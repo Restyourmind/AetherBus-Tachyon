@@ -1,8 +1,7 @@
 syntax = "proto3";
-
 package aetherbus.v1;
 
-// กำหนดการตั้งค่าสำหรับการสร้า[span_18](start_span)[span_18](end_span)[span_22](start_span)[span_22](end_span)งโค้ดข้ามแพลตฟอร์มภาษาต่างๆ
+// กำหนดการตั้งค่าสำหรับการสร้างโค้ดข้ามแพลตฟอร์มภาษาต่างๆ
 option go_package = "github.com/aetherbus/api/proto/v1;aetherbusv1";
 option java_multiple_files = true;
 option java_package = "com.aetherbus.api.v1";
@@ -10,40 +9,41 @@ option csharp_namespace = "AetherBus.Api.V1";
 
 // โครงสร้างหลักของแพ็กเก็ตข้อมูลบนเครือข่าย AetherBus
 message Event {
-  string id = 1;                 // รหัสอ้างอิงเฉพาะ (UUID) สำหรับแต่ละเหตุการณ์
-  string topic = 2;              // คีย์เส้นทาง หรือหัวข้อ (เช่น "sensor.temperature.region1")
-  bytes payload = 3;             // ข้อมูลไบนารีที่บรรจุเพย์โหลด
-  int64 timestamp_ns = 4;        // การประทับเวลา (Timestamp) ในระดับนาโนวินาที
-  CompressionType compression = 5; // ตัวบ่งชี้การบีบอัดข้อมูล
+    string id = 1;                     // รหัสอ้างอิงเฉพาะ (UUID)
+    string topic = 2;                  // คีย์เส้นทางหัวข้อ (เช่น "telemetry.sensor.alpha")
+    bytes payload = 3;                 // ข้อมูลไบนารีที่บรรจุเพย์โหลด
+    int64 timestamp_ns = 4;            // การประทับเวลาในระดับนาโนวินาที
+    CompressionType compression = 5;   // ตัวบ่งชี้อัลกอริทึมการบีบอัดข้อมูล
 }
 
-// อัลกอริทึมการบีบอัดข้อมูลที่รองรับในระดับสายส่ง (Wire-level)
+// อัลกอริทึมการบีบอัดข้อมูลที่รองรับในระดับสายส่ง
 enum CompressionType {
-  COMPRESSION_NONE = 0;
-  COMPRESSION_LZ4 = 1;
-  COMPRESSION_ZSTD = 2;
+    COMPRESSION_UNSPECIFIED = 0;       // ค่าเริ่มต้น
+    COMPRESSION_NONE = 1;
+    COMPRESSION_LZ4 = 2;               // สำหรับความหน่วงต่ำสุด
+    COMPRESSION_ZSTD = 3;              // สำหรับปริมาณข้อมูลหนาแน่น
 }
 
 message PublishResponse {
-  bool success = 1;
-  string message = 2;
+    bool success = 1;
+    string message = 2;
 }
 
 message SubscribeRequest {
-  string topic_filter = 1;       // หัวข้อที่ต้องการดึงข้อมูล รองรับ Wildcard (เช่น "sensor.*")
+    string topic_filter = 1;           // หัวข้อที่ต้องการดึงข้อมูล รองรับ Wildcard
 }
 
 // บริการสาธารณะในการเชื่อมต่อเข้ากับโหนด AetherBus
 service AetherBusService {
-  // การเรียก RPC แบบเดี่ยว: ใช้เพื่อเผยแพร่ข้อมูลหนึ่งชุดเข้าสู่บัส
-  rpc PublishEvent(Event) returns (PublishResponse);
-  
-  // การสตรีมจากไคลเอนต์: ส่งข้อมูลปริมาณมากเป็นชุดต่อเนื่องด้วยความเร็วสูงมาก
-  rpc StreamPublish(stream Event) returns (PublishResponse);
-  
-  // การสตรีมจากเซิร์ฟเวอร์: ติดตามหัวข้อแบบเรียลไทม์ เซิร์ฟเวอร์จะดันข้อมูลมาให้ตลอดเวลา
-  rpc Subscribe(SubscribeRequest) returns (stream Event);
-  
-  // การสตรีมแบบสองทิศทาง (Duplex): รับและส่งสตรีมข้อมูลโต้ตอบกันแบบหน่วงเวลาต่ำ
-  rpc DuplexConnect(stream Event) returns (stream Event);
+    // Unary RPC: เผยแพร่ข้อมูลเดี่ยว
+    rpc PublishEvent(Event) returns (PublishResponse);
+    
+    // Client Streaming: ส่งข้อมูลปริมาณมากเป็นชุดต่อเนื่องด้วยความเร็วสูง
+    rpc StreamPublish(stream Event) returns (PublishResponse);
+    
+    // Server Streaming: ติดตามหัวข้อแบบเรียลไทม์
+    rpc Subscribe(SubscribeRequest) returns (stream Event);
+    
+    // Duplex Streaming: สตรีมโต้ตอบแบบสองทิศทาง หน่วงเวลาต่ำ
+    rpc DuplexConnect(stream Event) returns (stream Event);
 }
