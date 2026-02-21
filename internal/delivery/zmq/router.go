@@ -16,14 +16,18 @@ type Router struct {
 	publisher   domain.EventPublisher
 	routerSocket *zmq4.Socket
 	pubSocket    *zmq4.Socket
+	codec       domain.Codec
+	compressor  domain.Compressor
 }
 
 // NewRouter creates a new ZMQ Router.
-func NewRouter(bindAddress, pubAddress string, publisher domain.EventPublisher) *Router {
+func NewRouter(bindAddress, pubAddress string, publisher domain.EventPublisher, codec domain.Codec, compressor domain.Compressor) *Router {
 	return &Router{
 		bindAddress: bindAddress,
 		pubAddress:  pubAddress,
 		publisher:   publisher,
+		codec:       codec,
+		compressor:  compressor,
 	}
 }
 
@@ -88,36 +92,41 @@ func (r *Router) loop(ctx context.Context) {
 		}
 
 		if len(sockets) > 0 {
-			// Read message from router socket
-			msg, err := r.routerSocket.RecvMessage(0)
+			msg, err := r.routerSocket.RecvMessageBytes(0)
 			if err != nil {
-				// Handle error (e.g., log it)
-				continue
+				continue // Log error
 			}
 
-			// Basic validation
 			if len(msg) < 2 {
-				// Malformed message
-				continue
+				continue // Malformed
 			}
 
-			// msg[0] is the client identity
-			// msg[1] is the event data
+			clientID := msg[0]
 			rawEvent := msg[1]
 
-			// In a real implementation, you would deserialize this into your
-			// domain.Event struct. For this example, we'll skip that and
-			// just pass the raw bytes to the publisher.
-			// We'll also invent a topic for routing.
-			event := domain.Event{
-				Topic:   "user.created", // This should be extracted from the message
-				Payload: []byte(rawEvent),
+			// 1. Decompress
+			decompressedEvent, err := r.compressor.Decompress(rawEvent)
+			if err != nil {
+				continue // Log error
 			}
 
-			// Publish to the application logic
-			if err := r.publisher.Publish(ctx, event); err == nil {
-				// If successful, publish to the PUB socket
-				r.pubSocket.SendMessage(event.Topic, string(event.Payload))
+			// 2. Decode
+			var event domain.Event
+			if err := r.codec.Decode(decompressedEvent, &event); err != nil {
+				continue // Log error
+			}
+
+			envelope := domain.Envelope{
+				ClientID: clientID,
+				Event:    event,
+			}
+
+			// 3. Publish to the application logic
+			if err := r.publisher.Publish(ctx, envelope); err == nil {
+				// If successful, publish to the PUB socket (optional)
+				// In a real scenario, you might want to re-encode and re-compress
+				// before publishing.
+				r.pubSocket.SendMessage(event.Topic, decompressedEvent)
 			}
 		}
 

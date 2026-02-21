@@ -1,26 +1,41 @@
 package domain
 
-// Status represents the state of a node in the cluster.
-type Status uint8
+import "time"
 
-const (
-	Alive Status = iota
-	Suspect
-	Dead
-)
-
-// Event represents the core data packet in AetherBus.
+// Event represents a single, immutable event that has occurred in the system.
+// It's the primary data structure that flows through AetherBus-Tachyon.
 type Event struct {
-	ID        string // UUID format
-	Topic     string
-	Payload   []byte
-	Timestamp int64  // Unix nanoseconds
+	// ID is a unique identifier for the event (e.g., UUID).
+	ID string
+
+	// Topic is the subject of the event (e.g., "user.created").
+	// It's used for routing.
+	Topic string
+
+	// Source is the identifier of the client that published the event.
+	Source string
+
+	// Timestamp is the time the event was created, in UTC.
+	Timestamp time.Time
+
+	// Data is the payload of the event. It can be any structured data.
+	Data interface{}
+
+	// DataContentType specifies the MIME type of the data (e.g., "application/json").
+	DataContentType string
+
+	// DataSchema is a URI to the schema of the data.
+	DataSchema string
+
+	// SpecVersion is the version of the CloudEvents specification.
+	SpecVersion string
 }
 
-// Node represents a member in the AetherBus cluster.
-type Node struct {
-	ID          string
-	Address     string
-	Incarnation uint32
-	Status      Status
+// Envelope is a container for an event that includes routing information.
+// This is the structure that is passed to the use case layer.
+type Envelope struct {
+	// ClientID is the ID of the client that sent the event.
+	ClientID []byte
+	// Event is the event itself.
+	Event Event
 }

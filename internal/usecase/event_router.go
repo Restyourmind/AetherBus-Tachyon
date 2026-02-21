@@ -5,11 +5,10 @@ import (
 	"fmt"
 
 	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
-	"github.com/aetherbus/aetherbus-tachyon/pkg/errors"
 )
 
-// EventRouter is the core application logic for routing events.
-// It orchestrates the interaction between the delivery layer and the repository layer.
+// EventRouter is a use case that routes events to the appropriate destination.
+// It uses a RouteStore to find the destination node ID for a given topic.
 type EventRouter struct {
 	routeStore domain.RouteStore
 }
@@ -21,23 +20,22 @@ func NewEventRouter(routeStore domain.RouteStore) *EventRouter {
 	}
 }
 
-// Publish implements the domain.EventPublisher interface.
-// It receives an event, finds the destination, and "sends" it.
-func (r *EventRouter) Publish(ctx context.Context, event domain.Event) error {
-	// 1. Match the topic to a destination node ID.
-	destNodeID := r.routeStore.Match(event.Topic)
+// Publish finds the destination node for the event and (for now) prints the routing decision.
+func (er *EventRouter) Publish(ctx context.Context, envelope domain.Envelope) error {
+	// For now, we'll just find the destination and print it.
+	// In a real implementation, this would involve more complex logic,
+	// such as forwarding the event to another node.
+	destNodeID := er.routeStore.Match(envelope.Event.Topic)
 	if destNodeID == "" {
-		// Log the warning and return a specific error.
-		fmt.Printf("WARN: No route found for topic '%s'\n", event.Topic)
-		return errors.ErrNoRouteFound
+		// If no specific route is found, it might be a broadcast
+		// or an error, depending on the desired system behavior.
+		fmt.Printf("No route found for topic: %s\n", envelope.Event.Topic)
+		return nil // Or return an error
 	}
 
-	// 2. In a real system, you would now use the destNodeID to
-	//    look up the node's address and publish the event to it
-	//    over the network (e.g., using the ZMQ DEALER-ROUTER pattern).
-	//    For this example, we'll just simulate this action.
+	fmt.Printf("Routing event %s (topic: %s) from client %s to node %s\n",
+		envelope.Event.ID, envelope.Event.Topic, string(envelope.ClientID), destNodeID)
 
-	// fmt.Printf("Routing event %s for topic %s to node %s\n", event.ID, event.Topic, destNodeID)
-
+	// In the future, this is where you would publish the event to the destination node.
 	return nil
 }
