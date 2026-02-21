@@ -4,52 +4,77 @@ package client
 import (
 	"context"
 	"fmt"
-    "time"
+	"sync"
+
+	zmq "github.com/pebbe/zmq4"
 )
 
+// tachyonClient implements the Client interface.
 type tachyonClient struct {
-	opts Options
-	// zmqSocket จะถูกจัดการในนี้
+	opts   Options
+	ctx    *zmq.Context
+	dealer *zmq.Socket // For Publish and Request-Reply
+	mu     sync.Mutex
+	closed bool
 }
 
-// New สร้าง instance ใหม่ของ Tachyon Client
+// New creates a new instance of the Tachyon Client.
 func New(opts ...Option) (Client, error) {
-	options := Options{
-		Addr:    "tcp://localhost:5555",
-		Timeout: 5 * time.Second,
-	}
-
+	options := defaultOptions()
 	for _, opt := range opts {
 		opt(&options)
 	}
 
+	zCtx, err := zmq.NewContext()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create zmq context: %w", err)
+	}
+
+	dealer, err := zCtx.NewSocket(zmq.DEALER)
+	if err != nil {
+		zCtx.Term() // Clean up context on subsequent failure
+		return nil, fmt.Errorf("failed to create dealer socket: %w", err)
+	}
+
+	// Set a client identity for the ROUTER to identify it.
+	if options.NodeID != "" {
+		dealer.SetIdentity(options.NodeID)
+	}
+
 	c := &tachyonClient{
-		opts: options,
+		opts:   options,
+		ctx:    zCtx,
+		dealer: dealer,
 	}
 
 	if err := c.connect(); err != nil {
-		return nil, fmt.Errorf("failed to connect: %w", err)
+		c.Close() // Ensure resources are released on connection failure
+		return nil, err
 	}
 
 	return c, nil
 }
 
-func (c *tachyonClient) Publish(ctx context.Context, topic string, payload []byte) error {
-	// Implementation logic สำหรับ ZMQ Dealer
-	return nil
-}
-
-func (c *tachyonClient) Subscribe(ctx context.Context, topic string, handler Handler) error {
-	// Implementation logic สำหรับ ZMQ Sub
-	return nil
+func (c *tachyonClient) connect() error {
+	return c.dealer.Connect(c.opts.Addr)
 }
 
 func (c *tachyonClient) Close() error {
-	// Graceful shutdown
-	return nil
-}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-func (c *tachyonClient) connect() error {
-	// Logic การสร้าง ZMQ Connection
+	if c.closed {
+		return nil
+	}
+
+	// Best-effort closing of resources
+	if c.dealer != nil {
+		c.dealer.Close()
+	}
+	if c.ctx != nil {
+		c.ctx.Term()
+	}
+
+	c.closed = true
 	return nil
 }
