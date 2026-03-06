@@ -47,6 +47,69 @@ sudo apt-get update && sudo apt-get install -y libzmq3-dev
 
 The server will start and bind to the addresses specified in the configuration (defaults to `tcp://*:5555` for the ROUTER and `tcp://*:5556` for the PUB socket).
 
+
+## 🧰 Build recovery under restricted network environments
+
+This repository may require external Go module resolution to complete full recovery of
+`go.mod` / `go.sum` and to run `go test ./...`.
+
+To make troubleshooting easier, use the recovery helper:
+
+### Offline-safe checks
+
+Use this mode when your environment cannot reach external Go module infrastructure:
+
+```bash
+bash scripts/go_mod_recovery.sh check
+```
+
+This mode is useful for:
+
+- validating repository structure
+- checking command entrypoints
+- running package-level tests for explicitly selected offline-safe packages
+
+By default, it tests:
+
+```bash
+go test ./cmd/aetherbus
+```
+
+### Full online recovery
+
+Use this mode on a machine or CI runner with module download access:
+
+```bash
+bash scripts/go_mod_recovery.sh recover
+```
+
+This runs:
+
+- `go mod download`
+- `go mod tidy`
+- `go build ./...`
+- `go test ./...`
+
+### Diagnostics
+
+To inspect the current Go environment:
+
+```bash
+bash scripts/go_mod_recovery.sh doctor
+```
+
+### Why this split exists
+
+Some failures are caused by local source issues, while others are caused by incomplete
+module metadata (`go.sum`) that cannot be repaired without downloading or verifying
+dependencies.
+
+In restricted-network environments, the offline-safe path helps confirm whether a failure
+is local to the codebase or caused by module resolution limits.
+
+If `recover` fails with module download/verification errors in restricted environments,
+treat that as an environment limitation first (not an automatic source regression).
+
 ##  Architectural Overview
 
 ```

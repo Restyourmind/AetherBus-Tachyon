@@ -7,24 +7,32 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  offline-sanity:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.22'
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
 
-    - name: Install ZeroMQ
-      run: sudo apt-get update && sudo apt-get install -y libzmq3-dev
+      - name: Run offline-safe checks
+        run: bash scripts/go_mod_recovery.sh check
 
-    - name: Install dependencies
-      run: go mod tidy
+  full-recovery:
+    runs-on: ubuntu-latest
+    needs: offline-sanity
+    steps:
+      - uses: actions/checkout@v4
 
-    - name: Build
-      run: go build -v ./...
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
 
-    - name: Test with race detector
-      run: go test -race -v ./...
+      - name: Install ZeroMQ
+        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev
+
+      - name: Run full online recovery
+        run: bash scripts/go_mod_recovery.sh recover
