@@ -11,13 +11,15 @@ import (
 
 // Router manages the ZMQ ROUTER socket for incoming events.
 type Router struct {
-	bindAddress  string
-	pubAddress   string
-	publisher    domain.EventPublisher
+	bindAddress string
+	pubAddress  string
+	publisher   domain.EventPublisher
+
 	routerSocket *zmq4.Socket
 	pubSocket    *zmq4.Socket
-	codec        domain.Codec
-	compressor   domain.Compressor
+
+	codec      domain.Codec
+	compressor domain.Compressor
 }
 
 // NewRouter creates a new ZMQ Router.
@@ -33,22 +35,18 @@ func NewRouter(bindAddress, pubAddress string, publisher domain.EventPublisher, 
 
 // Start initializes and runs the ZMQ ROUTER socket loop.
 func (r *Router) Start(ctx context.Context) error {
-	// ... (socket creation and binding code remains the same)
-	// Create ROUTER socket
 	routerSocket, err := zmq4.NewSocket(zmq4.ROUTER)
 	if err != nil {
 		return fmt.Errorf("failed to create router socket: %w", err)
 	}
 	r.routerSocket = routerSocket
 
-	// Create PUB socket
 	pubSocket, err := zmq4.NewSocket(zmq4.PUB)
 	if err != nil {
 		return fmt.Errorf("failed to create pub socket: %w", err)
 	}
 	r.pubSocket = pubSocket
 
-	// Bind sockets
 	if err := r.routerSocket.Bind(r.bindAddress); err != nil {
 		return fmt.Errorf("failed to bind router socket: %w", err)
 	}
@@ -58,19 +56,18 @@ func (r *Router) Start(ctx context.Context) error {
 
 	fmt.Println("ZMQ Router started")
 
-	// Run the main loop in a goroutine
 	go r.loop(ctx)
 
 	return nil
 }
 
-// Stop gracefully closes the ZMQ socket.
+// Stop gracefully closes the ZMQ sockets.
 func (r *Router) Stop() {
 	if r.routerSocket != nil {
-		r.routerSocket.Close()
+		_ = r.routerSocket.Close()
 	}
 	if r.pubSocket != nil {
-		r.pubSocket.Close()
+		_ = r.pubSocket.Close()
 	}
 	fmt.Println("ZMQ Router stopped")
 }
@@ -82,7 +79,6 @@ func (r *Router) loop(ctx context.Context) {
 	poller.Add(r.routerSocket, zmq4.POLLIN)
 
 	for {
-		// Poll for events with a timeout
 		sockets, err := poller.Poll(250 * time.Millisecond)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -93,31 +89,27 @@ func (r *Router) loop(ctx context.Context) {
 
 		if len(sockets) > 0 {
 			msg, err := r.routerSocket.RecvMessageBytes(0)
-			// Expect: [ClientID, Delimiter, Topic, Payload]
-			if err != nil || len(msg) < 4 {
-				continue // Malformed or error
+			if err != nil {
+				continue
 			}
 
-			clientID := msg[0]
-			// msg[1] is the empty delimiter
-			topic := string(msg[2])
-			rawEvent := msg[3]
+			clientID, topic, rawEvent, err := parseFrames(msg)
+			if err != nil {
+				continue
+			}
 
-			// 1. Decompress
 			decompressedEvent, err := r.compressor.Decompress(rawEvent)
 			if err != nil {
-				// Log error: failed to decompress
+				fmt.Printf("failed to decompress event: %v\n", err)
 				continue
 			}
 
-			// 2. Decode
 			var event domain.Event
 			if err := r.codec.Decode(decompressedEvent, &event); err != nil {
-				// Log error: failed to decode
+				fmt.Printf("failed to decode event: %v\n", err)
 				continue
 			}
 
-			// Assign the topic from the message frame
 			event.Topic = topic
 
 			envelope := domain.Envelope{
@@ -125,15 +117,31 @@ func (r *Router) loop(ctx context.Context) {
 				Event:    event,
 			}
 
-			// 3. Publish to the application logic
-			if err := r.publisher.Publish(ctx, envelope); err == nil {
-				// If successful, publish to the PUB socket for subscribers
-				r.pubSocket.SendMessage(event.Topic, decompressedEvent)
+			if err := r.publisher.Publish(ctx, envelope); err != nil {
+				fmt.Printf("failed to publish event: %v\n", err)
+				continue
+			}
+
+			if _, err := r.pubSocket.SendMessage(event.Topic, decompressedEvent); err != nil {
+				fmt.Printf("failed to fan out event on PUB socket: %v\n", err)
 			}
 		}
 
 		if ctx.Err() != nil {
 			break
 		}
+	}
+}
+
+func parseFrames(msg [][]byte) ([]byte, string, []byte, error) {
+	switch {
+	case len(msg) == 3:
+		// [ClientID, Topic, Payload]
+		return msg[0], string(msg[1]), msg[2], nil
+	case len(msg) >= 4 && len(msg[1]) == 0:
+		// [ClientID, Delimiter, Topic, Payload]
+		return msg[0], string(msg[2]), msg[3], nil
+	default:
+		return nil, "", nil, fmt.Errorf("malformed message: expected 3 frames or 4 frames with delimiter, got %d", len(msg))
 	}
 }

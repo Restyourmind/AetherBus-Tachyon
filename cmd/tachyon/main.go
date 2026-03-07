@@ -9,10 +9,7 @@ import (
 	"syscall"
 
 	"github.com/aetherbus/aetherbus-tachyon/config"
-	"github.com/aetherbus/aetherbus-tachyon/internal/delivery/zmq"
-	"github.com/aetherbus/aetherbus-tachyon/internal/media"
-	"github.com/aetherbus/aetherbus-tachyon/internal/repository"
-	"github.com/aetherbus/aetherbus-tachyon/internal/usecase"
+	"github.com/aetherbus/aetherbus-tachyon/internal/app"
 )
 
 func main() {
@@ -27,15 +24,10 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Set up dependencies (DI container)
-	routeStore := repository.NewART_RouteStore()
-	codec := media.NewJSONCodec()
-	compressor := media.NewLZ4Compressor()
-	eventRouter := usecase.NewEventRouter(routeStore)
-	zmqRouter := zmq.NewRouter(cfg.ZmqBindAddress, cfg.ZmqPubAddress, eventRouter, codec, compressor)
-
-	// For demonstration, let's add a dummy route
-	routeStore.AddRoute("user.created", "node-1")
+	runtime := app.NewRuntime(cfg, map[string]string{
+		"user.created": "node-1",
+	})
+	zmqRouter := runtime.Router
 
 	// Start the ZMQ router in a goroutine
 	if err := zmqRouter.Start(ctx); err != nil {

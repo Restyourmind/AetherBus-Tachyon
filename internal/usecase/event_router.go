@@ -13,6 +13,8 @@ type EventRouter struct {
 	routeStore domain.RouteStore
 }
 
+var _ domain.EventPublisher = (*EventRouter)(nil)
+
 // NewEventRouter creates a new EventRouter.
 func NewEventRouter(routeStore domain.RouteStore) *EventRouter {
 	return &EventRouter{
