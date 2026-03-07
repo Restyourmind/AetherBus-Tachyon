@@ -1,3 +1,6 @@
+//go:build legacy
+// +build legacy
+
 package message
 
 import (
@@ -52,7 +55,7 @@ import (
 // These methods use a codec to encode and decode the message body.
 // The default codec is JSON.
 
-type ( 
+type (
 	Message    = pb.Message
 	MessageRef = *pb.Message
 	Envelope   = pb.Envelope
