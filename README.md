@@ -110,22 +110,17 @@ is local to the codebase or caused by module resolution limits.
 If `recover` fails with module download/verification errors in restricted environments,
 treat that as an environment limitation first (not an automatic source regression).
 
-##  Architectural Overview
+## 🏗️ System Architecture Diagram
 
-```
-+-----------------------+
-|   ZMQ API (Delivery)  |
-| (Router, Pub/Sub)     |
-+-----------+-----------+
-            | (Envelope)
-+-----------v-----------+
-|  EventRouter (Usecase) |
-+-----------+-----------+
-            | (Topic)
-+-----------v-----------+
-| RouteStore (Repository)|
-| (Adaptive Radix Tree) |
-+-----------------------+
+```mermaid
+flowchart LR
+    P[Producers / Services] -->|Publish Envelope| D[Delivery Layer\nZMQ ROUTER/PUB]
+    C[Consumers / Workers] -->|Subscribe / Receive| D
+    D -->|Decode + Decompress| U[Use Case Layer\nEventRouter]
+    U -->|Route by Topic| R[Repository Layer\nART RouteStore]
+    R -->|Matched Route| U
+    U -->|Dispatch| D
+    D -->|Forward Message| C
 ```
 
 1.  **Delivery Layer (`zmq`):** Handles the raw network communication. It receives messages from clients, decompresses and decodes them, and wraps them in a `domain.Envelope`.
@@ -133,6 +128,24 @@ treat that as an environment limitation first (not an automatic source regressio
 3.  **Repository Layer (`repository`):** Provides an abstraction over the data storage. The `ART_RouteStore` implements the `RouteStore` interface using a high-performance radix tree to store and match routing keys.
 
 This separation allows for easy testing and swapping of components. For example, the `RouteStore` could be backed by a different data structure or a distributed key-value store without changing the use case logic.
+
+## 💡 Function Proposals & Next-step Ideas
+
+### English
+
+- **Consumer Group Support:** Add named consumer groups with load-balanced delivery and offset/position tracking per group.
+- **Message Replay Window:** Allow replay by timestamp or sequence for debugging, recovery, and audit use cases.
+- **Policy-based Retry Pipelines:** Configure retry profiles per topic (max attempts, delay strategy, dead-letter target).
+- **Authentication & Authorization:** Introduce token-based client authentication and topic-level ACL policies.
+- **Observability Dashboard Hooks:** Expose metrics/events for queue depth, retry counts, drop rates, and end-to-end latency.
+
+### ภาษาไทย
+
+- **รองรับ Consumer Group:** เพิ่มการรวมกลุ่มผู้บริโภคแบบตั้งชื่อได้ พร้อมกระจายงานและติดตามตำแหน่งการอ่านต่อกลุ่ม
+- **ความสามารถ Replay ข้อความ:** รองรับการดึงข้อความย้อนหลังตามเวลา/ลำดับ สำหรับดีบัก กู้คืน และงานตรวจสอบย้อนหลัง
+- **Retry Pipeline แบบกำหนดนโยบาย:** ตั้งค่า retry รายหัวข้อ เช่น จำนวนครั้งสูงสุด กลยุทธ์หน่วงเวลา และปลายทาง DLQ
+- **Authentication/Authorization:** เพิ่มการยืนยันตัวตนผู้ใช้งานและกำหนดสิทธิ์ระดับหัวข้อ (topic-level ACL)
+- **Hook สำหรับงาน Observability:** เปิด metric/event สำคัญ เช่น คิวค้าง retry rate อัตราการตกหล่น และ latency แบบ end-to-end
 
 
 ## 📘 Deep Architecture & Protocol Docs
