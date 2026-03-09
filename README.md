@@ -221,6 +221,14 @@ To move AetherBus-Tachyon toward a production-grade broker spec, the repository 
 - [Delivery Semantics (ACK/Retry/Backpressure/DLQ)](docs/DELIVERY.md)
 - [Performance Model and Benchmarking](docs/PERFORMANCE.md)
 
+### Delivery timeout configuration
+
+Direct-delivery ACK tracking supports timeout-driven retries. Configure via:
+
+- `DELIVERY_TIMEOUT_MS` (default: `30000`)
+
+If an inflight direct message is not ACKed before this timeout, the broker treats it as retryable, retries within the direct retry budget, and dead-letters it once retries are exhausted.
+
 These docs lock down the key areas that must be explicit for production evolution:
 
 - Protocol envelope and control messages (register/ack/nack)

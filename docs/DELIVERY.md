@@ -597,3 +597,20 @@ The AetherBus-Tachyon delivery model separates:
 - dead-letter handling
 
 This separation enables the broker to remain lightweight while still supporting production-grade message handling behavior.
+
+
+### 9.3 Timeout and Retry on Missing ACK
+
+For direct delivery with ACK enabled, each inflight record includes `dispatched_at`.
+
+- Broker configuration: `delivery_timeout_ms`
+- If `now - dispatched_at >= delivery_timeout_ms`, broker treats the message as retryable.
+- Broker increments retry counters and re-dispatches while retry budget remains.
+- When retry budget is exhausted, broker transitions the message to dead-letter state.
+
+### 9.4 Timeout-related Metrics
+
+Broker delivery metrics include:
+
+- `delivery_timeout`: count of inflight messages that crossed the ACK timeout window.
+- `retry_due_to_timeout`: count of retries triggered specifically by ACK timeout (subset of total retries).

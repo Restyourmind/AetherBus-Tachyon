@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/aetherbus/aetherbus-tachyon/config"
 	"github.com/aetherbus/aetherbus-tachyon/internal/delivery/zmq"
@@ -37,12 +38,14 @@ func main() {
 	eventRouter := usecase.NewEventRouter(routeStore)
 	fmt.Println("Initialized Event Router use case.")
 
-	zmqRouter := zmq.NewRouter(
+	zmqRouter := zmq.NewRouterWithOptions(
 		cfg.ZmqBindAddress,
 		cfg.ZmqPubAddress,
 		eventRouter,
 		codec,
 		compressor,
+		3,
+		time.Duration(cfg.DeliveryTimeoutMS)*time.Millisecond,
 	)
 
 	if err := zmqRouter.Start(ctx); err != nil {

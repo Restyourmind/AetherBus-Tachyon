@@ -2,6 +2,7 @@ package zmq
 
 import (
 	"testing"
+	"time"
 
 	"github.com/aetherbus/aetherbus-tachyon/internal/media"
 )
@@ -191,5 +192,81 @@ func TestTerminalNackDeadLettered(t *testing.T) {
 	}
 	if _, ok := r.inflight["msg-3"]; ok {
 		t.Fatalf("expected inflight entry removed for terminal nack")
+	}
+}
+
+func TestTimeoutRetry(t *testing.T) {
+	r := NewRouterWithOptions("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 3, 50*time.Millisecond)
+	r.directSessions["worker-1"] = &consumerSession{
+		SessionID:      "sess_000001",
+		ConsumerID:     "worker-1",
+		SocketIdentity: []byte("cid1"),
+		SupportsAck:    true,
+		MaxInflight:    10,
+		Subscriptions: map[string]struct{}{
+			"orders.created": {},
+		},
+	}
+
+	now := time.Unix(1000, 0).UTC()
+	r.now = func() time.Time { return now }
+	sendCount := 0
+	r.directSender = func(identity []byte, topic string, payload []byte) error {
+		sendCount++
+		return nil
+	}
+
+	r.dispatchDirect("orders.created", "msg-timeout-retry", []byte(`{"id":"msg-timeout-retry"}`))
+	now = now.Add(51 * time.Millisecond)
+	r.processInflightTimeouts()
+
+	if got := r.metrics.DeliveryTimeout; got != 1 {
+		t.Fatalf("expected delivery_timeout=1, got %d", got)
+	}
+	if got := r.metrics.RetryDueToTimeout; got != 1 {
+		t.Fatalf("expected retry_due_to_timeout=1, got %d", got)
+	}
+	if got := r.metrics.Retried; got != 1 {
+		t.Fatalf("expected retried=1, got %d", got)
+	}
+	if got := r.metrics.Dispatched; got != 2 {
+		t.Fatalf("expected dispatched=2 (initial+retry), got %d", got)
+	}
+	if sendCount != 2 {
+		t.Fatalf("expected direct sender called twice, got %d", sendCount)
+	}
+}
+
+func TestTimeoutDeadLetter(t *testing.T) {
+	r := NewRouterWithOptions("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 1, 50*time.Millisecond)
+	r.directSessions["worker-1"] = &consumerSession{
+		SessionID:      "sess_000001",
+		ConsumerID:     "worker-1",
+		SocketIdentity: []byte("cid1"),
+		SupportsAck:    true,
+		MaxInflight:    10,
+		Subscriptions: map[string]struct{}{
+			"orders.created": {},
+		},
+	}
+
+	now := time.Unix(1000, 0).UTC()
+	r.now = func() time.Time { return now }
+
+	r.dispatchDirect("orders.created", "msg-timeout-dead", []byte(`{"id":"msg-timeout-dead"}`))
+	now = now.Add(51 * time.Millisecond)
+	r.processInflightTimeouts()
+
+	if got := r.metrics.DeliveryTimeout; got != 1 {
+		t.Fatalf("expected delivery_timeout=1, got %d", got)
+	}
+	if got := r.metrics.RetryDueToTimeout; got != 0 {
+		t.Fatalf("expected retry_due_to_timeout=0, got %d", got)
+	}
+	if got := r.metrics.DeadLettered; got != 1 {
+		t.Fatalf("expected deadlettered=1, got %d", got)
+	}
+	if _, ok := r.inflight["msg-timeout-dead"]; ok {
+		t.Fatalf("expected inflight entry removed for timeout dead-letter")
 	}
 }

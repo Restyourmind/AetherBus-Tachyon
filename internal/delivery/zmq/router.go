@@ -16,9 +16,11 @@ import (
 
 // Router manages the ZMQ ROUTER socket for incoming events.
 type Router struct {
-	bindAddress string
-	pubAddress  string
-	publisher   domain.EventPublisher
+	bindAddress     string
+	pubAddress      string
+	publisher       domain.EventPublisher
+	deliveryTimeout time.Duration
+	now             func() time.Time
 
 	routerSocket *zmq4.Socket
 	pubSocket    *zmq4.Socket
@@ -73,11 +75,13 @@ type inflightMessage struct {
 
 // DeliveryMetrics captures direct-delivery lifecycle counters.
 type DeliveryMetrics struct {
-	Dispatched   uint64
-	Acked        uint64
-	Nacked       uint64
-	Retried      uint64
-	DeadLettered uint64
+	Dispatched        uint64
+	Acked             uint64
+	Nacked            uint64
+	Retried           uint64
+	DeadLettered      uint64
+	DeliveryTimeout   uint64
+	RetryDueToTimeout uint64
 }
 
 type controlMessage struct {
@@ -95,6 +99,18 @@ type controlMessage struct {
 
 // NewRouter creates a new ZMQ Router.
 func NewRouter(bindAddress, pubAddress string, publisher domain.EventPublisher, codec domain.Codec, compressor domain.Compressor) *Router {
+	return NewRouterWithOptions(bindAddress, pubAddress, publisher, codec, compressor, 3, 30*time.Second)
+}
+
+// NewRouterWithOptions creates a router with configurable retry and timeout behavior.
+func NewRouterWithOptions(bindAddress, pubAddress string, publisher domain.EventPublisher, codec domain.Codec, compressor domain.Compressor, maxDirectRetries int, deliveryTimeout time.Duration) *Router {
+	if maxDirectRetries <= 0 {
+		maxDirectRetries = 3
+	}
+	if deliveryTimeout <= 0 {
+		deliveryTimeout = 30 * time.Second
+	}
+
 	return &Router{
 		bindAddress:      bindAddress,
 		pubAddress:       pubAddress,
@@ -104,7 +120,9 @@ func NewRouter(bindAddress, pubAddress string, publisher domain.EventPublisher, 
 		directSessions:   map[string]*consumerSession{},
 		inflight:         map[string]*inflightMessage{},
 		completed:        map[string]deliveryStatus{},
-		maxDirectRetries: 3,
+		maxDirectRetries: maxDirectRetries,
+		deliveryTimeout:  deliveryTimeout,
+		now:              func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -167,6 +185,8 @@ func (r *Router) loop(ctx context.Context) {
 			continue
 		}
 
+		r.processInflightTimeouts()
+
 		if len(sockets) > 0 {
 			msg, err := r.routerSocket.RecvMessageBytes(0)
 			if err != nil {
@@ -225,6 +245,64 @@ func (r *Router) loop(ctx context.Context) {
 	}
 }
 
+func (r *Router) processInflightTimeouts() {
+	r.mu.Lock()
+	deferredRetries := make([]retryDispatch, 0)
+	now := r.now()
+	for messageID, record := range r.inflight {
+		if now.Sub(record.DispatchedAt) < r.deliveryTimeout {
+			continue
+		}
+
+		r.metrics.DeliveryTimeout++
+		if record.DeliveryAttempt < r.maxDirectRetries {
+			session, ok := r.directSessions[record.ConsumerID]
+			if !ok {
+				delete(r.inflight, messageID)
+				r.completed[messageID] = statusDeadLettered
+				r.metrics.DeadLettered++
+				continue
+			}
+
+			record.DeliveryAttempt++
+			record.Status = statusRetry
+			record.DispatchedAt = now
+			r.metrics.Retried++
+			r.metrics.RetryDueToTimeout++
+			r.metrics.Dispatched++
+			deferredRetries = append(deferredRetries, retryDispatch{
+				identity: append([]byte(nil), session.SocketIdentity...),
+				topic:    record.Topic,
+				payload:  append([]byte(nil), record.Payload...),
+			})
+			continue
+		}
+
+		if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
+			s.InflightCount--
+		}
+		delete(r.inflight, messageID)
+		r.completed[messageID] = statusDeadLettered
+		r.metrics.DeadLettered++
+	}
+	r.mu.Unlock()
+
+	for _, retry := range deferredRetries {
+		if r.directSender == nil {
+			continue
+		}
+		if err := r.directSender(retry.identity, retry.topic, retry.payload); err != nil {
+			fmt.Printf("failed to retry timed out direct-dispatch event: %v\n", err)
+		}
+	}
+}
+
+type retryDispatch struct {
+	identity []byte
+	topic    string
+	payload  []byte
+}
+
 func (r *Router) handleControl(clientID []byte, raw []byte) {
 	var msg controlMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
@@ -257,8 +335,8 @@ func (r *Router) registerConsumerSession(clientID []byte, msg controlMessage) {
 		SocketIdentity: append([]byte(nil), clientID...),
 		SupportsAck:    msg.Capabilities.SupportsAck,
 		Subscriptions:  map[string]struct{}{},
-		ConnectedAt:    time.Now().UTC(),
-		LastHeartbeat:  time.Now().UTC(),
+		ConnectedAt:    r.now(),
+		LastHeartbeat:  r.now(),
 		MaxInflight:    msg.Capabilities.MaxInflight,
 	}
 	if session.MaxInflight <= 0 {
@@ -274,7 +352,7 @@ func (r *Router) heartbeatConsumer(consumerID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if session, ok := r.directSessions[consumerID]; ok {
-		session.LastHeartbeat = time.Now().UTC()
+		session.LastHeartbeat = r.now()
 	}
 }
 
@@ -294,7 +372,7 @@ func (r *Router) dispatchDirect(topic, messageID string, payload []byte) {
 			Payload:         append([]byte(nil), payload...),
 			DeliveryAttempt: 1,
 			Status:          statusDispatched,
-			DispatchedAt:    time.Now().UTC(),
+			DispatchedAt:    r.now(),
 		}
 		session.InflightCount++
 	}
@@ -366,6 +444,7 @@ func (r *Router) handleNack(messageID, consumerID, status string) {
 		}
 		record.DeliveryAttempt++
 		record.Status = statusRetry
+		record.DispatchedAt = r.now()
 		r.metrics.Retried++
 		r.metrics.Dispatched++
 		identity := append([]byte(nil), session.SocketIdentity...)

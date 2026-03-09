@@ -1,6 +1,8 @@
 package app
 
 import (
+	"time"
+
 	"github.com/aetherbus/aetherbus-tachyon/config"
 	"github.com/aetherbus/aetherbus-tachyon/internal/delivery/zmq"
 	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
@@ -29,7 +31,7 @@ func NewRuntimeWithCompressor(cfg *config.Config, bootstrapRoutes map[string]str
 
 	codec := media.NewJSONCodec()
 	eventRouter := usecase.NewEventRouter(routeStore)
-	router := zmq.NewRouter(cfg.ZmqBindAddress, cfg.ZmqPubAddress, eventRouter, codec, compressor)
+	router := zmq.NewRouterWithOptions(cfg.ZmqBindAddress, cfg.ZmqPubAddress, eventRouter, codec, compressor, 3, time.Duration(cfg.DeliveryTimeoutMS)*time.Millisecond)
 
 	return &Runtime{
 		RouteStore: routeStore,
