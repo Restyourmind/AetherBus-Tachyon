@@ -3,7 +3,9 @@ package zmq
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
 	"github.com/pebbe/zmq4"
@@ -98,6 +100,11 @@ func (r *Router) loop(ctx context.Context) {
 				continue
 			}
 
+			if err := validateTopic(topic); err != nil {
+				fmt.Printf("invalid topic %q: %v\n", topic, err)
+				continue
+			}
+
 			decompressedEvent, err := r.compressor.Decompress(rawEvent)
 			if err != nil {
 				fmt.Printf("failed to decompress event: %v\n", err)
@@ -138,10 +145,28 @@ func parseFrames(msg [][]byte) ([]byte, string, []byte, error) {
 	case len(msg) == 3:
 		// [ClientID, Topic, Payload]
 		return msg[0], string(msg[1]), msg[2], nil
-	case len(msg) >= 4 && len(msg[1]) == 0:
+	case len(msg) == 4 && len(msg[1]) == 0:
 		// [ClientID, Delimiter, Topic, Payload]
 		return msg[0], string(msg[2]), msg[3], nil
 	default:
 		return nil, "", nil, fmt.Errorf("malformed message: expected 3 frames or 4 frames with delimiter, got %d", len(msg))
 	}
+}
+
+func validateTopic(topic string) error {
+	if topic == "" {
+		return fmt.Errorf("topic must not be empty")
+	}
+
+	if strings.HasPrefix(topic, ".") || strings.HasSuffix(topic, ".") || strings.Contains(topic, "..") {
+		return fmt.Errorf("topic segments must be non-empty")
+	}
+
+	for _, r := range topic {
+		if unicode.IsSpace(r) {
+			return fmt.Errorf("topic must not contain whitespace")
+		}
+	}
+
+	return nil
 }

@@ -32,6 +32,11 @@ func TestParseFrames(t *testing.T) {
 			msg:     [][]byte{[]byte("cid"), []byte("payload")},
 			wantErr: true,
 		},
+		{
+			name:    "invalid extended shape with extra frames",
+			msg:     [][]byte{[]byte("cid"), []byte(""), []byte("user.created"), []byte("payload"), []byte("extra")},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -52,6 +57,30 @@ func TestParseFrames(t *testing.T) {
 			}
 			if string(payload) != tc.wantPayload {
 				t.Fatalf("expected payload %q, got %q", tc.wantPayload, string(payload))
+			}
+		})
+	}
+}
+
+func TestValidateTopic(t *testing.T) {
+	tests := []struct {
+		name    string
+		topic   string
+		wantErr bool
+	}{
+		{name: "valid topic", topic: "orders.created", wantErr: false},
+		{name: "empty topic", topic: "", wantErr: true},
+		{name: "leading dot", topic: ".orders", wantErr: true},
+		{name: "trailing dot", topic: "orders.", wantErr: true},
+		{name: "double dot", topic: "orders..created", wantErr: true},
+		{name: "contains whitespace", topic: "orders. created", wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateTopic(tc.topic)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("expected err=%v, got err=%v", tc.wantErr, err)
 			}
 		})
 	}

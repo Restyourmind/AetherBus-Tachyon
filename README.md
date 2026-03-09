@@ -168,7 +168,7 @@ flowchart TD
 ### Message path
 
 1. **Producers** publish multipart frames to the ZeroMQ ROUTER.
-2. **`delivery/zmq.Router`** parses frames, decompresses payloads, and decodes them into `domain.Event`.
+2. **`delivery/zmq.Router`** parses strict ROUTER frame shapes (`[client, topic, payload]` or `[client, "", topic, payload]`), validates topic syntax, decompresses payloads, and decodes them into `domain.Event`.
 3. The transport layer wraps the event into **`domain.Envelope`**.
 4. **`usecase.EventRouter`** performs topic lookup through **`repository.ART_RouteStore`**.
 5. The routing decision returns to the transport layer.
