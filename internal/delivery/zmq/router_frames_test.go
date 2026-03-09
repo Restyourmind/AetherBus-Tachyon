@@ -270,3 +270,93 @@ func TestTimeoutDeadLetter(t *testing.T) {
 		t.Fatalf("expected inflight entry removed for timeout dead-letter")
 	}
 }
+
+func TestConsumerSaturationStopsDirectDispatch(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	r.directSessions["worker-1"] = &consumerSession{
+		SessionID:      "sess_000001",
+		ConsumerID:     "worker-1",
+		SocketIdentity: []byte("cid1"),
+		SupportsAck:    true,
+		MaxInflight:    1,
+		Subscriptions: map[string]struct{}{
+			"orders.created": {},
+		},
+	}
+
+	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`))
+	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`))
+
+	if got := r.metrics.Dispatched; got != 1 {
+		t.Fatalf("expected only first message dispatched, got %d", got)
+	}
+	if got := r.metrics.DispatchPaused; got != 1 {
+		t.Fatalf("expected one paused dispatch due to saturation, got %d", got)
+	}
+	if got := r.metrics.BacklogQueued; got != 1 {
+		t.Fatalf("expected one backlog increment, got %d", got)
+	}
+	if session := r.directSessions["worker-1"]; session.InflightCount != 1 {
+		t.Fatalf("expected inflight to remain saturated at 1, got %d", session.InflightCount)
+	}
+}
+
+func TestDispatchPauseTracksConsumerBacklog(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	r.directSessions["worker-1"] = &consumerSession{
+		SessionID:      "sess_000001",
+		ConsumerID:     "worker-1",
+		SocketIdentity: []byte("cid1"),
+		SupportsAck:    true,
+		MaxInflight:    1,
+		Subscriptions: map[string]struct{}{
+			"orders.created": {},
+		},
+	}
+
+	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`))
+	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`))
+	r.dispatchDirect("orders.created", "msg-3", []byte(`{"id":"msg-3"}`))
+
+	snapshot := r.ConsumerBacklogSnapshot()
+	metrics, ok := snapshot["worker-1"]
+	if !ok {
+		t.Fatalf("expected worker-1 in backlog snapshot")
+	}
+	if metrics.Backlog != 2 {
+		t.Fatalf("expected backlog=2, got %d", metrics.Backlog)
+	}
+	if metrics.MaxInflight != 1 {
+		t.Fatalf("expected max_inflight=1, got %d", metrics.MaxInflight)
+	}
+}
+
+func TestResumeDispatchAfterAckDropsInflight(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	r.directSessions["worker-1"] = &consumerSession{
+		SessionID:      "sess_000001",
+		ConsumerID:     "worker-1",
+		SocketIdentity: []byte("cid1"),
+		SupportsAck:    true,
+		MaxInflight:    1,
+		Subscriptions: map[string]struct{}{
+			"orders.created": {},
+		},
+	}
+
+	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`))
+	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`)) // paused
+	r.handleAck("msg-1", "worker-1")
+	r.dispatchDirect("orders.created", "msg-3", []byte(`{"id":"msg-3"}`)) // resumed
+
+	if got := r.metrics.Dispatched; got != 2 {
+		t.Fatalf("expected two dispatched messages after resume, got %d", got)
+	}
+	if session := r.directSessions["worker-1"]; session.InflightCount != 1 {
+		t.Fatalf("expected one inflight after redispatch, got %d", session.InflightCount)
+	}
+	snapshot := r.ConsumerBacklogSnapshot()
+	if got := snapshot["worker-1"].Backlog; got != 0 {
+		t.Fatalf("expected backlog drained after resume dispatch, got %d", got)
+	}
+}

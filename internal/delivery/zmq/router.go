@@ -28,14 +28,15 @@ type Router struct {
 	codec      domain.Codec
 	compressor domain.Compressor
 
-	mu               sync.Mutex
-	directSessions   map[string]*consumerSession
-	inflight         map[string]*inflightMessage
-	completed        map[string]deliveryStatus
-	nextSessionID    uint64
-	metrics          DeliveryMetrics
-	maxDirectRetries int
-	directSender     func(identity []byte, topic string, payload []byte) error
+	mu                     sync.Mutex
+	directSessions         map[string]*consumerSession
+	inflight               map[string]*inflightMessage
+	completed              map[string]deliveryStatus
+	nextSessionID          uint64
+	metrics                DeliveryMetrics
+	maxDirectRetries       int
+	maxInflightPerConsumer int
+	directSender           func(identity []byte, topic string, payload []byte) error
 }
 
 type deliveryStatus string
@@ -58,6 +59,7 @@ type consumerSession struct {
 	SupportsAck    bool
 	MaxInflight    int
 	InflightCount  int
+	BacklogCount   uint64
 	ConnectedAt    time.Time
 	LastHeartbeat  time.Time
 }
@@ -82,6 +84,15 @@ type DeliveryMetrics struct {
 	DeadLettered      uint64
 	DeliveryTimeout   uint64
 	RetryDueToTimeout uint64
+	DispatchPaused    uint64
+	BacklogQueued     uint64
+}
+
+// ConsumerBacklogMetrics captures per-consumer direct dispatch pressure.
+type ConsumerBacklogMetrics struct {
+	Inflight    int
+	MaxInflight int
+	Backlog     uint64
 }
 
 type controlMessage struct {
@@ -112,18 +123,29 @@ func NewRouterWithOptions(bindAddress, pubAddress string, publisher domain.Event
 	}
 
 	return &Router{
-		bindAddress:      bindAddress,
-		pubAddress:       pubAddress,
-		publisher:        publisher,
-		codec:            codec,
-		compressor:       compressor,
-		directSessions:   map[string]*consumerSession{},
-		inflight:         map[string]*inflightMessage{},
-		completed:        map[string]deliveryStatus{},
-		maxDirectRetries: maxDirectRetries,
-		deliveryTimeout:  deliveryTimeout,
-		now:              func() time.Time { return time.Now().UTC() },
+		bindAddress:            bindAddress,
+		pubAddress:             pubAddress,
+		publisher:              publisher,
+		codec:                  codec,
+		compressor:             compressor,
+		directSessions:         map[string]*consumerSession{},
+		inflight:               map[string]*inflightMessage{},
+		completed:              map[string]deliveryStatus{},
+		maxDirectRetries:       maxDirectRetries,
+		maxInflightPerConsumer: 1024,
+		deliveryTimeout:        deliveryTimeout,
+		now:                    func() time.Time { return time.Now().UTC() },
 	}
+}
+
+// SetMaxInflightPerConsumer configures the hard upper bound for a direct consumer inflight window.
+func (r *Router) SetMaxInflightPerConsumer(limit int) {
+	if limit <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.maxInflightPerConsumer = limit
 }
 
 // Start initializes and runs the ZMQ ROUTER socket loop.
@@ -339,8 +361,8 @@ func (r *Router) registerConsumerSession(clientID []byte, msg controlMessage) {
 		LastHeartbeat:  r.now(),
 		MaxInflight:    msg.Capabilities.MaxInflight,
 	}
-	if session.MaxInflight <= 0 {
-		session.MaxInflight = 1024
+	if session.MaxInflight <= 0 || session.MaxInflight > r.maxInflightPerConsumer {
+		session.MaxInflight = r.maxInflightPerConsumer
 	}
 	for _, topic := range msg.Subscriptions {
 		session.Subscriptions[topic] = struct{}{}
@@ -402,11 +424,32 @@ func (r *Router) selectSession(topic string) *consumerSession {
 			continue
 		}
 		if s.InflightCount >= s.MaxInflight {
+			r.metrics.DispatchPaused++
+			r.metrics.BacklogQueued++
+			s.BacklogCount++
 			continue
+		}
+		if s.BacklogCount > 0 {
+			s.BacklogCount--
 		}
 		return s
 	}
 	return nil
+}
+
+// ConsumerBacklogSnapshot returns per-consumer inflight and backlog counters.
+func (r *Router) ConsumerBacklogSnapshot() map[string]ConsumerBacklogMetrics {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]ConsumerBacklogMetrics, len(r.directSessions))
+	for consumerID, s := range r.directSessions {
+		out[consumerID] = ConsumerBacklogMetrics{
+			Inflight:    s.InflightCount,
+			MaxInflight: s.MaxInflight,
+			Backlog:     s.BacklogCount,
+		}
+	}
+	return out
 }
 
 func (r *Router) handleAck(messageID, consumerID string) {

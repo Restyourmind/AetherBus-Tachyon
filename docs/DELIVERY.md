@@ -514,6 +514,8 @@ Current broker runtime behavior (`internal/delivery/zmq.Router`) includes:
   - `status=retryable_error` retries up to the configured max attempt count
   - any other status is treated as terminal and finalized as dead-lettered
 - direct delivery counters for dispatched, acked, nacked, retried, and dead-lettered messages
+- per-consumer direct backpressure guard via `max_inflight_per_consumer` (hard cap for direct session inflight windows)
+- direct dispatch pause/backlog counters when a matching consumer is saturated
 - fanout path remains lightweight via PUB dispatch, without per-subscriber ACK tracking
 
 This behavior provides at-least-once style retry handling for direct mode and does not provide exactly-once semantics.
@@ -557,7 +559,7 @@ A production-ready deployment SHOULD define:
 - heartbeat timeout
 - dead-letter policy
 - queue size limits
-- consumer inflight limits
+- consumer inflight limits (including broker-level `max_inflight_per_consumer`)
 - routing miss policy
 - duplicate ACK handling policy
 
@@ -614,3 +616,5 @@ Broker delivery metrics include:
 
 - `delivery_timeout`: count of inflight messages that crossed the ACK timeout window.
 - `retry_due_to_timeout`: count of retries triggered specifically by ACK timeout (subset of total retries).
+- `dispatch_paused`: count of direct dispatch attempts skipped because matching consumers were at max inflight.
+- `backlog_queued`: count of direct messages deferred by consumer saturation in the dispatch path.
