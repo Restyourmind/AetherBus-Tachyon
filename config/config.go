@@ -9,6 +9,8 @@ type Config struct {
 	ZmqBindAddress    string
 	ZmqPubAddress     string
 	DeliveryTimeoutMS int
+	WALEnabled        bool
+	WALPath           string
 }
 
 // Load reads configuration from environment variables and returns a new Config struct.
@@ -17,6 +19,8 @@ func Load() (*Config, error) {
 		ZmqBindAddress:    getenvOrDefault("ZMQ_BIND_ADDRESS", "tcp://127.0.0.1:5555"),
 		ZmqPubAddress:     getenvOrDefault("ZMQ_PUB_ADDRESS", "tcp://127.0.0.1:5556"),
 		DeliveryTimeoutMS: getenvIntOrDefault("DELIVERY_TIMEOUT_MS", 30000),
+		WALEnabled:        getenvBoolOrDefault("WAL_ENABLED", false),
+		WALPath:           getenvOrDefault("WAL_PATH", "./data/direct_delivery.wal"),
 	}
 
 	return cfg, nil
@@ -42,4 +46,18 @@ func getenvOrDefault(key, defaultValue string) string {
 	}
 
 	return defaultValue
+}
+
+func getenvBoolOrDefault(key string, defaultValue bool) bool {
+	value, ok := os.LookupEnv(key)
+	if !ok || value == "" {
+		return defaultValue
+	}
+
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return defaultValue
+	}
+
+	return parsed
 }

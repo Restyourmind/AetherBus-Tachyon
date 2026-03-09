@@ -31,7 +31,21 @@ func NewRuntimeWithCompressor(cfg *config.Config, bootstrapRoutes map[string]str
 
 	codec := media.NewJSONCodec()
 	eventRouter := usecase.NewEventRouter(routeStore)
-	router := zmq.NewRouterWithOptions(cfg.ZmqBindAddress, cfg.ZmqPubAddress, eventRouter, codec, compressor, 3, time.Duration(cfg.DeliveryTimeoutMS)*time.Millisecond)
+	var durability zmq.WAL
+	if cfg.WALEnabled {
+		durability = zmq.NewFileWAL(cfg.WALPath)
+	}
+
+	router := zmq.NewRouterWithDurability(
+		cfg.ZmqBindAddress,
+		cfg.ZmqPubAddress,
+		eventRouter,
+		codec,
+		compressor,
+		3,
+		time.Duration(cfg.DeliveryTimeoutMS)*time.Millisecond,
+		durability,
+	)
 
 	return &Runtime{
 		RouteStore: routeStore,

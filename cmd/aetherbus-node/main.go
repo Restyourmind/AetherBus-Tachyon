@@ -38,7 +38,12 @@ func main() {
 	eventRouter := usecase.NewEventRouter(routeStore)
 	fmt.Println("Initialized Event Router use case.")
 
-	zmqRouter := zmq.NewRouterWithOptions(
+	var durability zmq.WAL
+	if cfg.WALEnabled {
+		durability = zmq.NewFileWAL(cfg.WALPath)
+	}
+
+	zmqRouter := zmq.NewRouterWithDurability(
 		cfg.ZmqBindAddress,
 		cfg.ZmqPubAddress,
 		eventRouter,
@@ -46,6 +51,7 @@ func main() {
 		compressor,
 		3,
 		time.Duration(cfg.DeliveryTimeoutMS)*time.Millisecond,
+		durability,
 	)
 
 	if err := zmqRouter.Start(ctx); err != nil {

@@ -247,6 +247,21 @@ If an ACK is received for a missing or expired session:
 - the broker SHOULD ignore it safely
 - the broker SHOULD log enough metadata for diagnostics
 
+## 10.3 WAL Durability (Optional)
+
+For direct delivery with acknowledgments, the broker MAY enable an append-only Write-Ahead Log (WAL).
+
+When enabled:
+
+- before direct dispatch, the broker appends a `dispatched` record to WAL
+- on ACK, the broker appends a `committed` record
+- on restart, the broker replays uncommitted direct messages when the target consumer session is re-established
+
+Operational counters exposed by broker metrics include:
+
+- `wal_written`: number of direct-dispatch WAL append operations
+- `wal_replayed`: number of unacked WAL entries replayed after restart
+
 ## 11. NACK Handling
 
 A NACK indicates processing failure.

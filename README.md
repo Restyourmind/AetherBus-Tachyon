@@ -47,6 +47,13 @@ sudo apt-get update && sudo apt-get install -y libzmq3-dev
 
 The server will start and bind to the addresses specified in the configuration (defaults to `tcp://127.0.0.1:5555` for the ROUTER and `tcp://127.0.0.1:5556` for the PUB socket).
 
+Optional direct-delivery durability can be enabled with:
+
+- `WAL_ENABLED=true`
+- `WAL_PATH=./data/direct_delivery.wal`
+
+When enabled, direct messages that require ACK are appended to an append-only WAL before dispatch, ACK marks entries committed, and unacked entries are replayed when matching consumers reconnect after restart.
+
 ## 🧰 Build recovery under restricted network environments
 
 This repository may require external Go module resolution to complete full recovery of

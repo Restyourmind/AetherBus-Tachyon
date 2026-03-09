@@ -21,6 +21,7 @@ type Router struct {
 	publisher       domain.EventPublisher
 	deliveryTimeout time.Duration
 	now             func() time.Time
+	wal             WAL
 
 	routerSocket *zmq4.Socket
 	pubSocket    *zmq4.Socket
@@ -86,6 +87,8 @@ type DeliveryMetrics struct {
 	RetryDueToTimeout uint64
 	DispatchPaused    uint64
 	BacklogQueued     uint64
+	WALWritten        uint64
+	WALReplayed       uint64
 }
 
 // ConsumerBacklogMetrics captures per-consumer direct dispatch pressure.
@@ -115,6 +118,11 @@ func NewRouter(bindAddress, pubAddress string, publisher domain.EventPublisher, 
 
 // NewRouterWithOptions creates a router with configurable retry and timeout behavior.
 func NewRouterWithOptions(bindAddress, pubAddress string, publisher domain.EventPublisher, codec domain.Codec, compressor domain.Compressor, maxDirectRetries int, deliveryTimeout time.Duration) *Router {
+	return NewRouterWithDurability(bindAddress, pubAddress, publisher, codec, compressor, maxDirectRetries, deliveryTimeout, nil)
+}
+
+// NewRouterWithDurability creates a router with configurable retry/timeout behavior and optional WAL durability.
+func NewRouterWithDurability(bindAddress, pubAddress string, publisher domain.EventPublisher, codec domain.Codec, compressor domain.Compressor, maxDirectRetries int, deliveryTimeout time.Duration, durability WAL) *Router {
 	if maxDirectRetries <= 0 {
 		maxDirectRetries = 3
 	}
@@ -135,6 +143,7 @@ func NewRouterWithOptions(bindAddress, pubAddress string, publisher domain.Event
 		maxInflightPerConsumer: 1024,
 		deliveryTimeout:        deliveryTimeout,
 		now:                    func() time.Time { return time.Now().UTC() },
+		wal:                    durability,
 	}
 }
 
@@ -267,6 +276,63 @@ func (r *Router) loop(ctx context.Context) {
 	}
 }
 
+func (r *Router) replayFromWAL(consumerID string) {
+	if r.wal == nil {
+		return
+	}
+
+	entries, err := r.wal.ReplayUnacked()
+	if err != nil {
+		fmt.Printf("failed to replay wal: %v\n", err)
+		return
+	}
+
+	r.mu.Lock()
+	deferred := make([]retryDispatch, 0, len(entries))
+	for _, entry := range entries {
+		if consumerID != "" && entry.Consumer != consumerID {
+			continue
+		}
+		session, ok := r.directSessions[entry.Consumer]
+		if !ok {
+			continue
+		}
+		if _, exists := r.inflight[entry.MessageID]; exists {
+			continue
+		}
+		if _, done := r.completed[entry.MessageID]; done {
+			continue
+		}
+		attempt := entry.Attempt
+		if attempt <= 0 {
+			attempt = 1
+		}
+		r.inflight[entry.MessageID] = &inflightMessage{
+			MessageID:       entry.MessageID,
+			ConsumerID:      entry.Consumer,
+			SessionID:       entry.SessionID,
+			Topic:           entry.Topic,
+			Payload:         append([]byte(nil), entry.Payload...),
+			DeliveryAttempt: attempt,
+			Status:          statusDispatched,
+			DispatchedAt:    r.now(),
+		}
+		session.InflightCount++
+		r.metrics.WALReplayed++
+		deferred = append(deferred, retryDispatch{identity: append([]byte(nil), session.SocketIdentity...), topic: entry.Topic, payload: append([]byte(nil), entry.Payload...)})
+	}
+	r.mu.Unlock()
+
+	for _, retry := range deferred {
+		if r.directSender == nil {
+			continue
+		}
+		if err := r.directSender(retry.identity, retry.topic, retry.payload); err != nil {
+			fmt.Printf("failed to replay wal event: %v\n", err)
+		}
+	}
+}
+
 func (r *Router) processInflightTimeouts() {
 	r.mu.Lock()
 	deferredRetries := make([]retryDispatch, 0)
@@ -349,7 +415,6 @@ func (r *Router) registerConsumerSession(clientID []byte, msg controlMessage) {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.nextSessionID++
 	session := &consumerSession{
 		SessionID:      fmt.Sprintf("sess_%06d", r.nextSessionID),
@@ -368,6 +433,9 @@ func (r *Router) registerConsumerSession(clientID []byte, msg controlMessage) {
 		session.Subscriptions[topic] = struct{}{}
 	}
 	r.directSessions[msg.ConsumerID] = session
+	r.mu.Unlock()
+
+	r.replayFromWAL(msg.ConsumerID)
 }
 
 func (r *Router) heartbeatConsumer(consumerID string) {
@@ -400,7 +468,19 @@ func (r *Router) dispatchDirect(topic, messageID string, payload []byte) {
 	}
 	r.metrics.Dispatched++
 	identity := append([]byte(nil), session.SocketIdentity...)
+	walEntry := walDispatchedEntry{MessageID: messageID, Consumer: session.ConsumerID, SessionID: session.SessionID, Topic: topic, Payload: append([]byte(nil), payload...), Attempt: 1}
+	needsWAL := r.wal != nil && session.SupportsAck && messageID != ""
 	r.mu.Unlock()
+
+	if needsWAL {
+		if err := r.wal.AppendDispatched(walEntry); err != nil {
+			fmt.Printf("failed to append wal dispatch: %v\n", err)
+		} else {
+			r.mu.Lock()
+			r.metrics.WALWritten++
+			r.mu.Unlock()
+		}
+	}
 
 	if r.directSender != nil {
 		if err := r.directSender(identity, topic, payload); err != nil {
@@ -454,12 +534,13 @@ func (r *Router) ConsumerBacklogSnapshot() map[string]ConsumerBacklogMetrics {
 
 func (r *Router) handleAck(messageID, consumerID string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if prior, ok := r.completed[messageID]; ok && prior == statusAcked {
+		r.mu.Unlock()
 		return
 	}
 	record, ok := r.inflight[messageID]
 	if !ok || record.ConsumerID != consumerID {
+		r.mu.Unlock()
 		return
 	}
 	if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
@@ -468,6 +549,14 @@ func (r *Router) handleAck(messageID, consumerID string) {
 	delete(r.inflight, messageID)
 	r.completed[messageID] = statusAcked
 	r.metrics.Acked++
+	shouldCommit := r.wal != nil
+	r.mu.Unlock()
+
+	if shouldCommit {
+		if err := r.wal.AppendCommitted(messageID); err != nil {
+			fmt.Printf("failed to append wal commit: %v\n", err)
+		}
+	}
 }
 
 func (r *Router) handleNack(messageID, consumerID, status string) {

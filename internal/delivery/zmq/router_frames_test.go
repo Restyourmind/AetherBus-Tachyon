@@ -7,6 +7,26 @@ import (
 	"github.com/aetherbus/aetherbus-tachyon/internal/media"
 )
 
+type stubWAL struct {
+	dispatched []walDispatchedEntry
+	committed  []string
+	replay     []walDispatchedEntry
+}
+
+func (w *stubWAL) AppendDispatched(entry walDispatchedEntry) error {
+	w.dispatched = append(w.dispatched, entry)
+	return nil
+}
+
+func (w *stubWAL) AppendCommitted(messageID string) error {
+	w.committed = append(w.committed, messageID)
+	return nil
+}
+
+func (w *stubWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
+	return append([]walDispatchedEntry(nil), w.replay...), nil
+}
+
 func TestParseFrames(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -358,5 +378,69 @@ func TestResumeDispatchAfterAckDropsInflight(t *testing.T) {
 	snapshot := r.ConsumerBacklogSnapshot()
 	if got := snapshot["worker-1"].Backlog; got != 0 {
 		t.Fatalf("expected backlog drained after resume dispatch, got %d", got)
+	}
+}
+
+func TestDispatchDirectWritesWALAndAckCommits(t *testing.T) {
+	w := &stubWAL{}
+	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 3, time.Second, w)
+	r.directSessions["worker-1"] = &consumerSession{
+		SessionID:      "sess_000001",
+		ConsumerID:     "worker-1",
+		SocketIdentity: []byte("cid1"),
+		SupportsAck:    true,
+		MaxInflight:    10,
+		Subscriptions: map[string]struct{}{
+			"orders.created": {},
+		},
+	}
+
+	r.dispatchDirect("orders.created", "msg-w1", []byte(`{"id":"msg-w1"}`))
+	if len(w.dispatched) != 1 {
+		t.Fatalf("expected one wal dispatch append, got %d", len(w.dispatched))
+	}
+	if got := r.metrics.WALWritten; got != 1 {
+		t.Fatalf("expected wal_written=1, got %d", got)
+	}
+
+	r.handleAck("msg-w1", "worker-1")
+	if len(w.committed) != 1 || w.committed[0] != "msg-w1" {
+		t.Fatalf("expected wal commit for msg-w1, got %#v", w.committed)
+	}
+}
+
+func TestReplayFromWALOnRegister(t *testing.T) {
+	w := &stubWAL{replay: []walDispatchedEntry{{
+		MessageID: "msg-r1",
+		Consumer:  "worker-1",
+		SessionID: "sess_000001",
+		Topic:     "orders.created",
+		Payload:   []byte(`{"id":"msg-r1"}`),
+		Attempt:   1,
+	}}}
+	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 3, time.Second, w)
+	sent := 0
+	r.directSender = func(identity []byte, topic string, payload []byte) error {
+		sent++
+		return nil
+	}
+
+	msg := controlMessage{
+		Mode:          "direct",
+		ConsumerID:    "worker-1",
+		Subscriptions: []string{"orders.created"},
+	}
+	msg.Capabilities.SupportsAck = true
+	msg.Capabilities.MaxInflight = 10
+	r.registerConsumerSession([]byte("cid1"), msg)
+
+	if sent != 1 {
+		t.Fatalf("expected replayed message to be sent once, got %d", sent)
+	}
+	if got := r.metrics.WALReplayed; got != 1 {
+		t.Fatalf("expected wal_replayed=1, got %d", got)
+	}
+	if _, ok := r.inflight["msg-r1"]; !ok {
+		t.Fatalf("expected replayed message in inflight")
 	}
 }
