@@ -2,8 +2,11 @@ package zmq
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -22,16 +25,86 @@ type Router struct {
 
 	codec      domain.Codec
 	compressor domain.Compressor
+
+	mu               sync.Mutex
+	directSessions   map[string]*consumerSession
+	inflight         map[string]*inflightMessage
+	completed        map[string]deliveryStatus
+	nextSessionID    uint64
+	metrics          DeliveryMetrics
+	maxDirectRetries int
+	directSender     func(identity []byte, topic string, payload []byte) error
+}
+
+type deliveryStatus string
+
+const (
+	statusDispatched   deliveryStatus = "dispatched"
+	statusAcked        deliveryStatus = "acked"
+	statusNacked       deliveryStatus = "nacked"
+	statusRetry        deliveryStatus = "retry_scheduled"
+	statusDeadLettered deliveryStatus = "dead_lettered"
+
+	controlTopic = "_control"
+)
+
+type consumerSession struct {
+	SessionID      string
+	ConsumerID     string
+	SocketIdentity []byte
+	Subscriptions  map[string]struct{}
+	SupportsAck    bool
+	MaxInflight    int
+	InflightCount  int
+	ConnectedAt    time.Time
+	LastHeartbeat  time.Time
+}
+
+type inflightMessage struct {
+	MessageID       string
+	ConsumerID      string
+	SessionID       string
+	Topic           string
+	Payload         []byte
+	DeliveryAttempt int
+	Status          deliveryStatus
+	DispatchedAt    time.Time
+}
+
+// DeliveryMetrics captures direct-delivery lifecycle counters.
+type DeliveryMetrics struct {
+	Dispatched   uint64
+	Acked        uint64
+	Nacked       uint64
+	Retried      uint64
+	DeadLettered uint64
+}
+
+type controlMessage struct {
+	Type          string   `json:"type"`
+	ConsumerID    string   `json:"consumer_id"`
+	MessageID     string   `json:"message_id"`
+	Status        string   `json:"status"`
+	Mode          string   `json:"mode"`
+	Subscriptions []string `json:"subscriptions"`
+	Capabilities  struct {
+		SupportsAck bool `json:"supports_ack"`
+		MaxInflight int  `json:"max_inflight"`
+	} `json:"capabilities"`
 }
 
 // NewRouter creates a new ZMQ Router.
 func NewRouter(bindAddress, pubAddress string, publisher domain.EventPublisher, codec domain.Codec, compressor domain.Compressor) *Router {
 	return &Router{
-		bindAddress: bindAddress,
-		pubAddress:  pubAddress,
-		publisher:   publisher,
-		codec:       codec,
-		compressor:  compressor,
+		bindAddress:      bindAddress,
+		pubAddress:       pubAddress,
+		publisher:        publisher,
+		codec:            codec,
+		compressor:       compressor,
+		directSessions:   map[string]*consumerSession{},
+		inflight:         map[string]*inflightMessage{},
+		completed:        map[string]deliveryStatus{},
+		maxDirectRetries: 3,
 	}
 }
 
@@ -57,6 +130,11 @@ func (r *Router) Start(ctx context.Context) error {
 	}
 
 	fmt.Println("ZMQ Router started")
+
+	r.directSender = func(identity []byte, topic string, payload []byte) error {
+		_, err := r.routerSocket.SendMessage(identity, "", topic, payload)
+		return err
+	}
 
 	go r.loop(ctx)
 
@@ -111,6 +189,11 @@ func (r *Router) loop(ctx context.Context) {
 				continue
 			}
 
+			if topic == controlTopic {
+				r.handleControl(clientID, decompressedEvent)
+				continue
+			}
+
 			var event domain.Event
 			if err := r.codec.Decode(decompressedEvent, &event); err != nil {
 				fmt.Printf("failed to decode event: %v\n", err)
@@ -132,12 +215,189 @@ func (r *Router) loop(ctx context.Context) {
 			if _, err := r.pubSocket.SendMessage(event.Topic, decompressedEvent); err != nil {
 				fmt.Printf("failed to fan out event on PUB socket: %v\n", err)
 			}
+
+			r.dispatchDirect(event.Topic, event.ID, decompressedEvent)
 		}
 
 		if ctx.Err() != nil {
 			break
 		}
 	}
+}
+
+func (r *Router) handleControl(clientID []byte, raw []byte) {
+	var msg controlMessage
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		fmt.Printf("failed to decode control message: %v\n", err)
+		return
+	}
+
+	switch msg.Type {
+	case "consumer.register":
+		r.registerConsumerSession(clientID, msg)
+	case "consumer.heartbeat":
+		r.heartbeatConsumer(msg.ConsumerID)
+	case "ack":
+		r.handleAck(msg.MessageID, msg.ConsumerID)
+	case "nack":
+		r.handleNack(msg.MessageID, msg.ConsumerID, msg.Status)
+	}
+}
+
+func (r *Router) registerConsumerSession(clientID []byte, msg controlMessage) {
+	if msg.Mode != "direct" || msg.ConsumerID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.nextSessionID++
+	session := &consumerSession{
+		SessionID:      fmt.Sprintf("sess_%06d", r.nextSessionID),
+		ConsumerID:     msg.ConsumerID,
+		SocketIdentity: append([]byte(nil), clientID...),
+		SupportsAck:    msg.Capabilities.SupportsAck,
+		Subscriptions:  map[string]struct{}{},
+		ConnectedAt:    time.Now().UTC(),
+		LastHeartbeat:  time.Now().UTC(),
+		MaxInflight:    msg.Capabilities.MaxInflight,
+	}
+	if session.MaxInflight <= 0 {
+		session.MaxInflight = 1024
+	}
+	for _, topic := range msg.Subscriptions {
+		session.Subscriptions[topic] = struct{}{}
+	}
+	r.directSessions[msg.ConsumerID] = session
+}
+
+func (r *Router) heartbeatConsumer(consumerID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if session, ok := r.directSessions[consumerID]; ok {
+		session.LastHeartbeat = time.Now().UTC()
+	}
+}
+
+func (r *Router) dispatchDirect(topic, messageID string, payload []byte) {
+	r.mu.Lock()
+	session := r.selectSession(topic)
+	if session == nil {
+		r.mu.Unlock()
+		return
+	}
+	if session.SupportsAck && messageID != "" {
+		r.inflight[messageID] = &inflightMessage{
+			MessageID:       messageID,
+			ConsumerID:      session.ConsumerID,
+			SessionID:       session.SessionID,
+			Topic:           topic,
+			Payload:         append([]byte(nil), payload...),
+			DeliveryAttempt: 1,
+			Status:          statusDispatched,
+			DispatchedAt:    time.Now().UTC(),
+		}
+		session.InflightCount++
+	}
+	r.metrics.Dispatched++
+	identity := append([]byte(nil), session.SocketIdentity...)
+	r.mu.Unlock()
+
+	if r.directSender != nil {
+		if err := r.directSender(identity, topic, payload); err != nil {
+			fmt.Printf("failed to direct-dispatch event: %v\n", err)
+		}
+	}
+}
+
+func (r *Router) selectSession(topic string) *consumerSession {
+	if len(r.directSessions) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(r.directSessions))
+	for id := range r.directSessions {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		s := r.directSessions[id]
+		if _, ok := s.Subscriptions[topic]; !ok {
+			continue
+		}
+		if s.InflightCount >= s.MaxInflight {
+			continue
+		}
+		return s
+	}
+	return nil
+}
+
+func (r *Router) handleAck(messageID, consumerID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if prior, ok := r.completed[messageID]; ok && prior == statusAcked {
+		return
+	}
+	record, ok := r.inflight[messageID]
+	if !ok || record.ConsumerID != consumerID {
+		return
+	}
+	if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
+		s.InflightCount--
+	}
+	delete(r.inflight, messageID)
+	r.completed[messageID] = statusAcked
+	r.metrics.Acked++
+}
+
+func (r *Router) handleNack(messageID, consumerID, status string) {
+	r.mu.Lock()
+	record, ok := r.inflight[messageID]
+	if !ok || record.ConsumerID != consumerID {
+		r.mu.Unlock()
+		return
+	}
+	r.metrics.Nacked++
+	isRetryable := status == "retryable_error"
+	if isRetryable && record.DeliveryAttempt < r.maxDirectRetries {
+		session, ok := r.directSessions[record.ConsumerID]
+		if !ok {
+			r.mu.Unlock()
+			return
+		}
+		record.DeliveryAttempt++
+		record.Status = statusRetry
+		r.metrics.Retried++
+		r.metrics.Dispatched++
+		identity := append([]byte(nil), session.SocketIdentity...)
+		topic := record.Topic
+		payload := append([]byte(nil), record.Payload...)
+		r.mu.Unlock()
+		if r.directSender != nil {
+			if err := r.directSender(identity, topic, payload); err != nil {
+				fmt.Printf("failed to retry direct-dispatch event: %v\n", err)
+			}
+		}
+		return
+	}
+
+	if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
+		s.InflightCount--
+	}
+	delete(r.inflight, messageID)
+	if isRetryable {
+		r.completed[messageID] = statusNacked
+	} else {
+		r.completed[messageID] = statusDeadLettered
+		r.metrics.DeadLettered++
+	}
+	r.mu.Unlock()
+}
+
+// MetricsSnapshot returns a thread-safe copy of delivery counters.
+func (r *Router) MetricsSnapshot() DeliveryMetrics {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.metrics
 }
 
 func parseFrames(msg [][]byte) ([]byte, string, []byte, error) {

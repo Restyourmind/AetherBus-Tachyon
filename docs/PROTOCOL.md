@@ -436,6 +436,7 @@ For direct delivery with acknowledgment enabled:
 - a consumer SHOULD NACK recoverable failures
 - a broker SHOULD correlate ACK/NACK by message_id
 - a broker MUST ignore ACK/NACK for unknown or expired sessions unless explicitly configured otherwise
+- control-plane ACK/NACK exchanges MAY be sent as JSON control messages on a reserved transport topic such as `_control`
 
 ## 16. Errors
 

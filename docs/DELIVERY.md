@@ -503,6 +503,21 @@ The delivery subsystem SHOULD expose metrics such as:
 - ack_latency_ms
 - delivery_latency_ms
 
+## 24A. Current Runtime Implementation Notes
+
+Current broker runtime behavior (`internal/delivery/zmq.Router`) includes:
+
+- direct consumer session registration via control messages on `_control`
+- direct inflight registry keyed by `message_id`
+- ACK handling that removes inflight state and treats duplicate/stale ACK as harmless no-op
+- NACK handling with deterministic outcomes:
+  - `status=retryable_error` retries up to the configured max attempt count
+  - any other status is treated as terminal and finalized as dead-lettered
+- direct delivery counters for dispatched, acked, nacked, retried, and dead-lettered messages
+- fanout path remains lightweight via PUB dispatch, without per-subscriber ACK tracking
+
+This behavior provides at-least-once style retry handling for direct mode and does not provide exactly-once semantics.
+
 ## 25. Logging
 
 Delivery logs SHOULD be structured.
