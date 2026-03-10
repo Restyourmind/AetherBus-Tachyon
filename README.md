@@ -336,6 +336,8 @@ To move AetherBus-Tachyon toward a production-grade broker spec, the repository 
 - [Delivery Semantics (ACK/Retry/Backpressure/DLQ)](docs/DELIVERY.md)
 - [Performance Model and Benchmarking](docs/PERFORMANCE.md)
 - [Rust Fast-path Sidecar Scaffold](docs/FASTPATH_SIDECAR.md)
+- [Intent Graph Algorithm Specification](docs/INTENT_GRAPH_ALGORITHM_SPEC.md)
+- [Intent Core Phase 1 (single-node scaffold)](docs/INTENT_CORE_PHASE1.md)
 
 ### Delivery timeout configuration
 
@@ -375,3 +377,5 @@ See `docs/FASTPATH_SIDECAR.md` for architecture, activation criteria, and measur
 - [Protocol Specification](docs/PROTOCOL.md)
 - [Routing Specification](docs/ROUTING.md)
 - [Delivery Specification](docs/DELIVERY.md)
+- [Intent Graph Algorithm Specification](docs/INTENT_GRAPH_ALGORITHM_SPEC.md)
+- [Intent Core Phase 1](docs/INTENT_CORE_PHASE1.md)
