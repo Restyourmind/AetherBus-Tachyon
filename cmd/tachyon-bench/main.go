@@ -103,6 +103,16 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "harness":
+		cfg := parseHarnessFlags(os.Args[2:])
+		if err := runHarnessAndReport(cfg); err != nil {
+			log.Fatal(err)
+		}
+	case "matrix":
+		cfg := parseHarnessFlags(os.Args[2:])
+		if err := runBenchmarkMatrix(cfg); err != nil {
+			log.Fatal(err)
+		}
 	case "run":
 		cfg := parseRunFlags(os.Args[2:])
 		if err := runAndReport(cfg); err != nil {
@@ -128,17 +138,25 @@ func usage() {
 	fmt.Println(`tachyon-bench
 
 Usage:
+  go run ./cmd/tachyon-bench harness [flags]
+  go run ./cmd/tachyon-bench matrix [flags]
   go run ./cmd/tachyon-bench run [flags]
   go run ./cmd/tachyon-bench baseline [flags]
   go run ./cmd/tachyon-bench step-load [flags]
 
 Examples:
+  go run ./cmd/tachyon-bench harness --mode direct-ack --payload-class small --compress=true --duration 20s
+  go run ./cmd/tachyon-bench harness --mode fanout --fanout-subs 8 --payload-class medium --compress=false
+  go run ./cmd/tachyon-bench harness --mode mixed --mixed-topics 8 --duration 30s
+  go run ./cmd/tachyon-bench matrix --duration 10s --connections 2
   go run ./cmd/tachyon-bench run --scenario A --duration 30s --connections 4 --topic system.heartbeat
   go run ./cmd/tachyon-bench baseline --duration 20s --connections 2 --compress=false
   go run ./cmd/tachyon-bench run --payload-size 1MB --compress=false --duration 30s --connections 2 --topic media.video.chunk
   go run ./cmd/tachyon-bench step-load --start-rate 1000 --step 1000 --max-rate 10000 --payload-size 64KB --duration 15s
 
 Notes:
+  - harness implements first-class scenarios: direct-ack, fanout, mixed.
+  - matrix runs CI-friendly benchmark sweeps across mode/payload/compression.
   - --launch-broker=true starts an in-process Tachyon broker.
   - --compress=false uses a no-op compressor in the local benchmark broker.
   - baseline runs 64KB / 1MB / 8MB for quick large-payload comparisons.

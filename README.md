@@ -125,6 +125,27 @@ is local to the codebase or caused by module resolution limits.
 If `recover` fails with module download/verification errors in restricted environments,
 treat that as an environment limitation first (not an automatic source regression).
 
+
+## ⚡ Benchmark harness
+
+A first-class benchmark harness is available via `cmd/tachyon-bench`:
+
+```bash
+# direct mode with ACK
+go run ./cmd/tachyon-bench harness --mode direct-ack --payload-class small --compress=true --duration 20s
+
+# fanout benchmark
+go run ./cmd/tachyon-bench harness --mode fanout --fanout-subs 8 --payload-class medium --compress=false --duration 20s
+
+# mixed topic distribution
+go run ./cmd/tachyon-bench harness --mode mixed --mixed-topics 8 --payload-class medium --compress=true --duration 30s
+
+# CI-friendly matrix
+go run ./cmd/tachyon-bench matrix --duration 10s --connections 2
+```
+
+The harness reports p50/p95/p99 latency, throughput, CPU usage, memory RSS, and allocations/op. See `docs/PERFORMANCE.md` for full interpretation guidance and comparison workflow.
+
 ## 🏗️ System Architecture Diagram
 
 ```mermaid

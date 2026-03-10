@@ -28,10 +28,10 @@ This document defines performance phases, benchmark scope, and baseline targets.
 
 Track throughput and latency per scenario:
 
-- Direct mode with ACK
-- Fanout mode under varying subscriber counts
-- Mixed topic distributions (exact vs wildcard)
-- Small/medium/large payload classes
+- Direct mode with ACK (`--mode direct-ack`)
+- Fanout mode under varying subscriber counts (`--mode fanout --fanout-subs N`)
+- Mixed topic distributions (`--mode mixed --mixed-topics N`)
+- Small/medium/large payload classes (`--payload-class small|medium|large`)
 
 Always report:
 
@@ -40,7 +40,78 @@ Always report:
 - CPU and memory usage
 - allocations/op (hot path)
 
-## 3) Key Metrics
+## 3) First-class benchmark harness
+
+The benchmark harness lives at `cmd/tachyon-bench` and now has dedicated commands for local use and CI:
+
+```bash
+# Single scenario (direct ACK)
+go run ./cmd/tachyon-bench harness \
+  --mode direct-ack \
+  --payload-class small \
+  --compress=true \
+  --duration 20s
+
+# Fanout with 8 subscribers
+go run ./cmd/tachyon-bench harness \
+  --mode fanout \
+  --fanout-subs 8 \
+  --payload-class medium \
+  --compress=false \
+  --duration 20s
+
+# Mixed topic distribution (70/30 hot-cold weighting)
+go run ./cmd/tachyon-bench harness \
+  --mode mixed \
+  --mixed-topics 8 \
+  --payload-class medium \
+  --compress=true \
+  --duration 30s
+
+# CI-friendly matrix across mode/payload/compression
+go run ./cmd/tachyon-bench matrix --duration 10s --connections 2
+```
+
+### Payload classes
+
+- `small` = 512B
+- `medium` = 4KB
+- `large` = 64KB
+
+### Compression modes
+
+- `--compress=true`: LZ4 in sender + benchmark broker runtime path
+- `--compress=false`: no-op compressor path for fair A/B overhead comparison
+
+## 4) Sample output format
+
+`harness` output:
+
+```text
+--- AetherBus Tachyon Benchmark Harness ---
+mode=fanout payload_class=medium payload=4.00 KB compress=true
+duration=20s connections=2 fanout_subs=8 mixed_topics=6
+sent=39840 recv=315617 errors=0 elapsed=22.004s
+throughput_msgs_sec=14343.65 throughput_mb_sec=56.03
+latency_p50=1.329ms latency_p95=3.982ms latency_p99=7.441ms
+cpu_percent=176.42 memory_rss=148.00 MB alloc_bytes_total=1.20 GB allocs_total=5661221 bytes_per_op=4096.31 allocs_per_op=17.94
+```
+
+`matrix` output (CSV line per run):
+
+```text
+mode,payload_class,compress,recv_msgs,msgs_per_sec,p50,p95,p99,cpu_percent,memory_rss_mb,allocs_per_op
+fanout,medium,true,315617,14343.65,1.329ms,3.982ms,7.441ms,176.42,148.00,17.94
+```
+
+## 5) Output interpretation
+
+- Compare `p99` first for tail behavior under stress.
+- Use `throughput_msgs_sec` with `errors` and drop rate (`sent - recv`) to avoid optimizing for raw speed only.
+- `cpu_percent` is process CPU consumption over wall-clock for the benchmark process.
+- `memory_rss` shows peak resident usage; `allocs_per_op` and `bytes_per_op` help identify allocator pressure.
+
+## 6) Key Metrics
 
 Broker counters:
 
@@ -65,7 +136,7 @@ Health metrics:
 - `retry_queue_depth`
 - `dlq_depth`
 
-## 4) Initial Target Template
+## 7) Initial Target Template
 
 The project should define explicit target SLOs over time, for example:
 
@@ -75,7 +146,20 @@ The project should define explicit target SLOs over time, for example:
 
 Set concrete numbers once baseline benchmark results are available in CI/perf environments.
 
-## 5) Compression Toggle for Benchmarking
+## 8) Comparing future optimizations
+
+To compare future optimizations consistently:
+
+1. Use `matrix` with a fixed duration/connections and both compression modes.
+2. Store each run's CSV output as CI artifact (or commit under a `perf/baselines/` folder).
+3. Compare candidate vs baseline on:
+   - p99 latency (must not regress)
+   - throughput (should improve or hold)
+   - allocs/op and bytes/op (should improve for hot-path changes)
+   - cpu_percent and memory_rss (watch for hidden cost shifts)
+4. Treat improvements as valid only when repeated at least 3 times and median trend is favorable.
+
+## 9) Compression Toggle for Benchmarking
 
 The default runtime wiring (`internal/app.NewRuntime`) uses LZ4 compression.
 For benchmark scenarios that require `--compress=false`, use benchmark runtime wiring:
@@ -84,4 +168,3 @@ For benchmark scenarios that require `--compress=false`, use benchmark runtime w
 - `internal/app.NewBenchmarkRuntime(...)` selects LZ4 when enabled and a no-op compressor when disabled.
 
 This allows fair comparison between compressed and uncompressed broker paths without introducing cgo/FFI complexity.
-
