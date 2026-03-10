@@ -376,6 +376,7 @@ func (r *Router) replayFromWAL(consumerID string) {
 func (r *Router) processInflightTimeouts() {
 	r.mu.Lock()
 	deferredRetries := make([]retryDispatch, 0)
+	deadLetteredIDs := make([]string, 0)
 	now := r.now()
 	for messageID, record := range r.inflight {
 		if now.Sub(record.DispatchedAt) < r.deliveryTimeout {
@@ -389,6 +390,9 @@ func (r *Router) processInflightTimeouts() {
 				delete(r.inflight, messageID)
 				r.completed[messageID] = statusDeadLettered
 				r.metrics.DeadLettered++
+				if r.wal != nil {
+					deadLetteredIDs = append(deadLetteredIDs, messageID)
+				}
 				continue
 			}
 
@@ -412,8 +416,17 @@ func (r *Router) processInflightTimeouts() {
 		delete(r.inflight, messageID)
 		r.completed[messageID] = statusDeadLettered
 		r.metrics.DeadLettered++
+		if r.wal != nil {
+			deadLetteredIDs = append(deadLetteredIDs, messageID)
+		}
 	}
 	r.mu.Unlock()
+
+	for _, messageID := range deadLetteredIDs {
+		if err := r.wal.AppendDeadLettered(messageID); err != nil {
+			fmt.Printf("failed to append wal dead-letter: %v\n", err)
+		}
+	}
 
 	for _, retry := range deferredRetries {
 		if r.directSender == nil {
@@ -692,13 +705,16 @@ func (r *Router) handleNack(messageID, consumerID, sessionID, status string) {
 	}
 	drain := r.drainDeferredLocked(record.Topic)
 	delete(r.inflight, messageID)
-	if isRetryable {
-		r.completed[messageID] = statusNacked
-	} else {
-		r.completed[messageID] = statusDeadLettered
-		r.metrics.DeadLettered++
-	}
+	r.completed[messageID] = statusDeadLettered
+	r.metrics.DeadLettered++
+	shouldDeadLetter := r.wal != nil
 	r.mu.Unlock()
+
+	if shouldDeadLetter {
+		if err := r.wal.AppendDeadLettered(messageID); err != nil {
+			fmt.Printf("failed to append wal dead-letter: %v\n", err)
+		}
+	}
 	r.sendDeferred(drain)
 }
 

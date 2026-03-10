@@ -52,7 +52,7 @@ Optional direct-delivery durability can be enabled with:
 - `WAL_ENABLED=true`
 - `WAL_PATH=./data/direct_delivery.wal`
 
-When enabled, direct messages that require ACK are appended to an append-only WAL before dispatch, ACK marks entries committed, and unacked entries are replayed when matching consumers reconnect after restart.
+When enabled, direct messages that require ACK are appended to an append-only WAL before dispatch, ACK marks entries committed, terminal outcomes are marked dead-lettered, and remaining unfinalized records are replayed when matching consumers reconnect after restart.
 
 Direct-delivery admission control defaults are intentionally conservative and can be tuned with:
 
@@ -249,16 +249,28 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 
 | Field | Type | Description |
 |---|---|---|
-| `type` | enum | `dispatched` or `committed` |
+| `type` | enum | `dispatched`, `committed`, or `dead_lettered` |
 | `message_id` | string | Message identity |
 | `consumer` | string | Consumer identity for dispatched records |
 | `session_id` | string | Session ID for dispatched records |
 | `topic` | string | Topic for dispatched records |
 | `payload` | bytes | Payload for dispatched records |
 | `attempt` | int | Attempt number for dispatched records |
-| `ts_unix_nano` | int64 | Record timestamp |
 
 > Note: if you need SQL/NoSQL persistence in the future, this model can be mapped directly to tables/collections (`routes`, `consumer_sessions`, `inflight_messages`, `delivery_wal`) while preserving existing runtime semantics.
+
+
+### Durability guarantees and non-goals
+
+**Guarantees (when `WAL_ENABLED=true`):**
+- Direct deliveries that require ACK are written to WAL before broker send.
+- ACK and terminal dead-letter outcomes finalize WAL records, preventing replay.
+- On restart, only unfinalized direct deliveries are replayed, preserving `message_id`, `consumer_id`, topic, payload, and attempt counter.
+
+**Non-goals / current limitations:**
+- WAL is local append-only file storage (single-node durability, no replication or consensus).
+- WAL replay is scoped to consumers that re-register; replay is not global fanout recovery.
+- WAL file compaction/retention is not implemented in this version.
 
 ## 💡 Function Proposals & Future Extensions
 

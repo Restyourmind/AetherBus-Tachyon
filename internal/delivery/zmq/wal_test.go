@@ -30,3 +30,23 @@ func TestFileWALAppendReplayAndCommit(t *testing.T) {
 		t.Fatalf("expected msg-2 replayed, got %s", entries[0].MessageID)
 	}
 }
+
+func TestFileWALReplaySkipsDeadLettered(t *testing.T) {
+	tmp := t.TempDir()
+	w := NewFileWAL(filepath.Join(tmp, "delivery.wal"))
+
+	if err := w.AppendDispatched(walDispatchedEntry{MessageID: "msg-dlq", Consumer: "c1", SessionID: "s1", Topic: "orders.created", Payload: []byte("p1"), Attempt: 2}); err != nil {
+		t.Fatalf("append dispatched: %v", err)
+	}
+	if err := w.AppendDeadLettered("msg-dlq"); err != nil {
+		t.Fatalf("append dead-lettered: %v", err)
+	}
+
+	entries, err := w.ReplayUnacked()
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected no replay entries after dead-letter finalize, got %d", len(entries))
+	}
+}

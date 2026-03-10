@@ -8,9 +8,10 @@ import (
 )
 
 type stubWAL struct {
-	dispatched []walDispatchedEntry
-	committed  []string
-	replay     []walDispatchedEntry
+	dispatched   []walDispatchedEntry
+	committed    []string
+	deadLettered []string
+	replay       []walDispatchedEntry
 }
 
 func (w *stubWAL) AppendDispatched(entry walDispatchedEntry) error {
@@ -23,6 +24,10 @@ func (w *stubWAL) AppendCommitted(messageID string) error {
 	return nil
 }
 
+func (w *stubWAL) AppendDeadLettered(messageID string) error {
+	w.deadLettered = append(w.deadLettered, messageID)
+	return nil
+}
 func (w *stubWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 	return append([]walDispatchedEntry(nil), w.replay...), nil
 }
@@ -549,5 +554,63 @@ func TestGlobalIngressLimitDropsNewDispatch(t *testing.T) {
 	}
 	if _, ok := r.inflight["msg-2"]; ok {
 		t.Fatalf("expected second message to be dropped before inflight registration")
+	}
+}
+
+func TestReplayFromWALPreservesIdentityAndAttempt(t *testing.T) {
+	w := &stubWAL{replay: []walDispatchedEntry{{
+		MessageID: "msg-r2",
+		Consumer:  "worker-1",
+		SessionID: "sess_old",
+		Topic:     "orders.created",
+		Payload:   []byte(`{"id":"msg-r2"}`),
+		Attempt:   2,
+	}}}
+	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 3, time.Second, w)
+	r.directSessions["worker-1"] = &consumerSession{
+		SessionID:      "sess_new",
+		ConsumerID:     "worker-1",
+		SocketIdentity: []byte("cid1"),
+		SupportsAck:    true,
+		MaxInflight:    10,
+		Subscriptions:  map[string]struct{}{"orders.created": {}},
+	}
+
+	r.replayFromWAL("worker-1")
+	replayed, ok := r.inflight["msg-r2"]
+	if !ok {
+		t.Fatalf("expected replayed inflight")
+	}
+	if replayed.MessageID != "msg-r2" || replayed.ConsumerID != "worker-1" {
+		t.Fatalf("expected message identity preserved on replay, got %#v", replayed)
+	}
+	if replayed.DeliveryAttempt != 2 {
+		t.Fatalf("expected replay attempt=2, got %d", replayed.DeliveryAttempt)
+	}
+}
+
+func TestRetryExhaustionAppendsDeadLetterToWAL(t *testing.T) {
+	w := &stubWAL{}
+	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 2, 50*time.Millisecond, w)
+	r.directSessions["worker-1"] = &consumerSession{
+		SessionID:      "sess_000001",
+		ConsumerID:     "worker-1",
+		SocketIdentity: []byte("cid1"),
+		SupportsAck:    true,
+		MaxInflight:    10,
+		Subscriptions: map[string]struct{}{
+			"orders.created": {},
+		},
+	}
+
+	r.dispatchDirect("orders.created", "msg-exhaust", []byte(`{"id":"msg-exhaust"}`))
+	r.handleNack("msg-exhaust", "worker-1", "sess_000001", "retryable_error")
+	r.handleNack("msg-exhaust", "worker-1", "sess_000001", "retryable_error")
+
+	if got := r.metrics.DeadLettered; got != 1 {
+		t.Fatalf("expected deadlettered=1 after retry exhaustion, got %d", got)
+	}
+	if len(w.deadLettered) != 1 || w.deadLettered[0] != "msg-exhaust" {
+		t.Fatalf("expected wal dead-letter append for exhausted retry, got %#v", w.deadLettered)
 	}
 }

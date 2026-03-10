@@ -255,12 +255,27 @@ When enabled:
 
 - before direct dispatch, the broker appends a `dispatched` record to WAL
 - on ACK, the broker appends a `committed` record
-- on restart, the broker replays uncommitted direct messages when the target consumer session is re-established
+- on terminal failure or retry exhaustion, the broker appends a `dead_lettered` record
+- on restart, the broker replays unfinalized direct messages when the target consumer session is re-established
 
 Operational counters exposed by broker metrics include:
 
 - `wal_written`: number of direct-dispatch WAL append operations
 - `wal_replayed`: number of unacked WAL entries replayed after restart
+
+### 10.4 WAL Guarantees and Limitations
+
+Guarantees when WAL is enabled:
+
+- direct messages requiring ACK are durable before first dispatch attempt
+- replay preserves `message_id`, target `consumer_id`, payload, topic, and delivery attempt metadata
+- finalized records (`committed` / `dead_lettered`) are excluded from replay
+
+Limitations in this first version:
+
+- local file durability only (no distributed consensus, replication, or quorum writes)
+- no WAL compaction or retention policy yet
+- replay is consumer-session driven; messages without a matching re-registered direct consumer remain pending
 
 ## 11. NACK Handling
 

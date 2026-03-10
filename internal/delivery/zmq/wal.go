@@ -14,6 +14,7 @@ import (
 type WAL interface {
 	AppendDispatched(entry walDispatchedEntry) error
 	AppendCommitted(messageID string) error
+	AppendDeadLettered(messageID string) error
 	ReplayUnacked() ([]walDispatchedEntry, error)
 }
 
@@ -66,6 +67,14 @@ func (w *fileWAL) AppendCommitted(messageID string) error {
 	return w.appendRecord(rec)
 }
 
+func (w *fileWAL) AppendDeadLettered(messageID string) error {
+	rec := walRecord{
+		Type:      "dead_lettered",
+		MessageID: messageID,
+	}
+	return w.appendRecord(rec)
+}
+
 func (w *fileWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -80,7 +89,7 @@ func (w *fileWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	committed := map[string]struct{}{}
+	finalized := map[string]struct{}{}
 	pending := map[string]walDispatchedEntry{}
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -93,13 +102,16 @@ func (w *fileWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 		}
 		switch rec.Type {
 		case "committed":
-			committed[rec.MessageID] = struct{}{}
+			finalized[rec.MessageID] = struct{}{}
+			delete(pending, rec.MessageID)
+		case "dead_lettered":
+			finalized[rec.MessageID] = struct{}{}
 			delete(pending, rec.MessageID)
 		case "dispatched":
 			if rec.MessageID == "" {
 				continue
 			}
-			if _, ok := committed[rec.MessageID]; ok {
+			if _, ok := finalized[rec.MessageID]; ok {
 				continue
 			}
 			payload, err := base64.StdEncoding.DecodeString(rec.Payload)
