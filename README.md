@@ -360,6 +360,14 @@ The repository includes a scaffolded Rust sidecar (`rust/tachyon-fastpath`) and 
 - Rust sidecar is an explicit opt-in integration path for large payload framing/compression offload.
 - The first iteration intentionally uses a process boundary (Unix socket sidecar) to minimize risk to broker delivery semantics.
 
+Fast-path sidecar configuration knobs are available for explicit developer testing:
+
+- `FASTPATH_SIDECAR_ENABLED` (default `false`)
+- `FASTPATH_SOCKET_PATH` (default `/tmp/tachyon-fastpath.sock`)
+- `FASTPATH_CUTOVER_BYTES` (default `262144`)
+- `FASTPATH_REQUIRE` (default `false`)
+- `FASTPATH_FALLBACK_TO_GO` (default `true`)
+
 See `docs/FASTPATH_SIDECAR.md` for architecture, activation criteria, and measurable migration candidates.
 
 ## Specifications
