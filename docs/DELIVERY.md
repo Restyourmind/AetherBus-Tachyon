@@ -34,6 +34,15 @@ Conceptually:
 Resolved route(s) → Delivery mode → Outbound transport → Optional ACK/NACK → Final status
 ```
 
+## 2.1 Routing Outcome Contract
+
+Before delivery execution, the routing layer returns a structured decision:
+
+- `routed`: a deterministic destination exists and delivery can proceed
+- `unroutable`: no destination is available and delivery is skipped
+
+For `unroutable`, the broker SHOULD increment unroutable counters and MUST avoid dispatching to direct/fanout transports for that event.
+
 ## 3. Transport Model
 
 AetherBus-Tachyon is built on ZeroMQ transport patterns.

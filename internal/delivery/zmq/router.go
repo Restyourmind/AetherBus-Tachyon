@@ -88,6 +88,9 @@ type queuedDirectMessage struct {
 
 // DeliveryMetrics captures direct-delivery lifecycle counters.
 type DeliveryMetrics struct {
+	Ingress           uint64
+	Routed            uint64
+	Unroutable        uint64
 	Dispatched        uint64
 	Acked             uint64
 	Nacked            uint64
@@ -298,10 +301,27 @@ func (r *Router) loop(ctx context.Context) {
 				Event:    event,
 			}
 
-			if err := r.publisher.Publish(ctx, envelope); err != nil {
-				fmt.Printf("failed to publish event: %v\n", err)
+			r.metrics.Ingress++
+			publishResult := domain.PublishResult{Status: domain.RouteStatusRouted, Topic: event.Topic}
+			if publisherWithResult, ok := r.publisher.(domain.EventPublisherWithResult); ok {
+				resolved, err := publisherWithResult.PublishWithResult(ctx, envelope)
+				if err != nil {
+					fmt.Printf("failed to publish event: %v\n", err)
+					continue
+				}
+				publishResult = resolved
+			} else {
+				if err := r.publisher.Publish(ctx, envelope); err != nil {
+					fmt.Printf("failed to publish event: %v\n", err)
+					continue
+				}
+			}
+
+			if publishResult.Status == domain.RouteStatusUnroutable {
+				r.metrics.Unroutable++
 				continue
 			}
+			r.metrics.Routed++
 
 			if _, err := r.pubSocket.SendMessage(event.Topic, decompressedEvent); err != nil {
 				fmt.Printf("failed to fan out event on PUB socket: %v\n", err)

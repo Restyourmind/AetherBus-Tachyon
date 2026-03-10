@@ -31,18 +31,10 @@ This roadmap is grounded in the current repository shape and documented protocol
   - Invalid header variants are rejected with deterministic parser errors.
   - Tests cover valid/invalid frame parsing and route lookup behavior for both paths.
 
-### 2) Route decision outcomes + explicit unroutable handling contract
-- **Goal:** Convert current log-only routing into explicit outcomes that can feed counters and retry/dlq decisions later.
-- **Impacted files/packages:**
-  - `internal/usecase/event_router.go`
-  - `internal/domain/interfaces.go`
-  - `internal/repository/art_route_store.go` (if wildcard/prefix matching is staged)
-  - `docs/DELIVERY.md`
-- **Risk:** **Low/Medium** (interface change ripple).
-- **Acceptance criteria:**
-  - Publish returns structured routing result (`routed`, `unroutable`, destination).
-  - Deterministic handling for no-route case (policy documented + tested).
-  - No change to external CLI/runtime bootstrap behavior required.
+### 2) Route decision outcomes + explicit unroutable handling contract ✅
+- **Status:** Implemented in current baseline.
+- `EventRouter` now exposes structured routing outcomes (`routed`, `unroutable`) while preserving the legacy publisher contract.
+- No-route decisions now deterministically skip delivery dispatch and are counted separately in broker metrics.
 
 ### 3) Add repeatable benchmark matrix for baseline vs fast path
 - **Goal:** Make performance claims measurable and regression-detectable.
@@ -146,12 +138,12 @@ This roadmap is grounded in the current repository shape and documented protocol
   - `internal/delivery/zmq/router_frames_test.go`
   - `docs/PROTOCOL.md`
 
-### Task 2: Structured route outcome + unroutable policy
-- **Why second:** Clarifies core broker semantics and enables metrics/retry later.
+### Task 2: Harden transport/media error taxonomy
+- **Why second now:** Better error classes make routing and delivery outcomes operationally actionable.
 - **Exact files likely to change:**
-  - `internal/usecase/event_router.go`
-  - `internal/domain/interfaces.go`
-  - `docs/DELIVERY.md`
+  - `internal/delivery/zmq/router.go`
+  - `pkg/errors/errors.go`
+  - `internal/media/*.go`
 
 ### Task 3: Benchmark matrix + reproducible reporting for default vs fast path
 - **Why third:** Prevents regressions and makes future optimizations evidence-driven.

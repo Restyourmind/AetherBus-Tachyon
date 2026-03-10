@@ -14,6 +14,7 @@ type EventRouter struct {
 }
 
 var _ domain.EventPublisher = (*EventRouter)(nil)
+var _ domain.EventPublisherWithResult = (*EventRouter)(nil)
 
 // NewEventRouter creates a new EventRouter.
 func NewEventRouter(routeStore domain.RouteStore) *EventRouter {
@@ -22,22 +23,29 @@ func NewEventRouter(routeStore domain.RouteStore) *EventRouter {
 	}
 }
 
-// Publish finds the destination node for the event and (for now) prints the routing decision.
+// Publish preserves the legacy publisher contract for existing callers.
 func (er *EventRouter) Publish(ctx context.Context, envelope domain.Envelope) error {
-	// For now, we'll just find the destination and print it.
-	// In a real implementation, this would involve more complex logic,
-	// such as forwarding the event to another node.
+	_, err := er.PublishWithResult(ctx, envelope)
+	return err
+}
+
+// PublishWithResult returns a structured routing outcome for observability and policy layers.
+func (er *EventRouter) PublishWithResult(ctx context.Context, envelope domain.Envelope) (domain.PublishResult, error) {
+	_ = ctx
+	result := domain.PublishResult{Topic: envelope.Event.Topic}
+
 	destNodeID := er.routeStore.Match(envelope.Event.Topic)
 	if destNodeID == "" {
-		// If no specific route is found, it might be a broadcast
-		// or an error, depending on the desired system behavior.
-		fmt.Printf("No route found for topic: %s\n", envelope.Event.Topic)
-		return nil // Or return an error
+		result.Status = domain.RouteStatusUnroutable
+		fmt.Printf("Routing unroutable event %s (topic: %s) from client %s\n",
+			envelope.Event.ID, envelope.Event.Topic, string(envelope.ClientID))
+		return result, nil
 	}
 
+	result.Status = domain.RouteStatusRouted
+	result.DestinationID = destNodeID
 	fmt.Printf("Routing event %s (topic: %s) from client %s to node %s\n",
 		envelope.Event.ID, envelope.Event.Topic, string(envelope.ClientID), destNodeID)
 
-	// In the future, this is where you would publish the event to the destination node.
-	return nil
+	return result, nil
 }
