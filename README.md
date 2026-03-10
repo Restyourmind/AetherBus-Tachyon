@@ -54,6 +54,15 @@ Optional direct-delivery durability can be enabled with:
 
 When enabled, direct messages that require ACK are appended to an append-only WAL before dispatch, ACK marks entries committed, and unacked entries are replayed when matching consumers reconnect after restart.
 
+Direct-delivery admission control defaults are intentionally conservative and can be tuned with:
+
+- `MAX_INFLIGHT_PER_CONSUMER` (default `1024`)
+- `MAX_PER_TOPIC_QUEUE` (default `256`)
+- `MAX_QUEUED_DIRECT` (default `4096`)
+- `MAX_GLOBAL_INGRESS` (default `8192`)
+
+When limits are reached, direct messages are deferred or dropped with explicit broker counters (`deferred`, `throttled`, `dropped`).
+
 ## 🧰 Build recovery under restricted network environments
 
 This repository may require external Go module resolution to complete full recovery of

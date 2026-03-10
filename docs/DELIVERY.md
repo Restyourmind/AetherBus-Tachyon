@@ -380,6 +380,18 @@ If a consumer is too slow:
 - the broker MAY disconnect the session after policy-defined thresholds
 - the broker SHOULD emit a health signal or diagnostic event
 
+### 15.3 Current Router Admission Model
+
+The current runtime applies direct-delivery admission control in this order:
+
+1. **Global ingress guard**: if `inflight + deferred >= max_global_ingress`, direct dispatch is dropped.
+2. **Consumer inflight guard**: if selected consumer is at `max_inflight`, message is deferred.
+3. **Per-topic deferred guard**: deferred queue is capped by `max_per_topic_queue`.
+4. **Global deferred guard**: aggregate deferred entries are capped by `max_queued_direct`.
+
+When deferred messages are present for a topic, they are deterministically drained as capacity
+is released by ACK/NACK completion.
+
 ## 16. Ordering
 
 AetherBus-Tachyon does not guarantee global ordering.
@@ -525,12 +537,22 @@ Current broker runtime behavior (`internal/delivery/zmq.Router`) includes:
 - direct consumer session registration via control messages on `_control`
 - direct inflight registry keyed by `message_id`
 - ACK handling that removes inflight state and treats duplicate/stale ACK as harmless no-op
+- ACK/NACK validation against `consumer_id` and optional `session_id` for session-aware direct finalization
 - NACK handling with deterministic outcomes:
   - `status=retryable_error` retries up to the configured max attempt count
+  - `status=retryable` is treated as retryable for compatibility
   - any other status is treated as terminal and finalized as dead-lettered
 - direct delivery counters for dispatched, acked, nacked, retried, and dead-lettered messages
 - per-consumer direct backpressure guard via `max_inflight_per_consumer` (hard cap for direct session inflight windows)
 - direct dispatch pause/backlog counters when a matching consumer is saturated
+- bounded deferred direct queues with explicit overload drop behavior:
+  - per-topic deferred queue bound (`max_per_topic_queue`, default `256`)
+  - global deferred direct queue bound (`max_queued_direct`, default `4096`)
+  - global direct ingress guard for `inflight + deferred` (`max_global_ingress`, default `8192`)
+- overload/defer observability counters:
+  - `deferred`: direct messages deferred due to temporary saturation
+  - `throttled`: direct dispatch attempts throttled into deferred queues
+  - `dropped`: direct messages dropped due to queue/ingress limits
 - fanout path remains lightweight via PUB dispatch, without per-subscriber ACK tracking
 
 This behavior provides at-least-once style retry handling for direct mode and does not provide exactly-once semantics.

@@ -46,6 +46,9 @@ func NewRuntimeWithCompressor(cfg *config.Config, bootstrapRoutes map[string]str
 		time.Duration(cfg.DeliveryTimeoutMS)*time.Millisecond,
 		durability,
 	)
+	router.SetMaxInflightPerConsumer(cfg.MaxInflightPerConsumer)
+	router.SetQueueBounds(cfg.MaxPerTopicQueue, cfg.MaxQueuedDirect)
+	router.SetGlobalIngressLimit(cfg.MaxGlobalIngress)
 
 	return &Runtime{
 		RouteStore: routeStore,

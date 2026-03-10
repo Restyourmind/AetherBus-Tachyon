@@ -130,17 +130,17 @@ func TestHandleAckDuplicateAndStale(t *testing.T) {
 		t.Fatalf("expected dispatched=1, got %d", got)
 	}
 
-	r.handleAck("msg-1", "worker-1")
+	r.handleAck("msg-1", "worker-1", "sess_000001")
 	if got := r.metrics.Acked; got != 1 {
 		t.Fatalf("expected acked=1, got %d", got)
 	}
 
-	r.handleAck("msg-1", "worker-1") // duplicate ACK
+	r.handleAck("msg-1", "worker-1", "sess_000001") // duplicate ACK
 	if got := r.metrics.Acked; got != 1 {
 		t.Fatalf("expected duplicate ACK to be harmless, got acked=%d", got)
 	}
 
-	r.handleAck("missing", "worker-1") // stale ACK
+	r.handleAck("missing", "worker-1", "sess_000001") // stale ACK
 	if got := r.metrics.Acked; got != 1 {
 		t.Fatalf("expected stale ACK to be ignored, got acked=%d", got)
 	}
@@ -166,7 +166,7 @@ func TestRetryableNackRetried(t *testing.T) {
 	}
 
 	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`))
-	r.handleNack("msg-2", "worker-1", "retryable_error")
+	r.handleNack("msg-2", "worker-1", "sess_000001", "retryable_error")
 
 	if got := r.metrics.Nacked; got != 1 {
 		t.Fatalf("expected nacked=1, got %d", got)
@@ -199,7 +199,7 @@ func TestTerminalNackDeadLettered(t *testing.T) {
 	}
 
 	r.dispatchDirect("orders.created", "msg-3", []byte(`{"id":"msg-3"}`))
-	r.handleNack("msg-3", "worker-1", "terminal_error")
+	r.handleNack("msg-3", "worker-1", "sess_000001", "terminal_error")
 
 	if got := r.metrics.Nacked; got != 1 {
 		t.Fatalf("expected nacked=1, got %d", got)
@@ -366,7 +366,7 @@ func TestResumeDispatchAfterAckDropsInflight(t *testing.T) {
 
 	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`))
 	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`)) // paused
-	r.handleAck("msg-1", "worker-1")
+	r.handleAck("msg-1", "worker-1", "sess_000001")
 	r.dispatchDirect("orders.created", "msg-3", []byte(`{"id":"msg-3"}`)) // resumed
 
 	if got := r.metrics.Dispatched; got != 2 {
@@ -376,8 +376,8 @@ func TestResumeDispatchAfterAckDropsInflight(t *testing.T) {
 		t.Fatalf("expected one inflight after redispatch, got %d", session.InflightCount)
 	}
 	snapshot := r.ConsumerBacklogSnapshot()
-	if got := snapshot["worker-1"].Backlog; got != 0 {
-		t.Fatalf("expected backlog drained after resume dispatch, got %d", got)
+	if got := snapshot["worker-1"].Backlog; got != 1 {
+		t.Fatalf("expected backlog to retain one deferred message after resume dispatch, got %d", got)
 	}
 }
 
@@ -403,7 +403,7 @@ func TestDispatchDirectWritesWALAndAckCommits(t *testing.T) {
 		t.Fatalf("expected wal_written=1, got %d", got)
 	}
 
-	r.handleAck("msg-w1", "worker-1")
+	r.handleAck("msg-w1", "worker-1", "sess_000001")
 	if len(w.committed) != 1 || w.committed[0] != "msg-w1" {
 		t.Fatalf("expected wal commit for msg-w1, got %#v", w.committed)
 	}
@@ -442,5 +442,112 @@ func TestReplayFromWALOnRegister(t *testing.T) {
 	}
 	if _, ok := r.inflight["msg-r1"]; !ok {
 		t.Fatalf("expected replayed message in inflight")
+	}
+}
+
+func TestStaleAckSessionMismatchIgnored(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	r.directSessions["worker-1"] = &consumerSession{
+		SessionID:      "sess_000001",
+		ConsumerID:     "worker-1",
+		SocketIdentity: []byte("cid1"),
+		SupportsAck:    true,
+		MaxInflight:    10,
+		Subscriptions: map[string]struct{}{
+			"orders.created": {},
+		},
+	}
+
+	r.dispatchDirect("orders.created", "msg-4", []byte(`{"id":"msg-4"}`))
+	r.handleAck("msg-4", "worker-1", "sess_old")
+
+	if got := r.metrics.Acked; got != 0 {
+		t.Fatalf("expected stale session ack ignored, got acked=%d", got)
+	}
+	if _, ok := r.inflight["msg-4"]; !ok {
+		t.Fatalf("expected inflight entry to remain after stale session ack")
+	}
+}
+
+func TestDeferredDispatchForSlowConsumer(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	r.SetQueueBounds(4, 8)
+	r.directSessions["worker-1"] = &consumerSession{
+		SessionID:      "sess_000001",
+		ConsumerID:     "worker-1",
+		SocketIdentity: []byte("cid1"),
+		SupportsAck:    true,
+		MaxInflight:    1,
+		Subscriptions: map[string]struct{}{
+			"orders.created": {},
+		},
+	}
+	sends := 0
+	r.directSender = func(identity []byte, topic string, payload []byte) error {
+		sends++
+		return nil
+	}
+
+	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`))
+	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`))
+	if got := r.metrics.Deferred; got != 1 {
+		t.Fatalf("expected deferred=1, got %d", got)
+	}
+	r.handleAck("msg-1", "worker-1", "sess_000001")
+
+	if sends != 2 {
+		t.Fatalf("expected deferred message to be dispatched after ack, got sends=%d", sends)
+	}
+	if _, ok := r.inflight["msg-2"]; !ok {
+		t.Fatalf("expected deferred message promoted to inflight")
+	}
+}
+
+func TestPerTopicQueueBoundDropsExcess(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	r.SetQueueBounds(1, 8)
+	r.directSessions["worker-1"] = &consumerSession{
+		SessionID:      "sess_000001",
+		ConsumerID:     "worker-1",
+		SocketIdentity: []byte("cid1"),
+		SupportsAck:    true,
+		MaxInflight:    1,
+		Subscriptions: map[string]struct{}{
+			"orders.created": {},
+		},
+	}
+
+	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`))
+	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`))
+	r.dispatchDirect("orders.created", "msg-3", []byte(`{"id":"msg-3"}`))
+
+	if got := r.metrics.Dropped; got != 1 {
+		t.Fatalf("expected dropped=1 for bounded queue overflow, got %d", got)
+	}
+}
+
+func TestGlobalIngressLimitDropsNewDispatch(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	r.SetQueueBounds(4, 8)
+	r.SetGlobalIngressLimit(1)
+	r.directSessions["worker-1"] = &consumerSession{
+		SessionID:      "sess_000001",
+		ConsumerID:     "worker-1",
+		SocketIdentity: []byte("cid1"),
+		SupportsAck:    true,
+		MaxInflight:    1,
+		Subscriptions: map[string]struct{}{
+			"orders.created": {},
+		},
+	}
+
+	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`))
+	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`))
+
+	if got := r.metrics.Dropped; got != 1 {
+		t.Fatalf("expected dropped=1 for global ingress protection, got %d", got)
+	}
+	if _, ok := r.inflight["msg-2"]; ok {
+		t.Fatalf("expected second message to be dropped before inflight registration")
 	}
 }

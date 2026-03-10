@@ -411,6 +411,7 @@ The logical lifecycle of a message is:
   "type": "ack",
   "message_id": "msg_01HV8J1K9C7K7Q...",
   "consumer_id": "worker.invoice.1",
+  "session_id": "sess_000123",
   "status": "processed",
   "processed_at": 1741337000500
 }
@@ -423,6 +424,7 @@ The logical lifecycle of a message is:
   "type": "nack",
   "message_id": "msg_01HV8J1K9C7K7Q...",
   "consumer_id": "worker.invoice.1",
+  "session_id": "sess_000123",
   "status": "retryable_error",
   "reason": "temporary downstream timeout"
 }
@@ -435,6 +437,7 @@ For direct delivery with acknowledgment enabled:
 - a consumer SHOULD ACK successful processing
 - a consumer SHOULD NACK recoverable failures
 - a broker SHOULD correlate ACK/NACK by message_id
+- a broker SHOULD validate consumer_id and (when provided) session_id before mutating inflight state
 - a broker MUST ignore ACK/NACK for unknown or expired sessions unless explicitly configured otherwise
 - control-plane ACK/NACK exchanges MAY be sent as JSON control messages on a reserved transport topic such as `_control`
 

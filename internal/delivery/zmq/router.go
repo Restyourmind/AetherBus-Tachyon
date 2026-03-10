@@ -37,6 +37,10 @@ type Router struct {
 	metrics                DeliveryMetrics
 	maxDirectRetries       int
 	maxInflightPerConsumer int
+	maxPerTopicQueue       int
+	maxQueuedDirect        int
+	maxGlobalIngress       int
+	directQueue            map[string][]queuedDirectMessage
 	directSender           func(identity []byte, topic string, payload []byte) error
 }
 
@@ -76,6 +80,12 @@ type inflightMessage struct {
 	DispatchedAt    time.Time
 }
 
+type queuedDirectMessage struct {
+	MessageID string
+	Topic     string
+	Payload   []byte
+}
+
 // DeliveryMetrics captures direct-delivery lifecycle counters.
 type DeliveryMetrics struct {
 	Dispatched        uint64
@@ -89,6 +99,9 @@ type DeliveryMetrics struct {
 	BacklogQueued     uint64
 	WALWritten        uint64
 	WALReplayed       uint64
+	Deferred          uint64
+	Throttled         uint64
+	Dropped           uint64
 }
 
 // ConsumerBacklogMetrics captures per-consumer direct dispatch pressure.
@@ -101,6 +114,7 @@ type ConsumerBacklogMetrics struct {
 type controlMessage struct {
 	Type          string   `json:"type"`
 	ConsumerID    string   `json:"consumer_id"`
+	SessionID     string   `json:"session_id"`
 	MessageID     string   `json:"message_id"`
 	Status        string   `json:"status"`
 	Mode          string   `json:"mode"`
@@ -141,6 +155,10 @@ func NewRouterWithDurability(bindAddress, pubAddress string, publisher domain.Ev
 		completed:              map[string]deliveryStatus{},
 		maxDirectRetries:       maxDirectRetries,
 		maxInflightPerConsumer: 1024,
+		maxPerTopicQueue:       256,
+		maxQueuedDirect:        4096,
+		maxGlobalIngress:       8192,
+		directQueue:            map[string][]queuedDirectMessage{},
 		deliveryTimeout:        deliveryTimeout,
 		now:                    func() time.Time { return time.Now().UTC() },
 		wal:                    durability,
@@ -155,6 +173,28 @@ func (r *Router) SetMaxInflightPerConsumer(limit int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.maxInflightPerConsumer = limit
+}
+
+// SetQueueBounds configures per-topic and global queued direct-message limits.
+func (r *Router) SetQueueBounds(maxPerTopicQueue, maxQueuedDirect int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if maxPerTopicQueue > 0 {
+		r.maxPerTopicQueue = maxPerTopicQueue
+	}
+	if maxQueuedDirect > 0 {
+		r.maxQueuedDirect = maxQueuedDirect
+	}
+}
+
+// SetGlobalIngressLimit configures a hard cap for inflight+queued direct messages.
+func (r *Router) SetGlobalIngressLimit(limit int) {
+	if limit <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.maxGlobalIngress = limit
 }
 
 // Start initializes and runs the ZMQ ROUTER socket loop.
@@ -404,9 +444,9 @@ func (r *Router) handleControl(clientID []byte, raw []byte) {
 	case "consumer.heartbeat":
 		r.heartbeatConsumer(msg.ConsumerID)
 	case "ack":
-		r.handleAck(msg.MessageID, msg.ConsumerID)
+		r.handleAck(msg.MessageID, msg.ConsumerID, msg.SessionID)
 	case "nack":
-		r.handleNack(msg.MessageID, msg.ConsumerID, msg.Status)
+		r.handleNack(msg.MessageID, msg.ConsumerID, msg.SessionID, msg.Status)
 	}
 }
 
@@ -448,28 +488,21 @@ func (r *Router) heartbeatConsumer(consumerID string) {
 
 func (r *Router) dispatchDirect(topic, messageID string, payload []byte) {
 	r.mu.Lock()
-	session := r.selectSession(topic)
-	if session == nil {
+	if r.maxGlobalIngress > 0 && r.totalDirectLoadLocked() >= r.maxGlobalIngress {
+		r.metrics.Dropped++
+		fmt.Printf("{\"event\":\"ingress_drop\",\"topic\":%q,\"message_id\":%q,\"reason\":\"global_ingress_limit\",\"limit\":%d}\n", topic, messageID, r.maxGlobalIngress)
 		r.mu.Unlock()
 		return
 	}
-	if session.SupportsAck && messageID != "" {
-		r.inflight[messageID] = &inflightMessage{
-			MessageID:       messageID,
-			ConsumerID:      session.ConsumerID,
-			SessionID:       session.SessionID,
-			Topic:           topic,
-			Payload:         append([]byte(nil), payload...),
-			DeliveryAttempt: 1,
-			Status:          statusDispatched,
-			DispatchedAt:    r.now(),
+	session := r.selectSession(topic)
+	if session == nil {
+		if messageID != "" {
+			r.enqueueDirectLocked(topic, messageID, payload)
 		}
-		session.InflightCount++
+		r.mu.Unlock()
+		return
 	}
-	r.metrics.Dispatched++
-	identity := append([]byte(nil), session.SocketIdentity...)
-	walEntry := walDispatchedEntry{MessageID: messageID, Consumer: session.ConsumerID, SessionID: session.SessionID, Topic: topic, Payload: append([]byte(nil), payload...), Attempt: 1}
-	needsWAL := r.wal != nil && session.SupportsAck && messageID != ""
+	identity, walEntry, needsWAL := r.prepareDispatchLocked(session, topic, messageID, payload, 1)
 	r.mu.Unlock()
 
 	if needsWAL {
@@ -489,6 +522,63 @@ func (r *Router) dispatchDirect(topic, messageID string, payload []byte) {
 	}
 }
 
+func (r *Router) prepareDispatchLocked(session *consumerSession, topic, messageID string, payload []byte, attempt int) ([]byte, walDispatchedEntry, bool) {
+	if session.SupportsAck && messageID != "" {
+		r.inflight[messageID] = &inflightMessage{
+			MessageID:       messageID,
+			ConsumerID:      session.ConsumerID,
+			SessionID:       session.SessionID,
+			Topic:           topic,
+			Payload:         append([]byte(nil), payload...),
+			DeliveryAttempt: attempt,
+			Status:          statusDispatched,
+			DispatchedAt:    r.now(),
+		}
+		session.InflightCount++
+	}
+	r.metrics.Dispatched++
+	identity := append([]byte(nil), session.SocketIdentity...)
+	walEntry := walDispatchedEntry{MessageID: messageID, Consumer: session.ConsumerID, SessionID: session.SessionID, Topic: topic, Payload: append([]byte(nil), payload...), Attempt: attempt}
+	needsWAL := r.wal != nil && session.SupportsAck && messageID != ""
+	return identity, walEntry, needsWAL
+}
+
+func (r *Router) enqueueDirectLocked(topic, messageID string, payload []byte) {
+	queue := r.directQueue[topic]
+	if r.maxPerTopicQueue > 0 && len(queue) >= r.maxPerTopicQueue {
+		r.metrics.Dropped++
+		fmt.Printf("{\"event\":\"direct_drop\",\"topic\":%q,\"message_id\":%q,\"reason\":\"topic_queue_full\",\"limit\":%d}\n", topic, messageID, r.maxPerTopicQueue)
+		return
+	}
+	if r.maxQueuedDirect > 0 && r.totalQueuedLocked() >= r.maxQueuedDirect {
+		r.metrics.Dropped++
+		fmt.Printf("{\"event\":\"direct_drop\",\"topic\":%q,\"message_id\":%q,\"reason\":\"global_direct_queue_full\",\"limit\":%d}\n", topic, messageID, r.maxQueuedDirect)
+		return
+	}
+	r.metrics.Deferred++
+	r.metrics.Throttled++
+	r.metrics.BacklogQueued++
+	r.directQueue[topic] = append(queue, queuedDirectMessage{MessageID: messageID, Topic: topic, Payload: append([]byte(nil), payload...)})
+	for _, s := range r.directSessions {
+		if _, ok := s.Subscriptions[topic]; ok {
+			s.BacklogCount++
+		}
+	}
+	fmt.Printf("{\"event\":\"direct_deferred\",\"topic\":%q,\"message_id\":%q}\n", topic, messageID)
+}
+
+func (r *Router) totalQueuedLocked() int {
+	total := 0
+	for _, queue := range r.directQueue {
+		total += len(queue)
+	}
+	return total
+}
+
+func (r *Router) totalDirectLoadLocked() int {
+	return len(r.inflight) + r.totalQueuedLocked()
+}
+
 func (r *Router) selectSession(topic string) *consumerSession {
 	if len(r.directSessions) == 0 {
 		return nil
@@ -505,12 +595,7 @@ func (r *Router) selectSession(topic string) *consumerSession {
 		}
 		if s.InflightCount >= s.MaxInflight {
 			r.metrics.DispatchPaused++
-			r.metrics.BacklogQueued++
-			s.BacklogCount++
 			continue
-		}
-		if s.BacklogCount > 0 {
-			s.BacklogCount--
 		}
 		return s
 	}
@@ -532,7 +617,7 @@ func (r *Router) ConsumerBacklogSnapshot() map[string]ConsumerBacklogMetrics {
 	return out
 }
 
-func (r *Router) handleAck(messageID, consumerID string) {
+func (r *Router) handleAck(messageID, consumerID, sessionID string) {
 	r.mu.Lock()
 	if prior, ok := r.completed[messageID]; ok && prior == statusAcked {
 		r.mu.Unlock()
@@ -543,8 +628,14 @@ func (r *Router) handleAck(messageID, consumerID string) {
 		r.mu.Unlock()
 		return
 	}
+	if sessionID != "" && record.SessionID != sessionID {
+		r.mu.Unlock()
+		return
+	}
+	var drain []retryDispatch
 	if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
 		s.InflightCount--
+		drain = r.drainDeferredLocked(record.Topic)
 	}
 	delete(r.inflight, messageID)
 	r.completed[messageID] = statusAcked
@@ -557,17 +648,22 @@ func (r *Router) handleAck(messageID, consumerID string) {
 			fmt.Printf("failed to append wal commit: %v\n", err)
 		}
 	}
+	r.sendDeferred(drain)
 }
 
-func (r *Router) handleNack(messageID, consumerID, status string) {
+func (r *Router) handleNack(messageID, consumerID, sessionID, status string) {
 	r.mu.Lock()
 	record, ok := r.inflight[messageID]
 	if !ok || record.ConsumerID != consumerID {
 		r.mu.Unlock()
 		return
 	}
+	if sessionID != "" && record.SessionID != sessionID {
+		r.mu.Unlock()
+		return
+	}
 	r.metrics.Nacked++
-	isRetryable := status == "retryable_error"
+	isRetryable := status == "retryable_error" || status == "retryable"
 	if isRetryable && record.DeliveryAttempt < r.maxDirectRetries {
 		session, ok := r.directSessions[record.ConsumerID]
 		if !ok {
@@ -594,6 +690,7 @@ func (r *Router) handleNack(messageID, consumerID, status string) {
 	if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
 		s.InflightCount--
 	}
+	drain := r.drainDeferredLocked(record.Topic)
 	delete(r.inflight, messageID)
 	if isRetryable {
 		r.completed[messageID] = statusNacked
@@ -602,6 +699,47 @@ func (r *Router) handleNack(messageID, consumerID, status string) {
 		r.metrics.DeadLettered++
 	}
 	r.mu.Unlock()
+	r.sendDeferred(drain)
+}
+
+func (r *Router) drainDeferredLocked(topic string) []retryDispatch {
+	queue := r.directQueue[topic]
+	if len(queue) == 0 {
+		return nil
+	}
+	session := r.selectSession(topic)
+	if session == nil {
+		return nil
+	}
+	msg := queue[0]
+	if len(queue) == 1 {
+		delete(r.directQueue, topic)
+	} else {
+		r.directQueue[topic] = queue[1:]
+	}
+	if session.BacklogCount > 0 {
+		session.BacklogCount--
+	}
+	identity, walEntry, needsWAL := r.prepareDispatchLocked(session, msg.Topic, msg.MessageID, msg.Payload, 1)
+	if needsWAL {
+		if err := r.wal.AppendDispatched(walEntry); err != nil {
+			fmt.Printf("failed to append wal dispatch: %v\n", err)
+		} else {
+			r.metrics.WALWritten++
+		}
+	}
+	return []retryDispatch{{identity: identity, topic: msg.Topic, payload: msg.Payload}}
+}
+
+func (r *Router) sendDeferred(retries []retryDispatch) {
+	for _, retry := range retries {
+		if r.directSender == nil {
+			continue
+		}
+		if err := r.directSender(retry.identity, retry.topic, retry.payload); err != nil {
+			fmt.Printf("failed to direct-dispatch deferred event: %v\n", err)
+		}
+	}
 }
 
 // MetricsSnapshot returns a thread-safe copy of delivery counters.
