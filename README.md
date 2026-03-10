@@ -192,7 +192,73 @@ flowchart TD
 
 This structure reflects the current codebase more closely than a generic broker diagram and keeps the runtime wiring, routing store, and transport/media responsibilities clearly separated.
 
-> Note: the current repository does not yet expose a real database persistence layer; therefore this diagram intentionally models the runtime architecture and in-memory/domain data flow found in the code today.
+## 🗃️ Data Storage Structure (Current)
+
+The broker currently uses a **hybrid in-memory + append-only WAL** model instead of a full relational database. The logical data structures are:
+
+### 1) Route store (in-memory ART)
+
+- Purpose: topic-to-destination lookup for routing decisions
+- Shape: key-value map over ART nodes
+- Lifecycle: runtime memory only (reconstructed from bootstrap routes on restart)
+
+| Field | Type | Description |
+|---|---|---|
+| `topic` | string | Topic key used for route lookup |
+| `destination` | string | Target consumer/node identifier |
+
+### 2) Direct consumer session table (in-memory)
+
+- Purpose: active consumer capability/session tracking for direct delivery
+- Shape: map keyed by `consumer_id`
+- Lifecycle: runtime memory only
+
+| Field | Type | Description |
+|---|---|---|
+| `consumer_id` | string | Stable consumer identity |
+| `session_id` | string | Active session identifier |
+| `socket_identity` | bytes | ZeroMQ ROUTER identity for direct send |
+| `supports_ack` | bool | Whether consumer participates in ACK flow |
+| `subscriptions` | set[string] | Topics subscribed for direct delivery |
+| `max_inflight` | int | Consumer inflight window cap |
+| `inflight_count` | int | Current number of inflight messages |
+| `last_heartbeat` | timestamp | Last heartbeat seen from consumer |
+
+### 3) Inflight delivery table (in-memory)
+
+- Purpose: ACK/NACK, retry, timeout, and dead-letter control for direct mode
+- Shape: map keyed by `message_id`
+- Lifecycle: runtime memory; can be repopulated from WAL replay for unacked messages
+
+| Field | Type | Description |
+|---|---|---|
+| `message_id` | string | Message identity used for ACK/NACK correlation |
+| `consumer_id` | string | Target consumer for this attempt |
+| `session_id` | string | Session that received the dispatch |
+| `topic` | string | Routed topic |
+| `payload` | bytes | Original payload bytes |
+| `attempt` | int | Delivery attempt count |
+| `dispatched_at` | timestamp | Dispatch time used for timeout evaluation |
+| `status` | enum | `dispatched` / `acked` / `nacked` / `expired` / `retry_scheduled` / `dead_lettered` |
+
+### 4) Delivery WAL (append-only file)
+
+- Purpose: durability for direct messages requiring ACK
+- Storage: JSON-line append log (default path `./data/direct_delivery.wal`)
+- Recovery: uncommitted dispatch records are replayed when matching consumers re-register
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | enum | `dispatched` or `committed` |
+| `message_id` | string | Message identity |
+| `consumer` | string | Consumer identity for dispatched records |
+| `session_id` | string | Session ID for dispatched records |
+| `topic` | string | Topic for dispatched records |
+| `payload` | bytes | Payload for dispatched records |
+| `attempt` | int | Attempt number for dispatched records |
+| `ts_unix_nano` | int64 | Record timestamp |
+
+> Note: if you need SQL/NoSQL persistence in the future, this model can be mapped directly to tables/collections (`routes`, `consumer_sessions`, `inflight_messages`, `delivery_wal`) while preserving existing runtime semantics.
 
 ## 💡 Function Proposals & Future Extensions
 
@@ -203,30 +269,30 @@ This structure reflects the current codebase more closely than a generic broker 
 - **Binary Frame Transport Path:** Introduce a compact binary frame header so the broker can route messages by topic without decoding large payloads first.
 - **Large-payload Streaming Mode:** Add chunked transfer and streaming delivery for 1MB+ payload classes to reduce memory spikes and improve throughput.
 - **Rust Fast-path Sidecar / FFI Module:** Move compression, framing, and large-payload processing into a Rust fast path while keeping Go for orchestration.
-- **ACK/NACK Control Messages:** Add explicit control-plane messages for delivery acknowledgment, retry signaling, and negative acknowledgment.
-- **Backpressure & Admission Control:** Add queue-depth-based throttling, rate limits, and overload protection policies.
-- **Durable Spool / WAL Layer:** Add optional local durability for replay, crash recovery, and delayed redelivery workflows.
-- **Admin API & Runtime Introspection:** Expose route inspection, connected clients, inflight counters, and broker health via HTTP or gRPC.
 - **Schema Registry Integration:** Support schema version validation for structured payloads and safer producer/consumer evolution.
 - **Rule-based Message Filtering:** Allow consumers to subscribe with filter expressions beyond exact topic matching.
 - **Federation / Cluster Routing:** Extend single-node routing into multi-node broker meshes with route propagation and failover.
 - **Benchmark & Profiling Harness:** Add a first-class benchmark command with p50/p95/p99 latency, throughput, memory, and allocation reporting.
 - **Object-store Payload References:** Allow oversized payloads to be stored externally while the broker transports only metadata and retrieval references.
+- **Durability Backends (SQLite/BoltDB/Badger):** Add pluggable local storage engines behind the current WAL abstraction for better operational flexibility.
+- **Policy-driven Retention & Compaction:** Introduce retention windows and background compaction for WAL/inflight records to control disk growth.
+- **Multi-tenant Quotas & Isolation:** Add tenant-scoped inflight limits, throughput quotas, and fairness scheduling.
+- **Unified Observability Endpoint:** Expose metrics and delivery/session state snapshots via Prometheus + optional OpenTelemetry.
 
 ### ภาษาไทย
 
 - **เส้นทางส่งข้อมูลแบบ Binary Frame:** เพิ่ม header แบบไบนารีเพื่อให้ broker ตัดสินใจ route ได้จากหัวข้อ โดยไม่ต้อง decode payload ขนาดใหญ่ก่อน
 - **โหมดส่งข้อมูลขนาดใหญ่แบบ Streaming:** รองรับการแบ่งชิ้นและส่งต่อแบบ stream สำหรับ payload ระดับ 1MB ขึ้นไป เพื่อลดการใช้หน่วยความจำและเพิ่ม throughput
 - **Rust Fast-path แบบ Sidecar / FFI:** ย้ายงาน framing, compression และเส้นทาง payload ใหญ่ไปยังโมดูล Rust โดยคง Go ไว้สำหรับ orchestration
-- **ACK/NACK Control Messages:** เพิ่มข้อความควบคุมสำหรับยืนยันการส่ง แจ้ง retry และปฏิเสธข้อความอย่างชัดเจน
-- **Backpressure และ Admission Control:** เพิ่มกลไกชะลอโหลด จำกัดอัตรา และป้องกันระบบล้นตามความลึกของคิวและสถานะ runtime
-- **Durable Spool / WAL:** เพิ่มตัวเลือกสำหรับเก็บข้อมูลชั่วคราวแบบคงทน เพื่อรองรับ replay, crash recovery และ delayed redelivery
-- **Admin API และ Runtime Introspection:** เปิด API สำหรับตรวจ route, client ที่เชื่อมต่ออยู่, inflight counters และสุขภาพของ broker
 - **การเชื่อมต่อ Schema Registry:** รองรับการตรวจสอบเวอร์ชันของ schema สำหรับ payload แบบ structured เพื่อให้ producer/consumer เปลี่ยนแปลงได้ปลอดภัยขึ้น
 - **Rule-based Message Filtering:** ให้ consumer สมัครรับข้อความด้วยเงื่อนไขการกรองที่ยืดหยุ่นกว่าการ match topic แบบตรงตัว
 - **Federation / Cluster Routing:** ขยายจาก single-node broker ไปสู่ broker mesh หลายโหนด พร้อม route propagation และ failover
 - **Benchmark และ Profiling Harness:** เพิ่มคำสั่ง benchmark อย่างเป็นทางการ พร้อมรายงาน p50/p95/p99, throughput, memory และ allocations
 - **Object-store Payload References:** เปิดทางให้ payload ที่มีขนาดใหญ่มากถูกเก็บภายนอก และให้ broker รับส่งเฉพาะ metadata กับ reference สำหรับดึงข้อมูล
+- **Durability Backends (SQLite/BoltDB/Badger):** เพิ่มตัวเลือก storage engine แบบ pluggable ภายใต้ abstraction เดิมของ WAL เพื่อความยืดหยุ่นด้านปฏิบัติการ
+- **Retention และ Compaction ตามนโยบาย:** เพิ่มนโยบายอายุข้อมูลและงาน compaction เบื้องหลังสำหรับ WAL/inflight เพื่อลดการเติบโตของไฟล์
+- **Multi-tenant Quotas และ Isolation:** เพิ่มเพดาน inflight/throughput แยกตาม tenant พร้อมกลไกจัดสรรความยุติธรรม
+- **Unified Observability Endpoint:** รวมการเปิดเผย metrics และ snapshot สถานะ delivery/session ผ่าน Prometheus และเลือกส่ง OpenTelemetry ได้
 
 ## 📘 Deep Architecture & Protocol Docs
 
