@@ -335,6 +335,7 @@ To move AetherBus-Tachyon toward a production-grade broker spec, the repository 
 - [Routing Semantics (ART)](docs/ROUTING.md)
 - [Delivery Semantics (ACK/Retry/Backpressure/DLQ)](docs/DELIVERY.md)
 - [Performance Model and Benchmarking](docs/PERFORMANCE.md)
+- [Rust Fast-path Sidecar Scaffold](docs/FASTPATH_SIDECAR.md)
 
 ### Delivery timeout configuration
 
@@ -350,6 +351,16 @@ These docs lock down the key areas that must be explicit for production evolutio
 - Topic grammar and wildcard matching precedence
 - Delivery guarantees and retry/dead-letter behavior
 - Operational model (backpressure, failure handling, observability)
+
+## Rust fast-path adapter boundary (scaffold)
+
+The repository includes a scaffolded Rust sidecar (`rust/tachyon-fastpath`) and a narrow Go adapter boundary (`internal/fastpath`).
+
+- Default runtime mode remains **Go-only** for backward-compatible behavior.
+- Rust sidecar is an explicit opt-in integration path for large payload framing/compression offload.
+- The first iteration intentionally uses a process boundary (Unix socket sidecar) to minimize risk to broker delivery semantics.
+
+See `docs/FASTPATH_SIDECAR.md` for architecture, activation criteria, and measurable migration candidates.
 
 ## Specifications
 

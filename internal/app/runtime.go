@@ -6,6 +6,7 @@ import (
 	"github.com/aetherbus/aetherbus-tachyon/config"
 	"github.com/aetherbus/aetherbus-tachyon/internal/delivery/zmq"
 	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
+	"github.com/aetherbus/aetherbus-tachyon/internal/fastpath"
 	"github.com/aetherbus/aetherbus-tachyon/internal/media"
 	"github.com/aetherbus/aetherbus-tachyon/internal/repository"
 	"github.com/aetherbus/aetherbus-tachyon/internal/usecase"
@@ -13,8 +14,9 @@ import (
 
 // Runtime contains the wired application components used by command entrypoints.
 type Runtime struct {
-	RouteStore *repository.ART_RouteStore
-	Router     *zmq.Router
+	RouteStore   *repository.ART_RouteStore
+	Router       *zmq.Router
+	FrameAdapter fastpath.FrameAdapter
 }
 
 // NewRuntime wires the core Tachyon runtime from config and bootstrap routes.
@@ -51,8 +53,9 @@ func NewRuntimeWithCompressor(cfg *config.Config, bootstrapRoutes map[string]str
 	router.SetGlobalIngressLimit(cfg.MaxGlobalIngress)
 
 	return &Runtime{
-		RouteStore: routeStore,
-		Router:     router,
+		RouteStore:   routeStore,
+		Router:       router,
+		FrameAdapter: NewDefaultFrameAdapter(),
 	}
 }
 
