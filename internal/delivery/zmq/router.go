@@ -350,7 +350,7 @@ func (r *Router) replayFromWAL(consumerID string) {
 		r.inflight[entry.MessageID] = &inflightMessage{
 			MessageID:       entry.MessageID,
 			ConsumerID:      entry.Consumer,
-			SessionID:       entry.SessionID,
+			SessionID:       session.SessionID,
 			Topic:           entry.Topic,
 			Payload:         append([]byte(nil), entry.Payload...),
 			DeliveryAttempt: attempt,
@@ -371,6 +371,56 @@ func (r *Router) replayFromWAL(consumerID string) {
 			fmt.Printf("failed to replay wal event: %v\n", err)
 		}
 	}
+}
+
+func (r *Router) promoteDeferredForConsumer(consumerID string) {
+	r.mu.Lock()
+	session, ok := r.directSessions[consumerID]
+	if !ok {
+		r.mu.Unlock()
+		return
+	}
+	topics := make([]string, 0, len(session.Subscriptions))
+	for topic := range session.Subscriptions {
+		topics = append(topics, topic)
+	}
+	sort.Strings(topics)
+
+	deferred := make([]retryDispatch, 0)
+	for session.InflightCount < session.MaxInflight {
+		dispatched := false
+		for _, topic := range topics {
+			queue := r.directQueue[topic]
+			if len(queue) == 0 {
+				continue
+			}
+			msg := queue[0]
+			if len(queue) == 1 {
+				delete(r.directQueue, topic)
+			} else {
+				r.directQueue[topic] = queue[1:]
+			}
+			if session.BacklogCount > 0 {
+				session.BacklogCount--
+			}
+			identity, walEntry, needsWAL := r.prepareDispatchLocked(session, msg.Topic, msg.MessageID, msg.Payload, 1)
+			if needsWAL {
+				if err := r.wal.AppendDispatched(walEntry); err != nil {
+					fmt.Printf("failed to append wal dispatch: %v\n", err)
+				} else {
+					r.metrics.WALWritten++
+				}
+			}
+			deferred = append(deferred, retryDispatch{identity: identity, topic: msg.Topic, payload: msg.Payload})
+			dispatched = true
+			break
+		}
+		if !dispatched {
+			break
+		}
+	}
+	r.mu.Unlock()
+	r.sendDeferred(deferred)
 }
 
 func (r *Router) processInflightTimeouts() {
@@ -489,6 +539,7 @@ func (r *Router) registerConsumerSession(clientID []byte, msg controlMessage) {
 	r.mu.Unlock()
 
 	r.replayFromWAL(msg.ConsumerID)
+	r.promoteDeferredForConsumer(msg.ConsumerID)
 }
 
 func (r *Router) heartbeatConsumer(consumerID string) {
@@ -715,6 +766,48 @@ func (r *Router) handleNack(messageID, consumerID, sessionID, status string) {
 			fmt.Printf("failed to append wal dead-letter: %v\n", err)
 		}
 	}
+	r.sendDeferred(drain)
+}
+
+func (r *Router) drainDeferredLocked(topic string) []retryDispatch {
+	queue := r.directQueue[topic]
+	if len(queue) == 0 {
+		return nil
+	}
+	session := r.selectSession(topic)
+	if session == nil {
+		return nil
+	}
+	msg := queue[0]
+	if len(queue) == 1 {
+		delete(r.directQueue, topic)
+	} else {
+		r.directQueue[topic] = queue[1:]
+	}
+	if session.BacklogCount > 0 {
+		session.BacklogCount--
+	}
+	identity, walEntry, needsWAL := r.prepareDispatchLocked(session, msg.Topic, msg.MessageID, msg.Payload, 1)
+	if needsWAL {
+		if err := r.wal.AppendDispatched(walEntry); err != nil {
+			fmt.Printf("failed to append wal dispatch: %v\n", err)
+		} else {
+			r.metrics.WALWritten++
+		}
+	}
+	return []retryDispatch{{identity: identity, topic: msg.Topic, payload: msg.Payload}}
+}
+
+func (r *Router) sendDeferred(retries []retryDispatch) {
+	for _, retry := range retries {
+		if r.directSender == nil {
+			continue
+		}
+		if err := r.directSender(retry.identity, retry.topic, retry.payload); err != nil {
+			fmt.Printf("failed to direct-dispatch deferred event: %v\n", err)
+		}
+	}
+	r.mu.Unlock()
 	r.sendDeferred(drain)
 }
 

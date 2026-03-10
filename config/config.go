@@ -15,11 +15,6 @@ type Config struct {
 	MaxGlobalIngress       int
 	WALEnabled             bool
 	WALPath                string
-	FastpathSidecarEnabled bool
-	FastpathSocketPath     string
-	FastpathCutoverBytes   int
-	FastpathRequire        bool
-	FastpathFallbackToGo   bool
 }
 
 // Load reads configuration from environment variables and returns a new Config struct.
@@ -34,11 +29,6 @@ func Load() (*Config, error) {
 		MaxGlobalIngress:       getenvIntOrDefault("MAX_GLOBAL_INGRESS", 8192),
 		WALEnabled:             getenvBoolOrDefault("WAL_ENABLED", false),
 		WALPath:                getenvOrDefault("WAL_PATH", "./data/direct_delivery.wal"),
-		FastpathSidecarEnabled: getenvBoolOrDefault("FASTPATH_SIDECAR_ENABLED", false),
-		FastpathSocketPath:     getenvOrDefault("FASTPATH_SOCKET_PATH", "/tmp/tachyon-fastpath.sock"),
-		FastpathCutoverBytes:   getenvIntOrDefault("FASTPATH_CUTOVER_BYTES", 256*1024),
-		FastpathRequire:        getenvBoolOrDefault("FASTPATH_REQUIRE", false),
-		FastpathFallbackToGo:   getenvBoolOrDefault("FASTPATH_FALLBACK_TO_GO", true),
 	}
 
 	return cfg, nil
