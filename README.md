@@ -314,7 +314,6 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 - **Schema Registry Integration:** Support schema version validation for structured payloads and safer producer/consumer evolution.
 - **Rule-based Message Filtering:** Allow consumers to subscribe with filter expressions beyond exact topic matching.
 - **Federation / Cluster Routing:** Extend single-node routing into multi-node broker meshes with route propagation and failover.
-- **Benchmark & Profiling Harness:** Add a first-class benchmark command with p50/p95/p99 latency, throughput, memory, and allocation reporting.
 - **Object-store Payload References:** Allow oversized payloads to be stored externally while the broker transports only metadata and retrieval references.
 - **Durability Backends (SQLite/BoltDB/Badger):** Add pluggable local storage engines behind the current WAL abstraction for better operational flexibility.
 - **Policy-driven Retention & Compaction:** Introduce retention windows and background compaction for WAL/inflight records to control disk growth.
@@ -329,7 +328,6 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 - **การเชื่อมต่อ Schema Registry:** รองรับการตรวจสอบเวอร์ชันของ schema สำหรับ payload แบบ structured เพื่อให้ producer/consumer เปลี่ยนแปลงได้ปลอดภัยขึ้น
 - **Rule-based Message Filtering:** ให้ consumer สมัครรับข้อความด้วยเงื่อนไขการกรองที่ยืดหยุ่นกว่าการ match topic แบบตรงตัว
 - **Federation / Cluster Routing:** ขยายจาก single-node broker ไปสู่ broker mesh หลายโหนด พร้อม route propagation และ failover
-- **Benchmark และ Profiling Harness:** เพิ่มคำสั่ง benchmark อย่างเป็นทางการ พร้อมรายงาน p50/p95/p99, throughput, memory และ allocations
 - **Object-store Payload References:** เปิดทางให้ payload ที่มีขนาดใหญ่มากถูกเก็บภายนอก และให้ broker รับส่งเฉพาะ metadata กับ reference สำหรับดึงข้อมูล
 - **Durability Backends (SQLite/BoltDB/Badger):** เพิ่มตัวเลือก storage engine แบบ pluggable ภายใต้ abstraction เดิมของ WAL เพื่อความยืดหยุ่นด้านปฏิบัติการ
 - **Retention และ Compaction ตามนโยบาย:** เพิ่มนโยบายอายุข้อมูลและงาน compaction เบื้องหลังสำหรับ WAL/inflight เพื่อลดการเติบโตของไฟล์
