@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/aetherbus/aetherbus-tachyon/internal/admin/audit"
 )
 
 func TestFileWALAppendReplayAndCommit(t *testing.T) {
@@ -117,7 +119,7 @@ func TestFileWALDeadLetterBrowseReplayAndPurge(t *testing.T) {
 	if len(records) != 1 || records[0].MessageID != "msg-1" {
 		t.Fatalf("unexpected filtered records: %#v", records)
 	}
-	res, err := w.ReplayDeadLetters(DeadLetterReplayRequest{MessageIDs: []string{"msg-1"}, TargetConsumerID: "worker-1", TargetTopic: "orders.created", Confirm: "REPLAY", RequestedAt: now.Add(2 * time.Second)})
+	res, err := w.ReplayDeadLetters(DeadLetterReplayRequest{MessageIDs: []string{"msg-1"}, TargetConsumerID: "worker-1", TargetTopic: "orders.created", Confirm: "REPLAY", RequestedAt: now.Add(2 * time.Second), AdminMutationMetadata: AdminMutationMetadata{Actor: "ops@example.com", Reason: "customer replay request"}})
 	if err != nil {
 		t.Fatalf("replay dead letters: %v", err)
 	}
@@ -138,11 +140,41 @@ func TestFileWALDeadLetterBrowseReplayAndPurge(t *testing.T) {
 	if ok {
 		t.Fatalf("expected replayed record removed from dlq")
 	}
-	purge, err := w.PurgeDeadLetters(DeadLetterPurgeRequest{MessageIDs: []string{"msg-2"}, Confirm: "PURGE"})
+	purge, err := w.PurgeDeadLetters(DeadLetterPurgeRequest{MessageIDs: []string{"msg-2"}, Confirm: "PURGE", AdminMutationMetadata: AdminMutationMetadata{Actor: "ops@example.com", Reason: "retention cleanup"}})
 	if err != nil {
 		t.Fatalf("purge dead letters: %v", err)
 	}
 	if purge.Purged != 1 || purge.Failed != 0 {
 		t.Fatalf("unexpected purge result: %#v", purge)
+	}
+}
+
+func TestFileWALAdminAuditTrailRoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	w := NewFileWAL(filepath.Join(tmp, "delivery.wal"))
+	now := time.Unix(700, 0).UTC()
+
+	record, err := w.ManualDeadLetter(ManualDeadLetterRequest{Record: DeadLetterRecord{MessageID: "msg-audit", ConsumerID: "worker-9", Topic: "orders.audit", Payload: []byte("payload"), Reason: "manual_admin_action", DeadLetteredAt: now}, AdminMutationMetadata: AdminMutationMetadata{Actor: "admin@example.com", Reason: "legal hold"}})
+	if err != nil {
+		t.Fatalf("manual dead-letter: %v", err)
+	}
+	if record.MessageID != "msg-audit" {
+		t.Fatalf("unexpected manual dead-letter record: %#v", record)
+	}
+	if _, err := w.ReplayDeadLetters(DeadLetterReplayRequest{MessageIDs: []string{"msg-audit"}, TargetConsumerID: "worker-9", TargetTopic: "orders.audit", Confirm: "REPLAY", RequestedAt: now.Add(time.Minute), AdminMutationMetadata: AdminMutationMetadata{Actor: "admin@example.com", Reason: "requeue after review"}}); err != nil {
+		t.Fatalf("replay dead letters: %v", err)
+	}
+	events, err := w.ListAuditEvents(audit.Query{MessageID: "msg-audit", Actor: "admin@example.com", Start: now.Add(-time.Second), End: now.Add(2 * time.Minute)})
+	if err != nil {
+		t.Fatalf("list audit events: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 audit events, got %#v", events)
+	}
+	if events[0].Operation != audit.OperationManualDeadLetter || events[1].Operation != audit.OperationReplayDeadLetter {
+		t.Fatalf("unexpected audit operations: %#v", events)
+	}
+	if events[1].PrevHash != events[0].Hash {
+		t.Fatalf("expected chained hashes, got prev=%q hash=%q", events[1].PrevHash, events[0].Hash)
 	}
 }

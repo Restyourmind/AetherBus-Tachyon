@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aetherbus/aetherbus-tachyon/internal/admin/audit"
 	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
 	"github.com/aetherbus/aetherbus-tachyon/internal/media"
 )
@@ -52,6 +53,19 @@ func (w *stubWAL) ReplayDeadLetters(req DeadLetterReplayRequest) (DeadLetterRepl
 }
 func (w *stubWAL) PurgeDeadLetters(req DeadLetterPurgeRequest) (DeadLetterPurgeResult, error) {
 	return DeadLetterPurgeResult{}, nil
+}
+
+func (w *stubWAL) ManualDeadLetter(req ManualDeadLetterRequest) (DeadLetterRecord, error) {
+	w.deadLettered = append(w.deadLettered, req.Record)
+	return req.Record, nil
+}
+
+func (w *stubWAL) ListAuditEvents(filter audit.Query) ([]audit.Event, error) {
+	return nil, nil
+}
+
+func (w *stubWAL) AppendAuditEvent(event audit.Event) (audit.Event, error) {
+	return event, nil
 }
 
 func (w *stubWAL) SaveSessionSnapshot(snapshot sessionSnapshot) error {

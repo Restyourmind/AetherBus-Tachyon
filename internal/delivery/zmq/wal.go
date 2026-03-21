@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aetherbus/aetherbus-tachyon/internal/admin/audit"
 )
 
 type WAL interface {
@@ -28,11 +30,15 @@ type WAL interface {
 	GetDeadLetter(messageID string) (DeadLetterRecord, bool, error)
 	ReplayDeadLetters(req DeadLetterReplayRequest) (DeadLetterReplayResult, error)
 	PurgeDeadLetters(req DeadLetterPurgeRequest) (DeadLetterPurgeResult, error)
+	ManualDeadLetter(req ManualDeadLetterRequest) (DeadLetterRecord, error)
+	ListAuditEvents(filter audit.Query) ([]audit.Event, error)
+	AppendAuditEvent(event audit.Event) (audit.Event, error)
 }
 
 type fileWAL struct {
-	mu   sync.Mutex
-	path string
+	mu         sync.Mutex
+	path       string
+	auditStore audit.Store
 }
 
 type walRecord struct {
@@ -87,6 +93,17 @@ type DeadLetterReplayRequest struct {
 	TargetTopic      string
 	Confirm          string
 	RequestedAt      time.Time
+	AdminMutationMetadata
+}
+
+type AdminMutationMetadata struct {
+	Actor  string
+	Reason string
+}
+
+type ManualDeadLetterRequest struct {
+	Record DeadLetterRecord
+	AdminMutationMetadata
 }
 
 type DeadLetterReplayFailure struct {
@@ -105,6 +122,7 @@ type DeadLetterPurgeRequest struct {
 	MessageIDs []string
 	Filter     DeadLetterFilter
 	Confirm    string
+	AdminMutationMetadata
 }
 
 type DeadLetterPurgeResult struct {
@@ -114,7 +132,9 @@ type DeadLetterPurgeResult struct {
 	Failures  []DeadLetterReplayFailure `json:"failures,omitempty"`
 }
 
-func NewFileWAL(path string) WAL { return &fileWAL{path: path} }
+func NewFileWAL(path string) WAL {
+	return &fileWAL{path: path, auditStore: audit.NewFileStore(path + ".audit")}
+}
 
 func (w *fileWAL) AppendDispatched(entry walDispatchedEntry) error {
 	return w.appendRecord(walRecord{Type: "dispatched", MessageID: entry.MessageID, Consumer: entry.Consumer, SessionID: entry.SessionID, Topic: entry.Topic, Payload: base64.StdEncoding.EncodeToString(entry.Payload), Priority: entry.Priority, EnqueueSequence: entry.EnqueueSequence, Attempt: entry.Attempt})
@@ -255,6 +275,8 @@ func (w *fileWAL) ReplayDeadLetters(req DeadLetterReplayRequest) (DeadLetterRepl
 		now = time.Now().UTC()
 	}
 	idSet := uniqueIDs(req.MessageIDs)
+	priorStates := make([]audit.MessageState, 0, len(idSet))
+	resultStates := make([]audit.MessageState, 0, len(idSet))
 	var maxSeq uint64
 	for _, entry := range scheduled {
 		if entry.Sequence > maxSeq {
@@ -278,11 +300,13 @@ func (w *fileWAL) ReplayDeadLetters(req DeadLetterReplayRequest) (DeadLetterRepl
 			result.Failures = append(result.Failures, DeadLetterReplayFailure{MessageID: id, Error: "target topic does not match original topic"})
 			continue
 		}
+		priorStates = append(priorStates, deadLetterAuditState(rec, "dead_letter_store"))
 		maxSeq++
 		scheduled = append(scheduled, scheduledMessage{Sequence: maxSeq, MessageID: rec.MessageID, Topic: rec.Topic, Payload: append([]byte(nil), rec.Payload...), Priority: rec.Priority, EnqueueSequence: rec.EnqueueSequence, DeliveryAttempt: 1, DeliverAt: now, Reason: "dlq_replay"})
 		rec.ReplayCount++
 		rec.LastReplayAt = now
 		rec.LastReplayTarget = req.TargetConsumerID + ":" + req.TargetTopic
+		resultStates = append(resultStates, audit.MessageState{MessageID: rec.MessageID, Location: "scheduled_replay", ConsumerID: rec.ConsumerID, SessionID: rec.SessionID, Topic: rec.Topic, Priority: rec.Priority, EnqueueSequence: rec.EnqueueSequence, Attempt: 1, Reason: "dlq_replay", ReplayCount: rec.ReplayCount, LastReplayAt: rec.LastReplayAt, LastReplayTarget: rec.LastReplayTarget})
 		delete(store, id)
 		result.Replayed++
 	}
@@ -291,6 +315,11 @@ func (w *fileWAL) ReplayDeadLetters(req DeadLetterReplayRequest) (DeadLetterRepl
 	}
 	if err := w.writeDeadLettersLocked(store); err != nil {
 		return DeadLetterReplayResult{}, err
+	}
+	if len(priorStates) > 0 {
+		if _, err := w.appendAuditEventLocked(audit.Event{Actor: req.Actor, Timestamp: now, Operation: audit.OperationReplayDeadLetter, TargetMessageIDs: idSet, RequestedReason: req.Reason, PriorState: priorStates, ResultingState: resultStates}); err != nil {
+			return DeadLetterReplayResult{}, err
+		}
 	}
 	return result, nil
 }
@@ -305,15 +334,20 @@ func (w *fileWAL) PurgeDeadLetters(req DeadLetterPurgeRequest) (DeadLetterPurgeR
 		return DeadLetterPurgeResult{}, err
 	}
 	result := DeadLetterPurgeResult{}
+	var targetIDs []string
+	priorStates := make([]audit.MessageState, 0)
 	if len(req.MessageIDs) > 0 {
 		ids := uniqueIDs(req.MessageIDs)
 		result.Requested = len(ids)
+		targetIDs = ids
 		for _, id := range ids {
-			if _, ok := store[id]; !ok {
+			rec, ok := store[id]
+			if !ok {
 				result.Failed++
 				result.Failures = append(result.Failures, DeadLetterReplayFailure{MessageID: id, Error: "record not found"})
 				continue
 			}
+			priorStates = append(priorStates, deadLetterAuditState(rec, "dead_letter_store"))
 			delete(store, id)
 			result.Purged++
 		}
@@ -332,6 +366,8 @@ func (w *fileWAL) PurgeDeadLetters(req DeadLetterPurgeRequest) (DeadLetterPurgeR
 				continue
 			}
 			result.Requested++
+			targetIDs = append(targetIDs, id)
+			priorStates = append(priorStates, deadLetterAuditState(rec, "dead_letter_store"))
 			delete(store, id)
 			result.Purged++
 		}
@@ -339,7 +375,66 @@ func (w *fileWAL) PurgeDeadLetters(req DeadLetterPurgeRequest) (DeadLetterPurgeR
 	if err := w.writeDeadLettersLocked(store); err != nil {
 		return DeadLetterPurgeResult{}, err
 	}
+	if len(priorStates) > 0 {
+		now := time.Now().UTC()
+		resultStates := make([]audit.MessageState, 0, len(priorStates))
+		for _, state := range priorStates {
+			resultStates = append(resultStates, audit.MessageState{MessageID: state.MessageID, Location: "purged"})
+		}
+		if _, err := w.appendAuditEventLocked(audit.Event{Actor: req.Actor, Timestamp: now, Operation: audit.OperationPurgeDeadLetter, TargetMessageIDs: targetIDs, RequestedReason: req.Reason, PriorState: priorStates, ResultingState: resultStates}); err != nil {
+			return DeadLetterPurgeResult{}, err
+		}
+	}
 	return result, nil
+}
+
+func (w *fileWAL) ManualDeadLetter(req ManualDeadLetterRequest) (DeadLetterRecord, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	record := req.Record
+	if record.MessageID == "" {
+		return DeadLetterRecord{}, errors.New("manual dead-letter requires message_id")
+	}
+	if record.DeadLetteredAt.IsZero() {
+		record.DeadLetteredAt = time.Now().UTC()
+	}
+	store, err := w.loadDeadLettersLocked()
+	if err != nil {
+		return DeadLetterRecord{}, err
+	}
+	priorStates := make([]audit.MessageState, 0, 1)
+	if existing, ok := store[record.MessageID]; ok {
+		priorStates = append(priorStates, deadLetterAuditState(existing, "dead_letter_store"))
+	}
+	store[record.MessageID] = record
+	if err := w.writeDeadLettersLocked(store); err != nil {
+		return DeadLetterRecord{}, err
+	}
+	if _, err := w.appendAuditEventLocked(audit.Event{Actor: req.Actor, Timestamp: record.DeadLetteredAt, Operation: audit.OperationManualDeadLetter, TargetMessageIDs: []string{record.MessageID}, RequestedReason: req.Reason, PriorState: priorStates, ResultingState: []audit.MessageState{deadLetterAuditState(record, "dead_letter_store")}}); err != nil {
+		return DeadLetterRecord{}, err
+	}
+	return record, nil
+}
+
+func (w *fileWAL) ListAuditEvents(filter audit.Query) ([]audit.Event, error) {
+	return w.auditStore.Query(filter)
+}
+
+func (w *fileWAL) AppendAuditEvent(event audit.Event) (audit.Event, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.appendAuditEventLocked(event)
+}
+
+func (w *fileWAL) appendAuditEventLocked(event audit.Event) (audit.Event, error) {
+	if w.auditStore == nil {
+		return audit.Event{}, errors.New("audit store not configured")
+	}
+	return w.auditStore.Append(event)
+}
+
+func deadLetterAuditState(rec DeadLetterRecord, location string) audit.MessageState {
+	return audit.MessageState{MessageID: rec.MessageID, Location: location, ConsumerID: rec.ConsumerID, SessionID: rec.SessionID, Topic: rec.Topic, Priority: rec.Priority, EnqueueSequence: rec.EnqueueSequence, Attempt: rec.Attempt, Reason: rec.Reason, DeadLetteredAt: rec.DeadLetteredAt, ReplayCount: rec.ReplayCount, LastReplayAt: rec.LastReplayAt, LastReplayTarget: rec.LastReplayTarget}
 }
 
 func (w *fileWAL) SaveSessionSnapshot(snapshot sessionSnapshot) error {

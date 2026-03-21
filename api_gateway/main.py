@@ -2,8 +2,10 @@ from textwrap import dedent
 from typing import Any, Dict, List, Optional
 
 import base64
+import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
@@ -49,14 +51,19 @@ class SystemAlert(BaseModel):
     message: str = Field(..., min_length=1, max_length=500)
 
 
-class DLQReplayRequest(BaseModel):
+class AdminMutationMetadata(BaseModel):
+    actor: str = Field(default="api_gateway")
+    requested_reason: Optional[str] = None
+
+
+class DLQReplayRequest(AdminMutationMetadata):
     message_ids: List[str] = Field(..., min_length=1)
     target_consumer_id: str = Field(..., min_length=1)
     target_topic: str = Field(..., min_length=1)
     confirm: str = Field(..., min_length=1)
 
 
-class DLQPurgeRequest(BaseModel):
+class DLQPurgeRequest(AdminMutationMetadata):
     message_ids: List[str] = Field(default_factory=list)
     consumer_id: Optional[str] = None
     topic: Optional[str] = None
@@ -64,8 +71,21 @@ class DLQPurgeRequest(BaseModel):
     confirm: str = Field(..., min_length=1)
 
 
+class ManualDeadLetterRequest(AdminMutationMetadata):
+    message_id: str = Field(..., min_length=1)
+    consumer_id: Optional[str] = None
+    session_id: Optional[str] = None
+    topic: str = Field(..., min_length=1)
+    payload: List[int] = Field(default_factory=list)
+    priority: Optional[str] = None
+    enqueue_sequence: int = 0
+    attempt: int = 0
+    reason: str = Field(default="manual_admin_action", min_length=1)
+
+
 DLQ_PATH = Path(os.getenv("DLQ_STORE_PATH", os.getenv("WAL_PATH", "./data/direct_delivery.wal") + ".dlq"))
 SCHEDULED_PATH = Path(os.getenv("SCHEDULED_STORE_PATH", os.getenv("WAL_PATH", "./data/direct_delivery.wal") + ".scheduled"))
+AUDIT_PATH = Path(os.getenv("AUDIT_STORE_PATH", os.getenv("WAL_PATH", "./data/direct_delivery.wal") + ".audit"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 
@@ -83,6 +103,69 @@ def _load_json(path: Path) -> Dict[str, Any]:
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _load_audit() -> List[Dict[str, Any]]:
+    if not AUDIT_PATH.exists():
+        return []
+    lines = [line.strip() for line in AUDIT_PATH.read_text().splitlines() if line.strip()]
+    return [json.loads(line) for line in lines]
+
+
+def _append_audit_event(operation: str, actor: str, target_message_ids: List[str], requested_reason: Optional[str], prior_state: List[Dict[str, Any]], resulting_state: List[Dict[str, Any]], timestamp: Optional[str] = None) -> Dict[str, Any]:
+    timestamp = timestamp or _utcnow()
+    target_message_ids = sorted({message_id for message_id in target_message_ids if message_id})
+    existing = _load_audit()
+    prev_hash = existing[-1]["hash"] if existing else ""
+    payload = {
+        "actor": actor or "unknown",
+        "timestamp": timestamp,
+        "operation": operation,
+        "target_message_ids": target_message_ids,
+        "requested_reason": requested_reason or "",
+        "prior_state": prior_state,
+        "resulting_state": resulting_state,
+        "prev_hash": prev_hash,
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    event = {
+        "event_id": f"audit_{digest[:16]}",
+        **payload,
+        "hash": digest,
+    }
+    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with AUDIT_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event) + "\n")
+    return event
+
+
+def _query_audit(message_id: Optional[str] = None, actor: Optional[str] = None, start: Optional[str] = None, end: Optional[str] = None) -> List[Dict[str, Any]]:
+    events = _load_audit()
+    def _matches_time(value: str, lower: Optional[str], upper: Optional[str]) -> bool:
+        if lower and value < lower:
+            return False
+        if upper and value > upper:
+            return False
+        return True
+    filtered = []
+    for event in events:
+        if actor and event.get("actor") != actor:
+            continue
+        if not _matches_time(event.get("timestamp", ""), start, end):
+            continue
+        if message_id:
+            targets = set(event.get("target_message_ids", []))
+            targets.update(item.get("message_id") for item in event.get("prior_state", []))
+            targets.update(item.get("message_id") for item in event.get("resulting_state", []))
+            if message_id not in targets:
+                continue
+        filtered.append(event)
+    filtered.sort(key=lambda item: (item.get("timestamp", ""), item.get("event_id", "")))
+    return filtered
 
 
 def _list_dlq(consumer_id: Optional[str] = None, topic: Optional[str] = None, reason: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -354,6 +437,8 @@ async def replay_dead_letters(request: DLQReplayRequest, x_admin_token: Optional
     records = _load_json(DLQ_PATH)
     scheduled = json.loads(SCHEDULED_PATH.read_text()) if SCHEDULED_PATH.exists() and SCHEDULED_PATH.read_text().strip() else []
     result = {"requested": len(request.message_ids), "replayed": 0, "failed": 0, "failures": []}
+    prior_state: List[Dict[str, Any]] = []
+    resulting_state: List[Dict[str, Any]] = []
     next_seq = max([item.get("sequence", 0) for item in scheduled], default=0)
     for message_id in request.message_ids:
         record = records.get(message_id)
@@ -369,12 +454,16 @@ async def replay_dead_letters(request: DLQReplayRequest, x_admin_token: Optional
             result["failed"] += 1
             result["failures"].append({"message_id": message_id, "error": "target topic does not match original topic"})
             continue
+        prior_state.append({"message_id": message_id, "location": "dead_letter_store", **record})
         next_seq += 1
-        scheduled.append({"sequence": next_seq, "message_id": message_id, "topic": record["topic"], "payload": record.get("payload", []), "priority": record.get("priority", ""), "enqueue_sequence": record.get("enqueue_sequence", 0), "delivery_attempt": 1, "deliver_at": "1970-01-01T00:00:00Z", "reason": "dlq_replay"})
+        scheduled.append({"sequence": next_seq, "message_id": message_id, "topic": record["topic"], "payload": record.get("payload", []), "priority": record.get("priority", ""), "enqueue_sequence": record.get("enqueue_sequence", 0), "delivery_attempt": 1, "deliver_at": _utcnow(), "reason": "dlq_replay"})
+        resulting_state.append({"message_id": message_id, "location": "scheduled_replay", "consumer_id": record.get("consumer_id"), "session_id": record.get("session_id"), "topic": record.get("topic"), "priority": record.get("priority", ""), "enqueue_sequence": record.get("enqueue_sequence", 0), "attempt": 1, "reason": "dlq_replay"})
         records.pop(message_id, None)
         result["replayed"] += 1
     _write_json(DLQ_PATH, records)
     _write_json(SCHEDULED_PATH, scheduled)
+    if prior_state:
+        _append_audit_event("replay_dead_letter", request.actor, request.message_ids, request.requested_reason, prior_state, resulting_state)
     return result
 
 
@@ -385,6 +474,8 @@ async def purge_dead_letters(request: DLQPurgeRequest, x_admin_token: Optional[s
         raise HTTPException(status_code=400, detail="Purge requires confirm=PURGE.")
     records = _load_json(DLQ_PATH)
     result = {"requested": 0, "purged": 0, "failed": 0, "failures": []}
+    prior_state: List[Dict[str, Any]] = []
+    target_message_ids: List[str] = []
     if request.message_ids:
         for message_id in request.message_ids:
             result["requested"] += 1
@@ -392,6 +483,8 @@ async def purge_dead_letters(request: DLQPurgeRequest, x_admin_token: Optional[s
                 result["failed"] += 1
                 result["failures"].append({"message_id": message_id, "error": "record not found"})
                 continue
+            prior_state.append({"message_id": message_id, "location": "dead_letter_store", **records[message_id]})
+            target_message_ids.append(message_id)
             records.pop(message_id, None)
             result["purged"] += 1
     else:
@@ -403,10 +496,48 @@ async def purge_dead_letters(request: DLQPurgeRequest, x_admin_token: Optional[s
             if request.reason and record.get("reason") != request.reason:
                 continue
             result["requested"] += 1
+            prior_state.append({"message_id": message_id, "location": "dead_letter_store", **record})
+            target_message_ids.append(message_id)
             records.pop(message_id, None)
             result["purged"] += 1
     _write_json(DLQ_PATH, records)
+    if prior_state:
+        _append_audit_event("purge_dead_letter", request.actor, target_message_ids, request.requested_reason, prior_state, [{"message_id": item["message_id"], "location": "purged"} for item in prior_state])
     return result
+
+
+@app.post("/api/admin/dlq/dead-letter")
+async def dead_letter_message(request: ManualDeadLetterRequest, x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _admin_guard(x_admin_token)
+    records = _load_json(DLQ_PATH)
+    record = {
+        "consumer_id": request.consumer_id,
+        "session_id": request.session_id,
+        "topic": request.topic,
+        "payload": request.payload,
+        "priority": request.priority,
+        "enqueue_sequence": request.enqueue_sequence,
+        "attempt": request.attempt,
+        "reason": request.reason,
+        "dead_lettered_at": _utcnow(),
+    }
+    prior_state = []
+    if request.message_id in records:
+        prior_state.append({"message_id": request.message_id, "location": "dead_letter_store", **records[request.message_id]})
+    records[request.message_id] = {k: v for k, v in record.items() if v not in (None, "") or k in {"topic", "payload", "reason", "dead_lettered_at"}}
+    _write_json(DLQ_PATH, records)
+    resulting_state = [{"message_id": request.message_id, "location": "dead_letter_store", **records[request.message_id]}]
+    _append_audit_event("manual_dead_letter", request.actor, [request.message_id], request.requested_reason, prior_state, resulting_state, timestamp=records[request.message_id]["dead_lettered_at"])
+    return {"message_id": request.message_id, **records[request.message_id]}
+
+
+@app.get("/api/admin/audit/events")
+async def list_audit_events(message_id: Optional[str] = None, actor: Optional[str] = None, start: Optional[str] = None, end: Optional[str] = None, x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _admin_guard(x_admin_token)
+    events = _query_audit(message_id=message_id, actor=actor, start=start, end=end)
+    return {"count": len(events), "events": events}
+
+
 if __name__ == "__main__":
     print("🚀 AetherBus Tachyon gateway starting on http://0.0.0.0:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)

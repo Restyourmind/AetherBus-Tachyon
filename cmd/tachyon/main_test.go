@@ -145,3 +145,16 @@ func TestDLQCLIReplayRequiresExplicitTarget(t *testing.T) {
 		t.Fatalf("expected replay to require explicit target")
 	}
 }
+
+func TestDLQCLIAuditQueryParsesFilters(t *testing.T) {
+	query, err := parseAuditQuery("msg-1", "ops@example.com", "2026-03-21T00:00:00Z", "2026-03-21T01:00:00Z")
+	if err != nil {
+		t.Fatalf("parse audit query: %v", err)
+	}
+	if query.MessageID != "msg-1" || query.Actor != "ops@example.com" {
+		t.Fatalf("unexpected query fields: %#v", query)
+	}
+	if query.Start.IsZero() || query.End.IsZero() {
+		t.Fatalf("expected parsed time bounds: %#v", query)
+	}
+}

@@ -56,11 +56,13 @@ def test_publish_alert_appends_bus_history():
     assert latest["payload"]["message"] == "queue pressure rising"
 
 
-def test_dlq_browse_replay_and_purge(tmp_path, monkeypatch):
+def test_dlq_browse_replay_purge_and_audit(tmp_path, monkeypatch):
     dlq_path = tmp_path / "delivery.wal.dlq"
     scheduled_path = tmp_path / "delivery.wal.scheduled"
+    audit_path = tmp_path / "delivery.wal.audit"
     monkeypatch.setattr("api_gateway.main.DLQ_PATH", dlq_path)
     monkeypatch.setattr("api_gateway.main.SCHEDULED_PATH", scheduled_path)
+    monkeypatch.setattr("api_gateway.main.AUDIT_PATH", audit_path)
     monkeypatch.setattr("api_gateway.main.ADMIN_TOKEN", "secret")
     dlq_path.write_text(json.dumps({
         "msg-1": {"consumer_id": "worker-1", "topic": "orders.created", "payload": [112, 49], "reason": "retry_exhausted", "dead_lettered_at": "2026-03-21T00:00:00Z"},
@@ -77,13 +79,21 @@ def test_dlq_browse_replay_and_purge(tmp_path, monkeypatch):
     replay = client.post(
         "/api/admin/dlq/replay",
         headers={"X-Admin-Token": "secret"},
-        json={"message_ids": ["msg-1", "missing"], "target_consumer_id": "worker-1", "target_topic": "orders.created", "confirm": "REPLAY"},
+        json={"message_ids": ["msg-1", "missing"], "target_consumer_id": "worker-1", "target_topic": "orders.created", "confirm": "REPLAY", "actor": "alice", "requested_reason": "customer remediation"},
     )
     assert replay.status_code == 200
     assert replay.json()["replayed"] == 1
     assert replay.json()["failed"] == 1
     scheduled = json.loads(scheduled_path.read_text())
     assert scheduled[0]["message_id"] == "msg-1"
+
+    dead_letter = client.post(
+        "/api/admin/dlq/dead-letter",
+        headers={"X-Admin-Token": "secret"},
+        json={"message_id": "msg-3", "consumer_id": "worker-3", "topic": "orders.retry", "payload": [112, 51], "actor": "alice", "requested_reason": "manual quarantine", "reason": "manual_admin_action"},
+    )
+    assert dead_letter.status_code == 200
+    assert dead_letter.json()["message_id"] == "msg-3"
 
     bad_confirm = client.post(
         "/api/admin/dlq/purge",
@@ -95,8 +105,20 @@ def test_dlq_browse_replay_and_purge(tmp_path, monkeypatch):
     purge = client.post(
         "/api/admin/dlq/purge",
         headers={"X-Admin-Token": "secret"},
-        json={"message_ids": ["msg-2"], "confirm": "PURGE"},
+        json={"message_ids": ["msg-2"], "confirm": "PURGE", "actor": "alice", "requested_reason": "retention cleanup"},
     )
     assert purge.status_code == 200
     assert purge.json()["purged"] == 1
-    assert json.loads(dlq_path.read_text()) == {}
+
+    audit = client.get(
+        "/api/admin/audit/events?message_id=msg-3&actor=alice",
+        headers={"X-Admin-Token": "secret"},
+    )
+    assert audit.status_code == 200
+    body = audit.json()
+    assert body["count"] == 1
+    assert body["events"][0]["operation"] == "manual_dead_letter"
+    all_events = [json.loads(line) for line in audit_path.read_text().splitlines() if line.strip()]
+    assert len(all_events) == 3
+    assert all_events[1]["prev_hash"] == all_events[0]["hash"]
+    assert all_events[2]["prev_hash"] == all_events[1]["hash"]

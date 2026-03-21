@@ -55,7 +55,7 @@ Optional direct-delivery durability can be enabled with:
 When enabled, direct messages that require ACK are appended to an append-only WAL before dispatch, ACK marks entries committed, terminal outcomes are marked dead-lettered, and remaining unfinalized records are replayed when matching consumers reconnect after restart.
 
 
-Dead-letter records are now materialized in a structured DLQ store at `WAL_PATH.dlq`, while broker-scheduled replays are written to `WAL_PATH.scheduled`. Operators can browse and inspect DLQ entries, then replay or purge them with explicit confirmation and exact target matching so replay cannot silently change the original consumer/topic boundary.
+Dead-letter records are now materialized in a structured DLQ store at `WAL_PATH.dlq`, while broker-scheduled replays are written to `WAL_PATH.scheduled`. Administrative mutations are recorded in a separate append-only audit chain at `WAL_PATH.audit`, so compliance retention can differ from hot-path dispatch durability. Operators can browse and inspect DLQ entries, then replay or purge them with explicit confirmation and exact target matching so replay cannot silently change the original consumer/topic boundary.
 
 ### DLQ operator workflow
 
@@ -67,13 +67,26 @@ go run ./cmd/tachyon dlq list --consumer worker-1
 go run ./cmd/tachyon dlq inspect --id msg-123
 
 # Replay only when the original target is restated exactly
-go run ./cmd/tachyon dlq replay --ids msg-123 --target-consumer worker-1 --target-topic orders.created --confirm REPLAY
+go run ./cmd/tachyon dlq replay --ids msg-123 --target-consumer worker-1 --target-topic orders.created --actor ops@example.com --reason "customer-approved replay" --confirm REPLAY
+
+# Manually quarantine a message into the dead-letter store
+go run ./cmd/tachyon dlq dead-letter --id msg-123 --consumer worker-1 --topic orders.created --payload "raw-body" --actor ops@example.com --reason "manual quarantine"
 
 # Purge an acknowledged bad record
-go run ./cmd/tachyon dlq purge --ids msg-123 --confirm PURGE
+go run ./cmd/tachyon dlq purge --ids msg-123 --actor ops@example.com --mutation-reason "retention cleanup" --confirm PURGE
+
+# Query immutable audit history by message, actor, or time window
+go run ./cmd/tachyon dlq audit --id msg-123 --actor ops@example.com --start 2026-03-21T00:00:00Z --end 2026-03-22T00:00:00Z
 ```
 
-The demo control-surface gateway exposes matching admin endpoints under `/api/admin/dlq/*`. Set `ADMIN_TOKEN` to require the `X-Admin-Token` header for browse, inspect, replay, and purge requests. Replay and purge responses include requested/replayed-or-purged counts plus per-record failure details.
+The demo control-surface gateway exposes matching admin endpoints under `/api/admin/dlq/*` plus audit queries at `/api/admin/audit/events`. Set `ADMIN_TOKEN` to require the `X-Admin-Token` header for browse, inspect, replay, manual dead-letter, purge, and audit requests. Replay and purge responses include requested/replayed-or-purged counts plus per-record failure details.
+
+### Audit retention and tamper evidence
+
+- `WAL_PATH.audit` is intentionally separate from `WAL_PATH`, `WAL_PATH.dlq`, and `WAL_PATH.scheduled` so compliance retention can be longer than dispatch/replay retention.
+- Each audit line stores actor, timestamp, operation, target message IDs, requested reason, prior state, resulting state, the previous record hash, and the current record hash.
+- The `prev_hash` → `hash` chain is meant to make offline tampering detectable during export or forensic review; it is not a substitute for WORM/object-lock storage.
+- Operationally, treat the audit log as append-only, rotate it with retention tooling that preserves line order, and export it to immutable storage when regulatory retention exceeds local disk policy.
 
 Direct-delivery admission control defaults are intentionally conservative and can be tuned with:
 
@@ -325,7 +338,8 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 **Non-goals / current limitations:**
 - WAL is local append-only file storage (single-node durability, no replication or consensus).
 - WAL replay is scoped to consumers that re-register; replay is not global fanout recovery.
-- WAL file compaction/retention is not implemented in this version.
+- Dispatch WAL compaction/retention is not implemented in this version.
+- Audit retention is operator-managed and can be longer than WAL retention because the audit chain is stored separately in `WAL_PATH.audit`.
 
 ## 💡 Function Proposals & Future Extensions
 
