@@ -159,68 +159,72 @@ The harness reports p50/p95/p99 latency, throughput, CPU usage, memory RSS, and 
 
 ```mermaid
 flowchart TD
-    subgraph EntryPoints[Command & Configuration]
-        CLI[cmd/tachyon\ncmd/aetherbus-node]
-        CFG[config.Config\nZMQ_BIND_ADDRESS\nZMQ_PUB_ADDRESS]
+    subgraph Runtime[Broker Runtime]
+        CLI[cmd/tachyon<br/>cmd/aetherbus-node]
+        CFG[config.Config<br/>Bind + durability settings]
         APP[internal/app.Runtime]
-    end
-
-    subgraph DomainApp[Domain & Application Core]
-        EVENT[domain.Event]
-        ENV[domain.Envelope]
-        UC[usecase.EventRouter]
-        STORE[repository.ART_RouteStore\nAdaptive Radix Tree]
-    end
-
-    subgraph TransportMedia[Transport & Media]
-        ZMQ[delivery/zmq.Router\nROUTER socket + PUB socket]
+        ZMQ[delivery/zmq.Router<br/>ROUTER + PUB sockets]
         CODEC[media.JSONCodec]
         COMP[media.LZ4Compressor]
+        UC[usecase.EventRouter]
+    end
+
+    subgraph MemoryDB[Logical Data Store (In-Memory)]
+        ROUTES[(Route Store<br/>ART index)]
+        SESSIONS[(Consumer Sessions<br/>consumer_id -> session)]
+        INFLIGHT[(Inflight Deliveries<br/>message_id -> state)]
+    end
+
+    subgraph DurableDB[Logical Durable Store]
+        WAL[(Delivery WAL<br/>append-only JSONL)]
     end
 
     PROD[Producers / DEALER clients]
-    CONS[Consumers / SUB clients]
+    CONS[Consumers / SUB or direct clients]
 
     CLI --> CFG --> APP
-    APP --> STORE
-    APP --> UC
     APP --> ZMQ
+    APP --> UC
+    APP --> ROUTES
+    APP --> SESSIONS
+    APP --> INFLIGHT
+    APP --> WAL
     APP --> CODEC
     APP --> COMP
 
     PROD -->|multipart frames| ZMQ
-    ZMQ -->|decompress + decode| EVENT
-    EVENT --> ENV
-    ENV --> UC
-    UC -->|topic lookup| STORE
-    STORE -->|destination node| UC
-    UC -->|routing decision| ZMQ
-    ZMQ -->|topic + payload| CONS
-    CODEC -. injected into .-> ZMQ
-    COMP -. injected into .-> ZMQ
+    ZMQ -->|decode + validate| UC
+    UC -->|topic lookup| ROUTES
+    ZMQ -->|register / heartbeat / capability| SESSIONS
+    ZMQ -->|dispatch + ack tracking| INFLIGHT
+    INFLIGHT -->|persist required direct deliveries| WAL
+    WAL -->|replay unfinalized entries| INFLIGHT
+    UC -->|fanout route| ZMQ
+    INFLIGHT -->|eligible direct message| ZMQ
+    ZMQ -->|topic payload / direct frames| CONS
 ```
 
 ### Runtime composition
 
-- **Command layer:** `cmd/tachyon` and `cmd/aetherbus-node` load configuration and start the broker runtime.
-- **Configuration layer:** `config.Config` defines the ROUTER/PUB bind addresses.
-- **Composition layer:** `internal/app.Runtime` wires the core components together.
-- **Transport layer:** `internal/delivery/zmq.Router` owns the ZeroMQ ROUTER/PUB sockets and performs frame parsing.
+- **Command layer:** `cmd/tachyon` and `cmd/aetherbus-node` load configuration, durability flags, and start the broker runtime.
+- **Configuration layer:** `config.Config` and environment variables define bind addresses, admission limits, timeout behavior, and WAL activation.
+- **Composition layer:** `internal/app.Runtime` wires transport, routing, session tracking, inflight control, and persistence together.
+- **Transport layer:** `internal/delivery/zmq.Router` owns the ZeroMQ ROUTER/PUB sockets, parses frames, handles consumer registration/heartbeats, and emits direct/fanout deliveries.
 - **Media layer:** `internal/media.JSONCodec` and `internal/media.LZ4Compressor` handle event encoding and payload compression.
-- **Application layer:** `internal/usecase.EventRouter` resolves where an event should be routed.
-- **Repository layer:** `internal/repository.ART_RouteStore` stores topic routes in an Adaptive Radix Tree.
-- **Domain model:** `domain.Event` and `domain.Envelope` represent the message and routing metadata passed through the system.
+- **Application layer:** `internal/usecase.EventRouter` resolves fanout routes and coordinates routing decisions with broker state.
+- **Logical data layer:** the runtime operates over four logical data structures — ART route index, consumer session table, inflight delivery table, and append-only WAL.
 
-### Message path
+### Message + state flow
 
 1. **Producers** publish multipart frames to the ZeroMQ ROUTER.
-2. **`delivery/zmq.Router`** parses strict ROUTER frame shapes (`[client, topic, payload]` or `[client, "", topic, payload]`), validates topic syntax, decompresses payloads, and decodes them into `domain.Event`.
-3. The transport layer wraps the event into **`domain.Envelope`**.
-4. **`usecase.EventRouter`** performs topic lookup through **`repository.ART_RouteStore`**.
-5. The routing decision returns to the transport layer.
-6. The ZeroMQ PUB socket forwards the topic and payload to **subscribers / workers**.
+2. **`delivery/zmq.Router`** validates frame shape, decodes/compresses payloads via the media layer, and forwards routing work into the application flow.
+3. **`usecase.EventRouter`** resolves topic matches through the **route store (ART)** for fanout delivery.
+4. **Consumer registration and heartbeat traffic** updates the **consumer session table**, which tracks active direct-delivery capability.
+5. **Direct deliveries** create or update **inflight delivery records** so ACK/NACK, retry, timeout, and dead-letter behavior can be evaluated.
+6. When ACK durability is required, the broker appends dispatch state to the **delivery WAL**, finalizes records on terminal outcomes, and replays unfinalized entries after restart.
+7. The transport layer emits the final topic payload or direct-delivery frame back to **subscribers / workers**.
 
-This structure reflects the current codebase more closely than a generic broker diagram and keeps the runtime wiring, routing store, and transport/media responsibilities clearly separated.
+This version of the diagram is aligned with the current logical storage model described below, so the architecture view now reflects both the runtime components and the broker-managed data structures.
 
 ## 🗃️ Data Storage Structure (Current)
 
@@ -304,35 +308,35 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 
 ## 💡 Function Proposals & Future Extensions
 
-> This section intentionally lists **forward-looking proposals only**. Completed work should be documented in changelogs, release notes, or implementation-specific sections rather than mixed into the proposal backlog.
+> This section intentionally lists **forward-looking proposals only**. Items that are already implemented have been removed so this backlog stays focused on future work.
 
 ### English
 
-- **Binary Frame Transport Path:** Introduce a compact binary frame header so the broker can route messages by topic without decoding large payloads first.
-- **Large-payload Streaming Mode:** Add chunked transfer and streaming delivery for 1MB+ payload classes to reduce memory spikes and improve throughput.
-- **Rust Fast-path Sidecar / FFI Module:** Move compression, framing, and large-payload processing into a Rust fast path while keeping Go for orchestration.
-- **Schema Registry Integration:** Support schema version validation for structured payloads and safer producer/consumer evolution.
-- **Rule-based Message Filtering:** Allow consumers to subscribe with filter expressions beyond exact topic matching.
-- **Federation / Cluster Routing:** Extend single-node routing into multi-node broker meshes with route propagation and failover.
-- **Object-store Payload References:** Allow oversized payloads to be stored externally while the broker transports only metadata and retrieval references.
-- **Durability Backends (SQLite/BoltDB/Badger):** Add pluggable local storage engines behind the current WAL abstraction for better operational flexibility.
-- **Policy-driven Retention & Compaction:** Introduce retention windows and background compaction for WAL/inflight records to control disk growth.
-- **Multi-tenant Quotas & Isolation:** Add tenant-scoped inflight limits, throughput quotas, and fairness scheduling.
-- **Unified Observability Endpoint:** Expose metrics and delivery/session state snapshots via Prometheus + optional OpenTelemetry.
+- **Route Bootstrap Persistence:** Add a persistent route catalog so the ART route store can be restored automatically without manual bootstrap configuration.
+- **Session Snapshot & Warm Restart:** Persist consumer session metadata and resumable capability hints to shorten recovery time after broker restarts.
+- **Delayed Delivery / Scheduled Publish:** Support future delivery timestamps and retry schedules as first-class broker behavior.
+- **Priority Queues for Direct Delivery:** Let operators assign message priority classes so urgent commands can bypass bulk background traffic.
+- **Dead-letter Inspection API:** Expose a dedicated API/CLI for browsing, replaying, and purging dead-lettered records safely.
+- **Replay Audit Trail:** Record operator-triggered replay actions and delivery state transitions for compliance and debugging.
+- **Tenant-aware Route Namespaces:** Isolate route lookup, quotas, and observability by tenant while preserving shared broker infrastructure.
+- **Adaptive Backpressure Policies:** Dynamically tune inflight and queue limits based on consumer lag, retry rate, and broker memory pressure.
+- **Geo-redundant WAL Replication:** Replicate WAL segments to a standby broker/object store for stronger disaster recovery.
+- **SQL/Analytics Export Pipeline:** Stream route, inflight, and WAL state changes into PostgreSQL, ClickHouse, or a warehouse for reporting.
+- **Operational Admin UI:** Build a lightweight dashboard for route topology, consumer sessions, inflight backlog, and replay controls.
 
 ### ภาษาไทย
 
-- **เส้นทางส่งข้อมูลแบบ Binary Frame:** เพิ่ม header แบบไบนารีเพื่อให้ broker ตัดสินใจ route ได้จากหัวข้อ โดยไม่ต้อง decode payload ขนาดใหญ่ก่อน
-- **โหมดส่งข้อมูลขนาดใหญ่แบบ Streaming:** รองรับการแบ่งชิ้นและส่งต่อแบบ stream สำหรับ payload ระดับ 1MB ขึ้นไป เพื่อลดการใช้หน่วยความจำและเพิ่ม throughput
-- **Rust Fast-path แบบ Sidecar / FFI:** ย้ายงาน framing, compression และเส้นทาง payload ใหญ่ไปยังโมดูล Rust โดยคง Go ไว้สำหรับ orchestration
-- **การเชื่อมต่อ Schema Registry:** รองรับการตรวจสอบเวอร์ชันของ schema สำหรับ payload แบบ structured เพื่อให้ producer/consumer เปลี่ยนแปลงได้ปลอดภัยขึ้น
-- **Rule-based Message Filtering:** ให้ consumer สมัครรับข้อความด้วยเงื่อนไขการกรองที่ยืดหยุ่นกว่าการ match topic แบบตรงตัว
-- **Federation / Cluster Routing:** ขยายจาก single-node broker ไปสู่ broker mesh หลายโหนด พร้อม route propagation และ failover
-- **Object-store Payload References:** เปิดทางให้ payload ที่มีขนาดใหญ่มากถูกเก็บภายนอก และให้ broker รับส่งเฉพาะ metadata กับ reference สำหรับดึงข้อมูล
-- **Durability Backends (SQLite/BoltDB/Badger):** เพิ่มตัวเลือก storage engine แบบ pluggable ภายใต้ abstraction เดิมของ WAL เพื่อความยืดหยุ่นด้านปฏิบัติการ
-- **Retention และ Compaction ตามนโยบาย:** เพิ่มนโยบายอายุข้อมูลและงาน compaction เบื้องหลังสำหรับ WAL/inflight เพื่อลดการเติบโตของไฟล์
-- **Multi-tenant Quotas และ Isolation:** เพิ่มเพดาน inflight/throughput แยกตาม tenant พร้อมกลไกจัดสรรความยุติธรรม
-- **Unified Observability Endpoint:** รวมการเปิดเผย metrics และ snapshot สถานะ delivery/session ผ่าน Prometheus และเลือกส่ง OpenTelemetry ได้
+- **Route Bootstrap Persistence:** เพิ่มที่เก็บ route catalog แบบถาวร เพื่อให้ ART route store ฟื้นคืนได้อัตโนมัติโดยไม่ต้อง bootstrap ด้วยมือทุกครั้ง
+- **Session Snapshot และ Warm Restart:** บันทึก metadata ของ consumer session และ capability ที่นำกลับมาใช้ต่อได้ เพื่อลดเวลา recovery หลัง broker restart
+- **Delayed Delivery / Scheduled Publish:** รองรับการตั้งเวลาส่งล่วงหน้าและตาราง retry ในระดับความสามารถหลักของ broker
+- **Priority Queues สำหรับ Direct Delivery:** เปิดให้กำหนดลำดับความสำคัญของข้อความ เพื่อให้คำสั่งเร่งด่วนวิ่งแซงงานพื้นหลังที่มีปริมาณมากได้
+- **Dead-letter Inspection API:** เพิ่ม API/CLI สำหรับดูรายการ dead-letter, สั่ง replay และลบข้อมูลอย่างปลอดภัย
+- **Replay Audit Trail:** เก็บประวัติการ replay ที่ผู้ปฏิบัติงานสั่งเอง รวมถึง state transition ของการส่ง เพื่อใช้ด้าน compliance และ debugging
+- **Tenant-aware Route Namespaces:** แยก route lookup, quota และ observability ตาม tenant โดยยังใช้โครงสร้าง broker ร่วมกันได้
+- **Adaptive Backpressure Policies:** ปรับเพดาน inflight และ queue แบบไดนามิกตาม lag ของ consumer, อัตรา retry และแรงกดดันด้านหน่วยความจำ
+- **Geo-redundant WAL Replication:** ทำสำเนา WAL ไปยัง standby broker หรือ object store เพื่อเพิ่มความพร้อมด้าน disaster recovery
+- **SQL/Analytics Export Pipeline:** ส่งการเปลี่ยนแปลงของ route, inflight และ WAL ไปยัง PostgreSQL, ClickHouse หรือ data warehouse สำหรับงานรายงาน
+- **Operational Admin UI:** สร้างแดชบอร์ดขนาดเบาสำหรับดู topology ของ route, consumer sessions, inflight backlog และเครื่องมือควบคุม replay
 
 ## 📘 Deep Architecture & Protocol Docs
 
