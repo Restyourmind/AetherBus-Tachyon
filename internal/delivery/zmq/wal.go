@@ -19,6 +19,7 @@ import (
 
 	"github.com/aetherbus/aetherbus-tachyon/internal/admin/audit"
 	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
+	"github.com/aetherbus/aetherbus-tachyon/internal/statefile"
 )
 
 type WAL interface {
@@ -28,7 +29,7 @@ type WAL interface {
 	ReplayUnacked() ([]walDispatchedEntry, error)
 	SaveSessionSnapshot(snapshot sessionSnapshot) error
 	LoadSessionSnapshots() ([]sessionSnapshot, error)
-	DeleteSessionSnapshot(consumerID string) error
+	DeleteSessionSnapshot(tenantID, consumerID string) error
 	SaveScheduled(entries []scheduledMessage) error
 	LoadScheduled() ([]scheduledMessage, error)
 	ListDeadLetters(filter DeadLetterFilter) ([]DeadLetterRecord, error)
@@ -73,17 +74,15 @@ const (
 	deadLetterSchemaVersion      = 2
 )
 
-type stateEnvelope[T any] struct {
-	Version int `json:"version"`
-	Data    T   `json:"data"`
-}
-
 type fileWAL struct {
-	mu         sync.Mutex
-	path       string
-	auditStore audit.Store
-	options    WALOptions
-	segments   *segmentLog
+	mu             sync.Mutex
+	path           string
+	auditStore     audit.Store
+	options        WALOptions
+	segments       *segmentLog
+	sessionStore   *statefile.FileStateStore[map[string]sessionSnapshot]
+	scheduledStore *statefile.FileStateStore[[]scheduledMessage]
+	dlqStore       *statefile.FileStateStore[map[string]DeadLetterRecord]
 }
 
 type walRecord struct {
@@ -239,7 +238,14 @@ func NewFileWALWithOptions(path string, opts WALOptions) WAL {
 	if opts.DurabilityMode == "" {
 		opts.DurabilityMode = DurabilityLocalFsync
 	}
-	w := &fileWAL{path: path, auditStore: audit.NewFileStore(path + ".audit"), options: opts}
+	w := &fileWAL{
+		path:           path,
+		auditStore:     audit.NewFileStore(path + ".audit"),
+		options:        opts,
+		sessionStore:   statefile.NewFileStateStore(path+".sessions", sessionSnapshotSchemaVersion, func() map[string]sessionSnapshot { return map[string]sessionSnapshot{} }),
+		scheduledStore: statefile.NewFileStateStore(path+".scheduled", scheduledSchemaVersion, func() []scheduledMessage { return nil }),
+		dlqStore:       statefile.NewFileStateStore(path+".dlq", deadLetterSchemaVersion, func() map[string]DeadLetterRecord { return map[string]DeadLetterRecord{} }),
+	}
 	w.segments = &segmentLog{root: w.segmentRoot(), maxBytes: opts.SegmentMaxBytes, durability: opts.DurabilityMode, replication: opts.ReplicationSink}
 	return w
 }
@@ -475,7 +481,7 @@ func (w *fileWAL) PurgeDeadLetters(req DeadLetterPurgeRequest) (DeadLetterPurgeR
 		now := time.Now().UTC()
 		resultStates := make([]audit.MessageState, 0, len(priorStates))
 		for _, state := range priorStates {
-			resultStates = append(resultStates, audit.MessageState{MessageID: state.MessageID, Location: "purged"})
+			resultStates = append(resultStates, audit.MessageState{MessageID: statefile.MessageID, Location: "purged"})
 		}
 		if _, err := w.appendAuditEventLocked(audit.Event{Actor: req.Actor, Timestamp: now, Operation: audit.OperationPurgeDeadLetter, TargetMessageIDs: targetIDs, RequestedReason: req.Reason, PriorState: priorStates, ResultingState: resultStates}); err != nil {
 			return DeadLetterPurgeResult{}, err
@@ -540,7 +546,7 @@ func (w *fileWAL) SaveSessionSnapshot(snapshot sessionSnapshot) error {
 	if err != nil {
 		return err
 	}
-	snapshots[snapshot.ConsumerID] = snapshot
+	snapshots[sessionSnapshotKey(snapshot.TenantID, snapshot.ConsumerID)] = snapshot
 	return w.writeSnapshotsLocked(snapshots)
 }
 func (w *fileWAL) LoadSessionSnapshots() ([]sessionSnapshot, error) {
@@ -557,14 +563,18 @@ func (w *fileWAL) LoadSessionSnapshots() ([]sessionSnapshot, error) {
 	sort.Slice(out, func(i, j int) bool { return out[i].ConsumerID < out[j].ConsumerID })
 	return out, nil
 }
-func (w *fileWAL) DeleteSessionSnapshot(consumerID string) error {
+func (w *fileWAL) DeleteSessionSnapshot(tenantID, consumerID string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	snapshots, err := w.loadSnapshotsLocked()
 	if err != nil {
 		return err
 	}
-	delete(snapshots, consumerID)
+	for key, snapshot := range snapshots {
+		if snapshot.TenantID == tenantID && snapshot.ConsumerID == consumerID {
+			delete(snapshots, key)
+		}
+	}
 	return w.writeSnapshotsLocked(snapshots)
 }
 func (w *fileWAL) appendRecord(rec walRecord) error {
@@ -587,23 +597,14 @@ func (w *fileWAL) LoadScheduled() ([]scheduledMessage, error) {
 	return w.loadScheduledLocked()
 }
 func (w *fileWAL) loadScheduledLocked() ([]scheduledMessage, error) {
-	data, err := os.ReadFile(w.scheduledPath())
+	envelope, err := w.scheduledStore.Load()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	if len(data) == 0 {
-		return nil, nil
-	}
-	var envelope stateEnvelope[[]scheduledMessage]
-	var entries []scheduledMessage
-	if err := json.Unmarshal(data, &envelope); err == nil && envelope.Version != 0 {
-		entries = envelope.Data
-	} else if err := json.Unmarshal(data, &entries); err != nil {
-		return nil, fmt.Errorf("decode scheduled queue: %w", err)
-	}
+	entries := append([]scheduledMessage(nil), envelope.Data...)
 	sort.Slice(entries, func(i, j int) bool {
 		if entries[i].DeliverAt.Equal(entries[j].DeliverAt) {
 			return entries[i].Sequence < entries[j].Sequence
@@ -618,93 +619,47 @@ func (w *fileWAL) loadScheduledLocked() ([]scheduledMessage, error) {
 	return entries, nil
 }
 func (w *fileWAL) writeScheduledLocked(entries []scheduledMessage) error {
-	if err := os.MkdirAll(filepath.Dir(w.scheduledPath()), 0o755); err != nil {
-		return err
-	}
-	encoded, err := json.MarshalIndent(stateEnvelope[[]scheduledMessage]{Version: scheduledSchemaVersion, Data: entries}, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := w.scheduledPath() + ".tmp"
-	if err := os.WriteFile(tmp, append(encoded, '\n'), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, w.scheduledPath())
+	return w.scheduledStore.Save(entries)
 }
 func (w *fileWAL) loadSnapshotsLocked() (map[string]sessionSnapshot, error) {
-	path := w.snapshotPath()
-	data, err := os.ReadFile(path)
+	envelope, err := w.sessionStore.Load()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return map[string]sessionSnapshot{}, nil
 		}
 		return nil, err
 	}
-	if len(data) == 0 {
-		return map[string]sessionSnapshot{}, nil
-	}
-	var envelope stateEnvelope[map[string]sessionSnapshot]
-	snapshots := map[string]sessionSnapshot{}
-	if err := json.Unmarshal(data, &envelope); err == nil && envelope.Version != 0 {
-		snapshots = envelope.Data
-	} else if err := json.Unmarshal(data, &snapshots); err != nil {
-		return nil, fmt.Errorf("decode session snapshots: %w", err)
-	}
+	snapshots := envelope.Data
 	if snapshots == nil {
 		snapshots = map[string]sessionSnapshot{}
 	}
 	return snapshots, nil
 }
 func (w *fileWAL) writeSnapshotsLocked(snapshots map[string]sessionSnapshot) error {
-	if err := os.MkdirAll(filepath.Dir(w.snapshotPath()), 0o755); err != nil {
-		return err
+	if snapshots == nil {
+		snapshots = map[string]sessionSnapshot{}
 	}
-	encoded, err := json.MarshalIndent(stateEnvelope[map[string]sessionSnapshot]{Version: sessionSnapshotSchemaVersion, Data: snapshots}, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := w.snapshotPath() + ".tmp"
-	if err := os.WriteFile(tmp, append(encoded, '\n'), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, w.snapshotPath())
+	return w.sessionStore.Save(snapshots)
 }
 func (w *fileWAL) loadDeadLettersLocked() (map[string]DeadLetterRecord, error) {
-	data, err := os.ReadFile(w.deadLetterPath())
+	envelope, err := w.dlqStore.Load()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return map[string]DeadLetterRecord{}, nil
 		}
 		return nil, err
 	}
-	if len(data) == 0 {
-		return map[string]DeadLetterRecord{}, nil
-	}
-	var envelope stateEnvelope[map[string]DeadLetterRecord]
-	recs := map[string]DeadLetterRecord{}
-	if err := json.Unmarshal(data, &envelope); err == nil && envelope.Version != 0 {
-		recs = envelope.Data
-	} else if err := json.Unmarshal(data, &recs); err != nil {
-		return nil, fmt.Errorf("decode dead letters: %w", err)
-	}
+	recs := envelope.Data
 	if recs == nil {
 		recs = map[string]DeadLetterRecord{}
 	}
 	return recs, nil
 }
 func (w *fileWAL) writeDeadLettersLocked(recs map[string]DeadLetterRecord) error {
-	if err := os.MkdirAll(filepath.Dir(w.deadLetterPath()), 0o755); err != nil {
-		return err
+	if recs == nil {
+		recs = map[string]DeadLetterRecord{}
 	}
-	encoded, err := json.MarshalIndent(stateEnvelope[map[string]DeadLetterRecord]{Version: deadLetterSchemaVersion, Data: recs}, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := w.deadLetterPath() + ".tmp"
-	if err := os.WriteFile(tmp, append(encoded, '\n'), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, w.deadLetterPath())
+	return w.dlqStore.Save(recs)
 }
 
 func (s *segmentLog) appendLocked(rec walRecord) error {
@@ -928,6 +883,10 @@ func nextSequenceFromSegmentID(id string) uint64 {
 	base := strings.TrimSuffix(strings.TrimPrefix(id, "segment-"), ".wal")
 	seq, _ := strconv.ParseUint(base, 10, 64)
 	return seq
+}
+
+func sessionSnapshotKey(tenantID, consumerID string) string {
+	return tenantID + "\x00" + consumerID
 }
 
 func uniqueIDs(ids []string) []string {

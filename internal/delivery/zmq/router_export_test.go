@@ -19,7 +19,7 @@ func TestRouterEmitsLifecycleEvents(t *testing.T) {
 	cap := &captureExporter{}
 	r.SetExporter(cap)
 	session := &consumerSession{SessionID: "sess_001", ConsumerID: "consumer-a", TransportIdentity: []byte("id"), Subscriptions: map[string]struct{}{"orders": {}}, Capabilities: capabilityHints{SupportsAck: true, Resumable: true}, MaxInflight: 4, Live: true}
-	r.directSessions[session.ConsumerID] = session
+	r.directSessions[sessionMapKey(session.TenantID, session.ConsumerID)] = session
 	r.prepareDispatchLocked(session, "tenant-a", "orders", "msg-1", []byte("payload"), "high", 12, 1)
 	r.handleAck("msg-1", "consumer-a", "sess_001")
 	seen := map[string]bool{}

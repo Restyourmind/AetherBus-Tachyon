@@ -97,15 +97,6 @@ Direct-delivery admission control defaults are intentionally conservative and ca
 
 When limits are reached, direct messages are deferred or dropped with explicit broker counters (`deferred`, `throttled`, `dropped`).
 
-Direct-delivery admission control defaults are intentionally conservative and can be tuned with:
-
-- `MAX_INFLIGHT_PER_CONSUMER` (default `1024`)
-- `MAX_PER_TOPIC_QUEUE` (default `256`)
-- `MAX_QUEUED_DIRECT` (default `4096`)
-- `MAX_GLOBAL_INGRESS` (default `8192`)
-
-When limits are reached, direct messages are deferred or dropped with explicit broker counters (`deferred`, `throttled`, `dropped`).
-
 ## 🧰 Build recovery under restricted network environments
 
 This repository may require external Go module resolution to complete full recovery of
@@ -194,20 +185,32 @@ The harness reports p50/p95/p99 latency, throughput, CPU usage, memory RSS, and 
 ```mermaid
 flowchart TD
     Producers[Producers / Clients] --> Broker[Broker Runtime]
-    Broker --> Routes[(routes)]
-    Broker --> Sessions[(consumer_sessions)]
-    Broker --> Inflight[(inflight_deliveries)]
-    Broker --> Scheduled[(scheduled_messages)]
-    Broker --> DLQ[(dead_letters)]
-    Broker --> Audit[(admin_audit)]
-    Audit --> Export[(analytics / export sink)]
 
-    Routes --> Inflight
-    Sessions --> Inflight
-    Inflight --> Scheduled
-    Inflight --> DLQ
-    Scheduled --> Audit
+    subgraph Persisted_State[Persisted state stores]
+        Routes[(routes.json / route catalog)]
+        Segments[(delivery.wal.segments / direct WAL)]
+        Sessions[(delivery.wal.sessions / resumable sessions)]
+        Scheduled[(delivery.wal.scheduled / delayed + retry queue)]
+        DLQ[(delivery.wal.dlq / dead letters)]
+        Audit[(delivery.wal.audit / admin audit)]
+        AuditHead[(delivery.wal.audit.head / audit head sidecar)]
+    end
+
+    Broker --> Routes
+    Broker --> Segments
+    Broker --> Sessions
+    Broker --> Scheduled
+    Broker --> DLQ
+    Broker --> Audit
+    AuditHead --> Audit
+
+    Routes --> Broker
+    Sessions --> Broker
+    Segments --> Broker
+    Scheduled --> Broker
     DLQ --> Audit
+    Scheduled --> Audit
+    Audit --> Export[(analytics / export sink)]
 ```
 
 

@@ -37,6 +37,9 @@ func (r *ART_RouteStore) UpsertRoute(route domain.Route) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	route = route.Normalize()
+	if err := domain.ValidateRoutePattern(route.Pattern); err != nil {
+		return err
+	}
 	r.routes[routeIdentity(route)] = route
 	r.rebuildTreeLocked()
 	if err := r.persistLocked(); err != nil {
@@ -128,6 +131,9 @@ func (r *ART_RouteStore) Restore(snapshot domain.RouteCatalogSnapshot) error {
 	r.routes = make(map[string]domain.Route, len(snapshot.Routes))
 	for _, route := range snapshot.Routes {
 		route = route.Normalize()
+		if err := domain.ValidateRoutePattern(route.Pattern); err != nil {
+			return err
+		}
 		r.routes[routeIdentity(route)] = route
 	}
 	r.rebuildTreeLocked()
@@ -173,7 +179,7 @@ func (r *ART_RouteStore) emitRouteEventLocked(action string, route domain.Route)
 	r.exporter.Emit(exporter.Event{Kind: "route", Action: action, Source: "route_store", Cursor: exporter.Cursor("route_store", r.exportSeq), OccurredAt: time.Now().UTC(), TenantID: route.Tenant, Topic: route.Pattern, RouteKey: routeIdentity(route), DestinationID: route.DestinationID, Status: route.RouteType, Labels: map[string]string{"enabled": fmt.Sprintf("%t", route.Enabled)}})
 }
 func classifyMatch(pattern, topic string) (int, bool) {
-	if !validPattern(pattern) {
+	if domain.ValidateRoutePattern(pattern) != nil {
 		return 0, false
 	}
 	if pattern == topic {
@@ -206,19 +212,4 @@ func classifyMatch(pattern, topic string) (int, bool) {
 		return 0, false
 	}
 	return class, true
-}
-func validPattern(pattern string) bool {
-	if pattern == "" || strings.Contains(pattern, "..") {
-		return false
-	}
-	parts := strings.Split(pattern, ".")
-	for i, part := range parts {
-		if part == "" {
-			return false
-		}
-		if part == ">" && i != len(parts)-1 {
-			return false
-		}
-	}
-	return true
 }

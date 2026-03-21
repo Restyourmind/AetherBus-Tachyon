@@ -1,52 +1,99 @@
-# State Store Architecture
+# AetherBus-Tachyon State Store
 
-## Current state
+## Objective
 
-The broker currently keeps hot operational state in memory and persists recoverable subsets to file-backed stores:
+This document defines the target **source-of-truth boundaries** for Tachyon so the current file-backed implementation can evolve cleanly into a DB-backed state store without changing delivery or routing use cases.
 
-- routes: versioned route catalog snapshot
-- consumer sessions: resumable logical session snapshots
-- inflight deliveries: append-only WAL dispatch/commit records
-- scheduled messages: versioned delayed-delivery queue snapshot
-- dead letters: versioned DLQ snapshot
-- admin audit: append-only tamper-evident hash chain with a head sidecar
+## Source of truth by concern
 
-## Target state
+### 1. Routing catalog
+**Source of truth:** persisted route catalog.
 
-The eventual database-backed state store is the operational source of truth for:
+- Stores tenant-scoped route definitions.
+- Includes exact, `*`, and `>` wildcard patterns.
+- Must preserve deterministic precedence metadata (`route_type`, priority, stable tie-break inputs).
+- Runtime indexes such as the ART tree are caches derived from this catalog, not authoritative state.
 
-1. routing catalog
-2. delivery state machine
-3. scheduled/retry state
-4. DLQ operational control
-5. audit trail
+### 2. Direct delivery state machine
+**Source of truth:** append-only direct-delivery WAL plus finalized DLQ/audit state.
 
-Analytics and export sinks remain downstream copies, not the source of truth.
+- Records dispatch, commit, and terminal dead-letter outcomes.
+- Restart recovery must reconstruct pending direct deliveries from persisted facts rather than runtime memory.
+- In-memory inflight maps and per-consumer counters are runtime-only caches.
 
-## Entity model
+### 3. Scheduled and retry queue
+**Source of truth:** persisted scheduled queue.
+
+- Stores delayed first-delivery and retry entries.
+- Persists resolved direct destination, tenant, topic, attempt, enqueue sequence, and delivery timestamp.
+- Runtime timers and sorted slices are derived scheduling structures, not authoritative state.
+
+### 4. Consumer resumability
+**Source of truth:** persisted resumable session snapshot store.
+
+- Stores only logical resumable metadata needed after restart.
+- MUST NOT persist transport identities or live-only counters.
+- Previous socket identity is never authoritative after restart; the consumer must re-register.
+
+### 5. Dead-letter operations
+**Source of truth:** persisted dead-letter store.
+
+- Stores operator-visible DLQ records, replay metadata, and tenant boundaries.
+- Replay removes the DLQ record and creates a scheduled retry entry.
+- Purge is a terminal administrative mutation and must be reflected in audit.
+
+### 6. Administrative audit trail
+**Source of truth:** append-only audit log plus versioned head sidecar.
+
+- Audit is immutable append-only history for replay/purge/manual DLQ actions.
+- The head sidecar is an optimization for append; the log file remains the canonical record.
+- Export pipelines are downstream replicas, not authoritative records.
+
+## What is explicitly runtime-only
+
+The following state should stay in memory and be recomputed/rebuilt as needed:
+
+- live ZeroMQ socket identities
+- per-session inflight counters
+- backlog counters
+- ART route index nodes
+- queue-limit policy samples
+- exporter cursors and transient metrics snapshots
+
+Persist these only if they become part of a documented recovery contract.
+
+## Current file-backed reference layout
 
 ```mermaid
 flowchart TD
-    Routes[(routes)]
-    Sessions[(consumer_sessions)]
-    Inflight[(inflight_deliveries)]
-    Scheduled[(scheduled_messages)]
-    DLQ[(dead_letters)]
-    Audit[(admin_audit)]
-    Export[(analytics/export sink)]
+    RouteCatalog[(routes.json)]
+    WalSegments[(delivery.wal.segments/*)]
+    SessionStore[(delivery.wal.sessions)]
+    ScheduledStore[(delivery.wal.scheduled)]
+    DLQStore[(delivery.wal.dlq)]
+    AuditLog[(delivery.wal.audit)]
+    AuditHead[(delivery.wal.audit.head)]
 
-    Routes --> Inflight
-    Sessions --> Inflight
-    Inflight --> Scheduled
-    Inflight --> DLQ
-    Scheduled --> Audit
-    DLQ --> Audit
-    Audit --> Export
+    RouteCatalog --> RouterIndex[ART route index cache]
+    SessionStore --> SessionCache[live/resumable session cache]
+    WalSegments --> InflightRecovery[inflight recovery]
+    ScheduledStore --> SchedulerCache[sorted scheduler cache]
+    DLQStore --> DLQOps[DLQ browse/replay/purge]
+    AuditLog --> AuditQueries[audit queries]
+    AuditHead --> AuditLog
+    DLQOps --> AuditLog
+    InflightRecovery --> DLQStore
 ```
 
-## Migration direction
+## Abstraction boundary
 
-- Keep runtime logic depending on store abstractions instead of file layouts.
-- Preserve file-backed stores as the reference implementation and migration fallback.
-- Add DB-backed implementations per entity family behind the same interfaces.
-- Use explicit `{version,data}` persistence envelopes so file snapshots remain migratable.
+Runtime code should depend on store behaviors, not file shapes:
+
+- route catalog store
+- resumable session snapshot store
+- scheduled message store
+- dead-letter store
+- audit append/query store
+- append-only dispatch WAL
+
+The current file-backed implementations are the reference adapters behind those boundaries. A future DB-backed implementation should preserve the same contracts while changing only storage adapters.

@@ -3,6 +3,7 @@ package audit
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -57,5 +58,20 @@ func TestFileStoreQueryDetectsCorruption(t *testing.T) {
 	}
 	if _, err := store.Query(Query{}); err == nil {
 		t.Fatal("expected corruption detection error")
+	}
+}
+
+func TestFileStoreHeadSidecarIsVersioned(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "delivery.audit")
+	store := NewFileStore(path)
+	if _, err := store.Append(Event{Actor: "alice", Timestamp: time.Unix(100, 0).UTC(), Operation: OperationManualDeadLetter, TargetMessageIDs: []string{"msg-1"}}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	data, err := os.ReadFile(path + ".head")
+	if err != nil {
+		t.Fatalf("read head sidecar: %v", err)
+	}
+	if !strings.Contains(string(data), `"version": 1`) {
+		t.Fatalf("expected versioned head sidecar, got %s", data)
 	}
 }

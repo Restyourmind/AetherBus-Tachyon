@@ -151,3 +151,12 @@ func TestARTStoreResolveWildcardClassesAndTenantIsolation(t *testing.T) {
 		t.Fatalf("expected tenant-b isolation, got %q", got)
 	}
 }
+
+func TestARTStoreRejectsInvalidWildcardPatterns(t *testing.T) {
+	store := NewART_RouteStore()
+	for _, pattern := range []string{"", "orders.>.created", ">.orders", "orders..created", "orders.*.>"} {
+		if err := store.UpsertRoute(domain.Route{Pattern: pattern, DestinationID: "node-1", RouteType: domain.RouteTypeDirect, Enabled: true, Tenant: "tenant-a"}); err == nil {
+			t.Fatalf("expected invalid pattern %q to be rejected", pattern)
+		}
+	}
+}

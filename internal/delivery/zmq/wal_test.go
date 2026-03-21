@@ -74,7 +74,7 @@ func TestFileWALSessionSnapshotsRoundTrip(t *testing.T) {
 	if len(snapshots) != 1 || snapshots[0].ConsumerID != "worker-1" {
 		t.Fatalf("expected worker-1 snapshot, got %#v", snapshots)
 	}
-	if err := w.DeleteSessionSnapshot("worker-1"); err != nil {
+	if err := w.DeleteSessionSnapshot("", "worker-1"); err != nil {
 		t.Fatalf("delete snapshot: %v", err)
 	}
 	snapshots, err = w.LoadSessionSnapshots()
@@ -279,5 +279,33 @@ func TestFileWALLoadLegacyScheduledAndVersionedSnapshots(t *testing.T) {
 	}
 	if !bytes.Contains(stored, []byte(`"version":2`)) {
 		t.Fatalf("expected versioned envelope, got %s", stored)
+	}
+}
+
+func TestFileWALSessionSnapshotsVersionedByTenant(t *testing.T) {
+	tmp := t.TempDir()
+	w := NewFileWAL(filepath.Join(tmp, "delivery.wal")).(*fileWAL)
+	if err := w.SaveSessionSnapshot(sessionSnapshot{TenantID: "tenant-a", ConsumerID: "worker-1", SessionID: "sess-a", LastHeartbeat: time.Unix(100, 0).UTC(), Resumable: true}); err != nil {
+		t.Fatalf("save tenant-a snapshot: %v", err)
+	}
+	if err := w.SaveSessionSnapshot(sessionSnapshot{TenantID: "tenant-b", ConsumerID: "worker-1", SessionID: "sess-b", LastHeartbeat: time.Unix(101, 0).UTC(), Resumable: true}); err != nil {
+		t.Fatalf("save tenant-b snapshot: %v", err)
+	}
+	if err := w.DeleteSessionSnapshot("tenant-a", "worker-1"); err != nil {
+		t.Fatalf("delete tenant-a snapshot: %v", err)
+	}
+	snapshots, err := w.LoadSessionSnapshots()
+	if err != nil {
+		t.Fatalf("load snapshots: %v", err)
+	}
+	if len(snapshots) != 1 || snapshots[0].TenantID != "tenant-b" {
+		t.Fatalf("expected only tenant-b snapshot to remain, got %#v", snapshots)
+	}
+	stored, err := os.ReadFile(w.snapshotPath())
+	if err != nil {
+		t.Fatalf("read snapshot file: %v", err)
+	}
+	if !bytes.Contains(stored, []byte(`"version":2`)) {
+		t.Fatalf("expected session snapshot envelope version, got %s", stored)
 	}
 }

@@ -166,7 +166,6 @@ type sessionSnapshot struct {
 	ConsumerID          string    `json:"consumer_id"`
 	TenantID            string    `json:"tenant_id,omitempty"`
 	Subscriptions       []string  `json:"subscriptions"`
-	ConnectedAt         time.Time `json:"connected_at"`
 	LastHeartbeat       time.Time `json:"last_heartbeat"`
 	MaxInflight         int       `json:"max_inflight"`
 	SupportsAck         bool      `json:"supports_ack"`
@@ -736,12 +735,14 @@ func (r *Router) loadSessionSnapshots() error {
 		return err
 	}
 	now := r.now()
+	restored := make([]*consumerSession, 0, len(snapshots))
+	r.mu.Lock()
 	for _, snapshot := range snapshots {
 		if snapshot.ConsumerID == "" {
 			continue
 		}
 		if r.sessionSnapshotTTL > 0 && !snapshot.LastHeartbeat.IsZero() && now.Sub(snapshot.LastHeartbeat) > r.sessionSnapshotTTL {
-			if err := r.wal.DeleteSessionSnapshot(snapshot.ConsumerID); err != nil {
+			if err := r.wal.DeleteSessionSnapshot(snapshot.TenantID, snapshot.ConsumerID); err != nil {
 				fmt.Printf("failed to delete stale session snapshot: %v\n", err)
 			}
 			continue
@@ -751,13 +752,18 @@ func (r *Router) loadSessionSnapshots() error {
 			session.Live = false
 			session.TransportIdentity = nil
 		}
-		if existing, ok := r.directSessions[session.ConsumerID]; !ok || existing.LastHeartbeat.Before(session.LastHeartbeat) {
-			r.directSessions[session.ConsumerID] = session
-			r.emitSessionEvent(session, "restore", "snapshot")
+		sessionKey := sessionMapKey(session.TenantID, session.ConsumerID)
+		if existing, ok := r.directSessions[sessionKey]; !ok || existing.LastHeartbeat.Before(session.LastHeartbeat) {
+			r.directSessions[sessionKey] = session
+			restored = append(restored, cloneSession(session))
 			if n := parseSessionOrdinal(session.SessionID); n > r.nextSessionID {
 				r.nextSessionID = n
 			}
 		}
+	}
+	r.mu.Unlock()
+	for _, session := range restored {
+		r.emitSessionEvent(session, "restore", "snapshot")
 	}
 	return nil
 }
@@ -799,7 +805,7 @@ func (r *Router) persistScheduledLocked() {
 	}
 }
 
-func (r *Router) replayFromWAL(consumerID string) {
+func (r *Router) replayFromWAL(tenantID, consumerID string) {
 	if r.wal == nil {
 		return
 	}
@@ -814,7 +820,10 @@ func (r *Router) replayFromWAL(consumerID string) {
 		if consumerID != "" && entry.Consumer != consumerID {
 			continue
 		}
-		session, ok := r.directSessions[entry.Consumer]
+		if tenantID != "" && entry.TenantID != tenantID {
+			continue
+		}
+		session, ok := r.directSessions[sessionMapKey(entry.TenantID, entry.Consumer)]
 		if !ok || !isSessionLive(session) {
 			continue
 		}
@@ -839,9 +848,9 @@ func (r *Router) replayFromWAL(consumerID string) {
 	r.sendDeferred(deferred)
 }
 
-func (r *Router) promoteDeferredForConsumer(consumerID string) {
+func (r *Router) promoteDeferredForConsumer(tenantID, consumerID string) {
 	r.mu.Lock()
-	session, ok := r.directSessions[consumerID]
+	session, ok := r.directSessions[sessionMapKey(tenantID, consumerID)]
 	if !ok || !isSessionLive(session) {
 		r.mu.Unlock()
 		return
@@ -906,7 +915,7 @@ func (r *Router) processInflightTimeouts() {
 			record.DeliveryAttempt++
 			record.Status = statusRetry
 			delete(r.inflight, messageID)
-			if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
+			if s, ok := r.directSessions[sessionMapKey(record.TenantID, record.ConsumerID)]; ok && s.InflightCount > 0 {
 				s.InflightCount--
 			}
 			r.metrics.Retried++
@@ -917,7 +926,7 @@ func (r *Router) processInflightTimeouts() {
 			r.emitEventLocked("delivery", "retry", record.TenantID, record.Topic, record.MessageID, record.ConsumerID, record.SessionID, record.DeliveryAttempt, statusRetry, "timeout_retry", record.EnqueueSequence, now.Add(r.deliveryTimeout), len(record.Payload), nil)
 			continue
 		}
-		if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
+		if s, ok := r.directSessions[sessionMapKey(record.TenantID, record.ConsumerID)]; ok && s.InflightCount > 0 {
 			s.InflightCount--
 		}
 		delete(r.inflight, messageID)
@@ -972,7 +981,7 @@ func (r *Router) handleControl(clientID []byte, raw []byte) {
 	case "consumer.register":
 		r.registerConsumerSession(clientID, msg)
 	case "consumer.heartbeat":
-		r.heartbeatConsumer(msg.ConsumerID)
+		r.heartbeatConsumer(msg.TenantID, msg.ConsumerID)
 	case "ack":
 		r.handleAck(msg.MessageID, msg.ConsumerID, msg.SessionID)
 	case "nack":
@@ -991,16 +1000,17 @@ func (r *Router) registerConsumerSession(clientID []byte, msg controlMessage) {
 		fmt.Printf("failed to persist session snapshot: %v\n", err)
 	}
 	r.emitSessionEvent(session, "register", "live")
-	r.replayFromWAL(msg.ConsumerID)
-	r.promoteDeferredForConsumer(msg.ConsumerID)
+	r.replayFromWAL(msg.TenantID, msg.ConsumerID)
+	r.promoteDeferredForConsumer(msg.TenantID, msg.ConsumerID)
 	r.promoteScheduledDue()
 }
 func (r *Router) upsertSessionLocked(clientID []byte, msg controlMessage, now time.Time) *consumerSession {
-	existing, ok := r.directSessions[msg.ConsumerID]
+	sessionKey := sessionMapKey(msg.TenantID, msg.ConsumerID)
+	existing, ok := r.directSessions[sessionKey]
 	if !ok || existing.SessionID == "" {
 		r.nextSessionID++
 		existing = &consumerSession{SessionID: fmt.Sprintf("sess_%06d", r.nextSessionID), ConsumerID: msg.ConsumerID, ConnectedAt: now}
-		r.directSessions[msg.ConsumerID] = existing
+		r.directSessions[sessionKey] = existing
 	}
 	existing.TenantID = msg.TenantID
 	existing.TransportIdentity = append(existing.TransportIdentity[:0], clientID...)
@@ -1021,10 +1031,10 @@ func (r *Router) upsertSessionLocked(clientID []byte, msg controlMessage, now ti
 	existing.ResumablePending = existing.Capabilities.Resumable
 	return cloneSession(existing)
 }
-func (r *Router) heartbeatConsumer(consumerID string) {
+func (r *Router) heartbeatConsumer(tenantID, consumerID string) {
 	r.mu.Lock()
 	var snapshot *consumerSession
-	if session, ok := r.directSessions[consumerID]; ok {
+	if session, ok := r.directSessions[sessionMapKey(tenantID, consumerID)]; ok {
 		session.LastHeartbeat = r.now()
 		snapshot = cloneSession(session)
 		r.emitSessionEvent(snapshot, "heartbeat", "live")
@@ -1187,6 +1197,12 @@ func (r *Router) enqueueDirectLocked(tenantID, topic, destinationID, routeType, 
 	r.directQueue[queueKey] = queue
 	tenantMetric.Deferred = r.tenantQueuedLocked(tenantID)
 	for _, s := range r.directSessions {
+		if s.TenantID != tenantID {
+			continue
+		}
+		if destinationID != "" && s.ConsumerID != destinationID {
+			continue
+		}
 		if _, ok := s.Subscriptions[topic]; ok {
 			s.BacklogCount++
 		}
@@ -1239,8 +1255,11 @@ func (r *Router) selectSession(tenantID, destinationID, topic string) *consumerS
 		if !isSessionLive(s) {
 			continue
 		}
+		if s.TenantID != tenantID {
+			continue
+		}
 		if destinationID != "" {
-			if s.ConsumerID != destinationID || (s.TenantID != "" && s.TenantID != tenantID) {
+			if s.ConsumerID != destinationID {
 				continue
 			}
 		} else if _, ok := s.Subscriptions[topic]; !ok {
@@ -1280,7 +1299,7 @@ func (r *Router) handleAck(messageID, consumerID, sessionID string) {
 		return
 	}
 	var drain []retryDispatch
-	if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
+	if s, ok := r.directSessions[sessionMapKey(record.TenantID, record.ConsumerID)]; ok && s.InflightCount > 0 {
 		s.InflightCount--
 		drain = r.drainDeferredLocked(record.TenantID, record.ConsumerID, record.Topic)
 	}
@@ -1318,7 +1337,7 @@ func (r *Router) handleNack(messageID, consumerID, sessionID, status string) {
 		record.DeliveryAttempt++
 		record.Status = statusRetry
 		delete(r.inflight, messageID)
-		if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
+		if s, ok := r.directSessions[sessionMapKey(record.TenantID, record.ConsumerID)]; ok && s.InflightCount > 0 {
 			s.InflightCount--
 		}
 		r.metrics.Retried++
@@ -1329,7 +1348,7 @@ func (r *Router) handleNack(messageID, consumerID, sessionID, status string) {
 		r.mu.Unlock()
 		return
 	}
-	if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
+	if s, ok := r.directSessions[sessionMapKey(record.TenantID, record.ConsumerID)]; ok && s.InflightCount > 0 {
 		s.InflightCount--
 	}
 	drain := r.drainDeferredLocked(record.TenantID, record.ConsumerID, record.Topic)
@@ -1422,7 +1441,7 @@ func (r *Router) subscribedTopicsLocked(tenantID, destinationID, preferredTopic 
 		if !isSessionLive(session) || session.InflightCount >= session.MaxInflight {
 			continue
 		}
-		if tenantID != "" && session.TenantID != tenantID {
+		if session.TenantID != tenantID {
 			continue
 		}
 		if destinationID != "" && session.ConsumerID != destinationID {
@@ -1525,14 +1544,14 @@ func snapshotFromSession(session *consumerSession) sessionSnapshot {
 		subscriptions = append(subscriptions, topic)
 	}
 	sort.Strings(subscriptions)
-	return sessionSnapshot{SessionID: session.SessionID, ConsumerID: session.ConsumerID, TenantID: session.TenantID, Subscriptions: subscriptions, ConnectedAt: session.ConnectedAt, LastHeartbeat: session.LastHeartbeat, MaxInflight: session.MaxInflight, SupportsAck: session.Capabilities.SupportsAck, SupportsCompression: cloneStrings(session.Capabilities.SupportsCompression), SupportsCodec: cloneStrings(session.Capabilities.SupportsCodec), Resumable: session.Capabilities.Resumable}
+	return sessionSnapshot{SessionID: session.SessionID, ConsumerID: session.ConsumerID, TenantID: session.TenantID, Subscriptions: subscriptions, LastHeartbeat: session.LastHeartbeat, MaxInflight: session.MaxInflight, SupportsAck: session.Capabilities.SupportsAck, SupportsCompression: cloneStrings(session.Capabilities.SupportsCompression), SupportsCodec: cloneStrings(session.Capabilities.SupportsCodec), Resumable: session.Capabilities.Resumable}
 }
 func sessionFromSnapshot(snapshot sessionSnapshot) *consumerSession {
 	subs := make(map[string]struct{}, len(snapshot.Subscriptions))
 	for _, topic := range snapshot.Subscriptions {
 		subs[topic] = struct{}{}
 	}
-	return &consumerSession{SessionID: snapshot.SessionID, ConsumerID: snapshot.ConsumerID, TenantID: snapshot.TenantID, Subscriptions: subs, Capabilities: capabilityHints{SupportsAck: snapshot.SupportsAck, SupportsCompression: cloneStrings(snapshot.SupportsCompression), SupportsCodec: cloneStrings(snapshot.SupportsCodec), Resumable: snapshot.Resumable}, MaxInflight: snapshot.MaxInflight, ConnectedAt: snapshot.ConnectedAt, LastHeartbeat: snapshot.LastHeartbeat, Live: false, ResumablePending: snapshot.Resumable}
+	return &consumerSession{SessionID: snapshot.SessionID, ConsumerID: snapshot.ConsumerID, TenantID: snapshot.TenantID, Subscriptions: subs, Capabilities: capabilityHints{SupportsAck: snapshot.SupportsAck, SupportsCompression: cloneStrings(snapshot.SupportsCompression), SupportsCodec: cloneStrings(snapshot.SupportsCodec), Resumable: snapshot.Resumable}, MaxInflight: snapshot.MaxInflight, LastHeartbeat: snapshot.LastHeartbeat, Live: false, ResumablePending: snapshot.Resumable}
 }
 func shouldFanoutPublish(result domain.PublishResult) bool {
 	for _, dest := range result.ResolvedDestinations {
@@ -1552,10 +1571,7 @@ func firstDirectDestination(result domain.PublishResult) *domain.ResolvedDestina
 			return &copy
 		}
 	}
-	if result.DestinationID == "" {
-		return nil
-	}
-	return &domain.ResolvedDestination{DestinationID: result.DestinationID, RouteType: domain.RouteTypeDirect}
+	return nil
 }
 func cloneSession(session *consumerSession) *consumerSession {
 	if session == nil {
@@ -1658,6 +1674,10 @@ func (r *Router) tenantQuotaLocked(tenantID string) TenantQuota {
 
 func tenantQuotaExceeded(limit, value int) bool {
 	return limit > 0 && value >= limit
+}
+
+func sessionMapKey(tenantID, consumerID string) string {
+	return tenantID + "\x00" + consumerID
 }
 
 func tenantTopicKey(tenantID, topic string) string {

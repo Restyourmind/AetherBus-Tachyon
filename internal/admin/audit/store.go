@@ -10,7 +10,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/aetherbus/aetherbus-tachyon/internal/statefile"
 )
+
+const headSchemaVersion = 1
 
 type Store interface {
 	Append(event Event) (Event, error)
@@ -18,11 +22,14 @@ type Store interface {
 }
 
 type FileStore struct {
-	mu   sync.Mutex
-	path string
+	mu        sync.Mutex
+	path      string
+	headStore *statefile.FileStateStore[string]
 }
 
-func NewFileStore(path string) Store { return &FileStore{path: path} }
+func NewFileStore(path string) Store {
+	return &FileStore{path: path, headStore: statefile.NewFileStateStore(path+".head", headSchemaVersion, func() string { return "" })}
+}
 
 func (s *FileStore) Append(event Event) (Event, error) {
 	s.mu.Lock()
@@ -141,13 +148,17 @@ func containsMessageID(event Event, id string) bool {
 func (s *FileStore) headPath() string { return s.path + ".head" }
 
 func (s *FileStore) lastHashLocked() (string, error) {
-	data, err := os.ReadFile(s.headPath())
+	envelope, err := s.headStore.Load()
 	if err == nil {
-		return strings.TrimSpace(string(data)), nil
+		return strings.TrimSpace(envelope.Data), nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
+	return s.rebuildHeadLocked()
+}
+
+func (s *FileStore) rebuildHeadLocked() (string, error) {
 	f, err := os.Open(s.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -179,8 +190,5 @@ func (s *FileStore) lastHashLocked() (string, error) {
 }
 
 func (s *FileStore) writeHeadLocked(hash string) error {
-	if err := os.MkdirAll(filepath.Dir(s.headPath()), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(s.headPath(), []byte(strings.TrimSpace(hash)+"\n"), 0o644)
+	return s.headStore.Save(strings.TrimSpace(hash))
 }
