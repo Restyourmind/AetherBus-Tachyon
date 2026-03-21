@@ -34,7 +34,7 @@ func NewRuntimeWithCompressor(cfg *config.Config, bootstrapRoutes map[string]str
 		_ = routeStore.Restore(loadedSnapshot)
 	} else {
 		for topic, nodeID := range bootstrapRoutes {
-			_ = routeStore.AddRoute(topic, nodeID)
+			_ = routeStore.AddRoute(domain.RouteKey{Topic: topic}, nodeID)
 		}
 	}
 

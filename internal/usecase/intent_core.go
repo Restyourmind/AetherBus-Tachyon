@@ -141,7 +141,7 @@ func (c *IntentCoordinator) Process(ctx context.Context, intent domain.Intent) (
 	resolved := make([]domain.ResolvedBrokerAction, 0, len(actions))
 	unroutable := make([]domain.RoutableBrokerAction, 0)
 	for _, action := range actions {
-		dest := c.routeStore.Match(action.Topic)
+		dest := c.routeStore.Match(domain.RouteKey{Topic: action.Topic})
 		if dest == "" {
 			unroutable = append(unroutable, action)
 			continue

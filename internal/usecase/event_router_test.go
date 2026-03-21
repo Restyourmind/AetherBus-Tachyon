@@ -8,7 +8,7 @@ import (
 )
 
 func TestEventRouterPublishWithResult(t *testing.T) {
-	routes := stubRouteStore{routes: map[string]string{"orders.created": "node-a"}}
+	routes := stubRouteStore{routes: map[string]string{routeMapKey("", "orders.created"): "node-a"}}
 	router := NewEventRouter(routes)
 
 	t.Run("routed outcome", func(t *testing.T) {
@@ -57,7 +57,7 @@ func TestEventRouterPublishWithResult(t *testing.T) {
 }
 
 func TestEventRouterPublishBackwardCompatible(t *testing.T) {
-	routes := stubRouteStore{routes: map[string]string{"orders.created": "node-a"}}
+	routes := stubRouteStore{routes: map[string]string{routeMapKey("", "orders.created"): "node-a"}}
 	router := NewEventRouter(routes)
 
 	err := router.Publish(context.Background(), domain.Envelope{
@@ -66,5 +66,25 @@ func TestEventRouterPublishBackwardCompatible(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("expected nil error from Publish, got %v", err)
+	}
+}
+
+func TestEventRouterPublishIsTenantAware(t *testing.T) {
+	routes := stubRouteStore{routes: map[string]string{
+		routeMapKey("tenant-a", "orders.created"): "node-a",
+		routeMapKey("tenant-b", "orders.created"): "node-b",
+	}}
+	router := NewEventRouter(routes)
+
+	result, err := router.PublishWithResult(context.Background(), domain.Envelope{
+		ClientID: []byte("client-1"),
+		TenantID: "tenant-b",
+		Event:    domain.Event{ID: "evt-4", Topic: "orders.created"},
+	})
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if result.DestinationID != "node-b" || result.TenantID != "tenant-b" {
+		t.Fatalf("expected tenant-scoped route node-b/tenant-b, got %+v", result)
 	}
 }

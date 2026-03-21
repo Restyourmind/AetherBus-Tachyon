@@ -12,6 +12,9 @@ type Event struct {
 	// It's used for routing.
 	Topic string
 
+	// TenantID identifies the tenant/namespace for routing and delivery isolation.
+	TenantID string `json:"tenant_id,omitempty"`
+
 	// Source is the identifier of the client that published the event.
 	Source string
 
@@ -45,6 +48,8 @@ type Envelope struct {
 	ClientID []byte
 	// Event is the event itself.
 	Event Event
+	// TenantID is the broker-normalized tenant/namespace copied from the event or headers.
+	TenantID string
 	// DeliverAt requests that broker dispatch does not begin before this UTC timestamp.
 	DeliverAt time.Time
 	// NextAttemptAt is broker-managed scheduler state for delayed retries/promotions.

@@ -32,9 +32,13 @@ func (er *EventRouter) Publish(ctx context.Context, envelope domain.Envelope) er
 // PublishWithResult returns a structured routing outcome for observability and policy layers.
 func (er *EventRouter) PublishWithResult(ctx context.Context, envelope domain.Envelope) (domain.PublishResult, error) {
 	_ = ctx
-	result := domain.PublishResult{Topic: envelope.Event.Topic}
+	tenantID := envelope.TenantID
+	if tenantID == "" {
+		tenantID = envelope.Event.TenantID
+	}
+	result := domain.PublishResult{Topic: envelope.Event.Topic, TenantID: tenantID}
 
-	destNodeID := er.routeStore.Match(envelope.Event.Topic)
+	destNodeID := er.routeStore.Match(domain.RouteKey{TenantID: tenantID, Topic: envelope.Event.Topic})
 	if destNodeID == "" {
 		result.Status = domain.RouteStatusUnroutable
 		fmt.Printf("Routing unroutable event %s (topic: %s) from client %s\n",

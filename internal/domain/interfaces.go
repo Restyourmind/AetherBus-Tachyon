@@ -14,6 +14,7 @@ const (
 type PublishResult struct {
 	Status        RouteStatus
 	DestinationID string
+	TenantID      string
 	Topic         string
 }
 
@@ -21,19 +22,19 @@ type PublishResult struct {
 // It's responsible for mapping topics to destination nodes.
 type RouteStore interface {
 	// AddRoute adds a new direct route to the table.
-	AddRoute(topic string, destNodeID string) error
+	AddRoute(key RouteKey, destNodeID string) error
 
 	// UpsertRoute inserts or updates a serializable route entry.
 	UpsertRoute(route Route) error
 
 	// RemoveRoute removes an exact route identity from the table.
-	RemoveRoute(pattern string, destNodeID string) error
+	RemoveRoute(key RouteKey, destNodeID string) error
 
 	// Routes returns a stable snapshot of the current route set.
 	Routes() []Route
 
 	// Match finds the appropriate destination node ID for a given topic.
-	Match(topic string) string
+	Match(key RouteKey) string
 }
 
 // EventPublisher defines the interface for publishing events to the bus.

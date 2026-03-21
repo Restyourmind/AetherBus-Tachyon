@@ -36,7 +36,7 @@ func TestRuntimeRestoresRoutesFromCatalogOnRestart(t *testing.T) {
 
 	runtime := NewRuntimeWithCompressor(testRuntimeConfig(path), map[string]string{"orders.created": "bootstrap-node"}, media.NewNoopCompressor())
 
-	if got := runtime.RouteStore.Match("orders.created"); got != "node-restored" {
+	if got := runtime.RouteStore.Match(domain.RouteKey{TenantID: "tenant-a", Topic: "orders.created"}); got != "node-restored" {
 		t.Fatalf("expected restored destination node-restored, got %q", got)
 	}
 	routes := runtime.RouteStore.Routes()
@@ -53,7 +53,7 @@ func TestRuntimeFallsBackToBootstrapRoutesOnCorruptedCatalog(t *testing.T) {
 
 	runtime := NewRuntimeWithCompressor(testRuntimeConfig(path), map[string]string{"orders.created": "bootstrap-node"}, media.NewNoopCompressor())
 
-	if got := runtime.RouteStore.Match("orders.created"); got != "bootstrap-node" {
+	if got := runtime.RouteStore.Match(domain.RouteKey{Topic: "orders.created"}); got != "bootstrap-node" {
 		t.Fatalf("expected bootstrap fallback destination, got %q", got)
 	}
 }

@@ -34,12 +34,13 @@ func NewART_RouteStoreWithCatalog(catalog *FileRouteCatalog) *ART_RouteStore {
 }
 
 // AddRoute adds a new direct route to the table.
-func (r *ART_RouteStore) AddRoute(topic string, destNodeID string) error {
+func (r *ART_RouteStore) AddRoute(key domain.RouteKey, destNodeID string) error {
 	return r.UpsertRoute(domain.Route{
-		Pattern:       topic,
+		Pattern:       key.Topic,
 		DestinationID: destNodeID,
 		RouteType:     "direct",
 		Enabled:       true,
+		Tenant:        key.TenantID,
 	})
 }
 
@@ -56,14 +57,14 @@ func (r *ART_RouteStore) UpsertRoute(route domain.Route) error {
 }
 
 // RemoveRoute removes an exact route identity from the table.
-func (r *ART_RouteStore) RemoveRoute(pattern string, destNodeID string) error {
+func (r *ART_RouteStore) RemoveRoute(key domain.RouteKey, destNodeID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	var removed bool
-	for key, route := range r.routes {
-		if route.Pattern == pattern && route.DestinationID == destNodeID {
-			delete(r.routes, key)
+	for identity, route := range r.routes {
+		if route.Pattern == key.Topic && route.Tenant == key.TenantID && route.DestinationID == destNodeID {
+			delete(r.routes, identity)
 			removed = true
 		}
 	}
@@ -77,11 +78,11 @@ func (r *ART_RouteStore) RemoveRoute(pattern string, destNodeID string) error {
 
 // Match finds the appropriate destination node ID for a given topic.
 // For now, it performs an exact match.
-func (r *ART_RouteStore) Match(topic string) string {
+func (r *ART_RouteStore) Match(key domain.RouteKey) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	value, found := r.tree.Search(art.Key(topic))
+	value, found := r.tree.Search(art.Key(partitionedTopicKey(key.TenantID, key.Topic)))
 	if found {
 		return value.(string)
 	}
@@ -123,7 +124,7 @@ func (r *ART_RouteStore) rebuildTreeLocked() {
 		if !route.Enabled {
 			continue
 		}
-		r.tree.Insert(art.Key(route.Pattern), route.DestinationID)
+		r.tree.Insert(art.Key(partitionedTopicKey(route.Tenant, route.Pattern)), route.DestinationID)
 	}
 }
 
@@ -147,4 +148,8 @@ func (r *ART_RouteStore) persistLocked() error {
 
 func routeIdentity(route domain.Route) string {
 	return fmt.Sprintf("%s\x00%s\x00%s\x00%d\x00%t\x00%s", route.Pattern, route.DestinationID, route.RouteType, route.Priority, route.Enabled, route.Tenant)
+}
+
+func partitionedTopicKey(tenantID, topic string) string {
+	return fmt.Sprintf("%s\x00%s", tenantID, topic)
 }

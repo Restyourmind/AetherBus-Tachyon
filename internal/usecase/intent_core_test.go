@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
@@ -11,31 +12,43 @@ type stubRouteStore struct {
 	routes map[string]string
 }
 
-func (s stubRouteStore) AddRoute(topic string, destNodeID string) error {
-	s.routes[topic] = destNodeID
+func routeMapKey(tenantID, topic string) string {
+	return tenantID + "\x00" + topic
+}
+
+func (s stubRouteStore) AddRoute(key domain.RouteKey, destNodeID string) error {
+	s.routes[routeMapKey(key.TenantID, key.Topic)] = destNodeID
 	return nil
 }
 
 func (s stubRouteStore) UpsertRoute(route domain.Route) error {
-	s.routes[route.Pattern] = route.DestinationID
+	s.routes[routeMapKey(route.Tenant, route.Pattern)] = route.DestinationID
 	return nil
 }
 
-func (s stubRouteStore) RemoveRoute(pattern string, destNodeID string) error {
-	delete(s.routes, pattern)
+func (s stubRouteStore) RemoveRoute(key domain.RouteKey, destNodeID string) error {
+	delete(s.routes, routeMapKey(key.TenantID, key.Topic))
 	return nil
 }
 
 func (s stubRouteStore) Routes() []domain.Route {
 	routes := make([]domain.Route, 0, len(s.routes))
-	for pattern, dest := range s.routes {
-		routes = append(routes, domain.Route{Pattern: pattern, DestinationID: dest, RouteType: "direct", Enabled: true})
+	for composite, dest := range s.routes {
+		parts := strings.SplitN(composite, "\x00", 2)
+		route := domain.Route{DestinationID: dest, RouteType: "direct", Enabled: true}
+		if len(parts) == 2 {
+			route.Tenant = parts[0]
+			route.Pattern = parts[1]
+		} else {
+			route.Pattern = composite
+		}
+		routes = append(routes, route)
 	}
 	return routes
 }
 
-func (s stubRouteStore) Match(topic string) string {
-	return s.routes[topic]
+func (s stubRouteStore) Match(key domain.RouteKey) string {
+	return s.routes[routeMapKey(key.TenantID, key.Topic)]
 }
 
 func TestIntentAdmissionValidator(t *testing.T) {
@@ -80,7 +93,7 @@ func TestIntentDecomposerStub(t *testing.T) {
 }
 
 func TestIntentCoordinatorLocalResolution(t *testing.T) {
-	routes := stubRouteStore{routes: map[string]string{"payments.created": "node-1"}}
+	routes := stubRouteStore{routes: map[string]string{routeMapKey("", "payments.created"): "node-1"}}
 	coordinator := NewIntentCoordinator(routes, NewLocalIntentGraph())
 
 	intent := domain.Intent{ID: "intent-20", Issuer: "svc-a", Scope: domain.IntentScopeLocal, Kind: "route", Goal: domain.GoalPredicate{Topic: "payments.created"}}

@@ -52,7 +52,7 @@ func TestARTStoreDeduplicatesDuplicateRoutesInSnapshot(t *testing.T) {
 	if len(routes) != 1 {
 		t.Fatalf("expected duplicate route collapse, got %d routes", len(routes))
 	}
-	if got := store.Match("orders.created"); got != "node-1" {
+	if got := store.Match(domain.RouteKey{Topic: "orders.created"}); got != "node-1" {
 		t.Fatalf("expected restored route to match node-1, got %q", got)
 	}
 }
@@ -64,10 +64,10 @@ func TestARTStorePersistsMutations(t *testing.T) {
 	if err := store.UpsertRoute(domain.Route{Pattern: "orders.created", DestinationID: "node-1", RouteType: "direct", Priority: 10, Enabled: true, Tenant: "tenant-a"}); err != nil {
 		t.Fatalf("upsert route: %v", err)
 	}
-	if err := store.RemoveRoute("orders.created", "node-1"); err != nil {
+	if err := store.RemoveRoute(domain.RouteKey{TenantID: "tenant-a", Topic: "orders.created"}, "node-1"); err != nil {
 		t.Fatalf("remove route: %v", err)
 	}
-	if err := store.AddRoute("orders.updated", "node-2"); err != nil {
+	if err := store.AddRoute(domain.RouteKey{Topic: "orders.updated"}, "node-2"); err != nil {
 		t.Fatalf("add route: %v", err)
 	}
 
@@ -83,5 +83,25 @@ func TestARTStorePersistsMutations(t *testing.T) {
 	}
 	if snapshot.Routes[0].Pattern != "orders.updated" || snapshot.Routes[0].DestinationID != "node-2" {
 		t.Fatalf("unexpected persisted route: %+v", snapshot.Routes[0])
+	}
+}
+
+func TestARTStoreIsolatesRoutesAcrossTenants(t *testing.T) {
+	store := NewART_RouteStore()
+	if err := store.UpsertRoute(domain.Route{Pattern: "orders.created", DestinationID: "node-a", RouteType: "direct", Enabled: true, Tenant: "tenant-a"}); err != nil {
+		t.Fatalf("upsert tenant-a route: %v", err)
+	}
+	if err := store.UpsertRoute(domain.Route{Pattern: "orders.created", DestinationID: "node-b", RouteType: "direct", Enabled: true, Tenant: "tenant-b"}); err != nil {
+		t.Fatalf("upsert tenant-b route: %v", err)
+	}
+
+	if got := store.Match(domain.RouteKey{TenantID: "tenant-a", Topic: "orders.created"}); got != "node-a" {
+		t.Fatalf("expected tenant-a isolation, got %q", got)
+	}
+	if got := store.Match(domain.RouteKey{TenantID: "tenant-b", Topic: "orders.created"}); got != "node-b" {
+		t.Fatalf("expected tenant-b isolation, got %q", got)
+	}
+	if got := store.Match(domain.RouteKey{TenantID: "tenant-c", Topic: "orders.created"}); got != "" {
+		t.Fatalf("expected no cross-tenant route leakage, got %q", got)
 	}
 }

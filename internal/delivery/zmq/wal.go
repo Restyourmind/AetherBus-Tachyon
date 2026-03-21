@@ -46,6 +46,7 @@ type walRecord struct {
 	MessageID       string `json:"message_id"`
 	Consumer        string `json:"consumer_id,omitempty"`
 	SessionID       string `json:"session_id,omitempty"`
+	TenantID        string `json:"tenant_id,omitempty"`
 	Topic           string `json:"topic,omitempty"`
 	Payload         string `json:"payload,omitempty"`
 	Priority        string `json:"priority,omitempty"`
@@ -57,6 +58,7 @@ type walDispatchedEntry struct {
 	MessageID       string
 	Consumer        string
 	SessionID       string
+	TenantID        string
 	Topic           string
 	Payload         []byte
 	Priority        string
@@ -68,6 +70,7 @@ type DeadLetterRecord struct {
 	MessageID        string    `json:"message_id"`
 	ConsumerID       string    `json:"consumer_id,omitempty"`
 	SessionID        string    `json:"session_id,omitempty"`
+	TenantID         string    `json:"tenant_id,omitempty"`
 	Topic            string    `json:"topic"`
 	Payload          []byte    `json:"payload"`
 	Priority         string    `json:"priority,omitempty"`
@@ -137,7 +140,7 @@ func NewFileWAL(path string) WAL {
 }
 
 func (w *fileWAL) AppendDispatched(entry walDispatchedEntry) error {
-	return w.appendRecord(walRecord{Type: "dispatched", MessageID: entry.MessageID, Consumer: entry.Consumer, SessionID: entry.SessionID, Topic: entry.Topic, Payload: base64.StdEncoding.EncodeToString(entry.Payload), Priority: entry.Priority, EnqueueSequence: entry.EnqueueSequence, Attempt: entry.Attempt})
+	return w.appendRecord(walRecord{Type: "dispatched", MessageID: entry.MessageID, Consumer: entry.Consumer, SessionID: entry.SessionID, TenantID: entry.TenantID, Topic: entry.Topic, Payload: base64.StdEncoding.EncodeToString(entry.Payload), Priority: entry.Priority, EnqueueSequence: entry.EnqueueSequence, Attempt: entry.Attempt})
 }
 func (w *fileWAL) AppendCommitted(messageID string) error {
 	return w.appendRecord(walRecord{Type: "committed", MessageID: messageID})
@@ -197,7 +200,7 @@ func (w *fileWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 			if err != nil {
 				return nil, fmt.Errorf("decode wal payload: %w", err)
 			}
-			pending[rec.MessageID] = walDispatchedEntry{MessageID: rec.MessageID, Consumer: rec.Consumer, SessionID: rec.SessionID, Topic: rec.Topic, Payload: payload, Priority: rec.Priority, EnqueueSequence: rec.EnqueueSequence, Attempt: rec.Attempt}
+			pending[rec.MessageID] = walDispatchedEntry{MessageID: rec.MessageID, Consumer: rec.Consumer, SessionID: rec.SessionID, TenantID: rec.TenantID, Topic: rec.Topic, Payload: payload, Priority: rec.Priority, EnqueueSequence: rec.EnqueueSequence, Attempt: rec.Attempt}
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -302,7 +305,7 @@ func (w *fileWAL) ReplayDeadLetters(req DeadLetterReplayRequest) (DeadLetterRepl
 		}
 		priorStates = append(priorStates, deadLetterAuditState(rec, "dead_letter_store"))
 		maxSeq++
-		scheduled = append(scheduled, scheduledMessage{Sequence: maxSeq, MessageID: rec.MessageID, Topic: rec.Topic, Payload: append([]byte(nil), rec.Payload...), Priority: rec.Priority, EnqueueSequence: rec.EnqueueSequence, DeliveryAttempt: 1, DeliverAt: now, Reason: "dlq_replay"})
+		scheduled = append(scheduled, scheduledMessage{Sequence: maxSeq, MessageID: rec.MessageID, TenantID: rec.TenantID, Topic: rec.Topic, Payload: append([]byte(nil), rec.Payload...), Priority: rec.Priority, EnqueueSequence: rec.EnqueueSequence, DeliveryAttempt: 1, DeliverAt: now, Reason: "dlq_replay"})
 		rec.ReplayCount++
 		rec.LastReplayAt = now
 		rec.LastReplayTarget = req.TargetConsumerID + ":" + req.TargetTopic

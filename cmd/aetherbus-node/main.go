@@ -10,6 +10,7 @@ import (
 
 	"github.com/aetherbus/aetherbus-tachyon/config"
 	"github.com/aetherbus/aetherbus-tachyon/internal/delivery/zmq"
+	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
 	"github.com/aetherbus/aetherbus-tachyon/internal/media"
 	"github.com/aetherbus/aetherbus-tachyon/internal/repository"
 	"github.com/aetherbus/aetherbus-tachyon/internal/usecase"
@@ -28,9 +29,9 @@ func main() {
 	routeStore := repository.NewART_RouteStore()
 	fmt.Println("Initialized Adaptive Radix Tree Route Store.")
 
-	_ = routeStore.AddRoute("telemetry.sensor.alpha", "node-alpha-1")
-	_ = routeStore.AddRoute("telemetry.sensor.beta", "node-beta-1")
-	_ = routeStore.AddRoute("logs.system", "node-logger-1")
+	_ = routeStore.AddRoute(domain.RouteKey{Topic: "telemetry.sensor.alpha"}, "node-alpha-1")
+	_ = routeStore.AddRoute(domain.RouteKey{Topic: "telemetry.sensor.beta"}, "node-beta-1")
+	_ = routeStore.AddRoute(domain.RouteKey{Topic: "logs.system"}, "node-logger-1")
 	fmt.Println("Populated dummy routes.")
 
 	codec := media.NewJSONCodec()

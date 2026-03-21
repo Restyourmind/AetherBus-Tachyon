@@ -523,6 +523,21 @@ Preferred for clarity:
 - logical tenant context kept outside topic path
 - routing table partitioned internally by tenant
 
+The reference implementation now uses **internal partitioning**, not topic prefixing.
+`tenant_id` is carried separately from `topic` in the route key model, and the ART-backed
+`RouteStore` indexes routes inside a tenant-partitioned keyspace. This means two tenants
+can both define `orders.created` without colliding, while a missing or empty tenant falls
+back to the default/global partition for backward compatibility.
+
+Routing and direct-delivery bookkeeping also preserve `tenant_id` through:
+
+- publish result accounting
+- inflight message records
+- deferred direct queues
+- scheduled retry/deferred promotion state
+- dead-letter records
+- per-tenant metric/quota counters
+
 ## 28. Route Health and Availability
 
 Routes MAY be temporarily unavailable due to:

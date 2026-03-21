@@ -26,7 +26,7 @@ func TestMainIntegration(t *testing.T) {
 	}()
 
 	routeStore := repository.NewART_RouteStore()
-	_ = routeStore.AddRoute("user.created", "node-1")
+	_ = routeStore.AddRoute(domain.RouteKey{Topic: "user.created"}, "node-1")
 
 	codec := media.NewJSONCodec()
 	compressor := media.NewLZ4Compressor()

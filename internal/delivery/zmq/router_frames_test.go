@@ -196,7 +196,7 @@ func TestHandleAckDuplicateAndStale(t *testing.T) {
 		},
 	}
 
-	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
 	if got := r.metrics.Dispatched; got != 1 {
 		t.Fatalf("expected dispatched=1, got %d", got)
 	}
@@ -236,7 +236,7 @@ func TestRetryableNackRetried(t *testing.T) {
 		return nil
 	}
 
-	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal")
 	r.handleNack("msg-2", "worker-1", "sess_000001", "retryable_error")
 
 	if got := r.metrics.Nacked; got != 1 {
@@ -272,7 +272,7 @@ func TestTerminalNackDeadLettered(t *testing.T) {
 		},
 	}
 
-	r.dispatchDirect("orders.created", "msg-3", []byte(`{"id":"msg-3"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-3", []byte(`{"id":"msg-3"}`), "normal")
 	r.handleNack("msg-3", "worker-1", "sess_000001", "terminal_error")
 
 	if got := r.metrics.Nacked; got != 1 {
@@ -310,7 +310,7 @@ func TestTimeoutRetry(t *testing.T) {
 		return nil
 	}
 
-	r.dispatchDirect("orders.created", "msg-timeout-retry", []byte(`{"id":"msg-timeout-retry"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-timeout-retry", []byte(`{"id":"msg-timeout-retry"}`), "normal")
 	now = now.Add(51 * time.Millisecond)
 	r.processInflightTimeouts()
 
@@ -350,7 +350,7 @@ func TestTimeoutDeadLetter(t *testing.T) {
 	now := time.Unix(1000, 0).UTC()
 	r.now = func() time.Time { return now }
 
-	r.dispatchDirect("orders.created", "msg-timeout-dead", []byte(`{"id":"msg-timeout-dead"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-timeout-dead", []byte(`{"id":"msg-timeout-dead"}`), "normal")
 	now = now.Add(51 * time.Millisecond)
 	r.processInflightTimeouts()
 
@@ -381,8 +381,8 @@ func TestConsumerSaturationStopsDirectDispatch(t *testing.T) {
 		},
 	}
 
-	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
-	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal")
 
 	if got := r.metrics.Dispatched; got != 1 {
 		t.Fatalf("expected only first message dispatched, got %d", got)
@@ -411,9 +411,9 @@ func TestDispatchPauseTracksConsumerBacklog(t *testing.T) {
 		},
 	}
 
-	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
-	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal")
-	r.dispatchDirect("orders.created", "msg-3", []byte(`{"id":"msg-3"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-3", []byte(`{"id":"msg-3"}`), "normal")
 
 	snapshot := r.ConsumerBacklogSnapshot()
 	metrics, ok := snapshot["worker-1"]
@@ -441,10 +441,10 @@ func TestResumeDispatchAfterAckDropsInflight(t *testing.T) {
 		},
 	}
 
-	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
-	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal") // paused
+	r.dispatchDirect("", "orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal") // paused
 	r.handleAck("msg-1", "worker-1", "sess_000001")
-	r.dispatchDirect("orders.created", "msg-3", []byte(`{"id":"msg-3"}`), "normal") // resumed
+	r.dispatchDirect("", "orders.created", "msg-3", []byte(`{"id":"msg-3"}`), "normal") // resumed
 
 	if got := r.metrics.Dispatched; got != 2 {
 		t.Fatalf("expected two dispatched messages after resume, got %d", got)
@@ -472,7 +472,7 @@ func TestDispatchDirectWritesWALAndAckCommits(t *testing.T) {
 		},
 	}
 
-	r.dispatchDirect("orders.created", "msg-w1", []byte(`{"id":"msg-w1"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-w1", []byte(`{"id":"msg-w1"}`), "normal")
 	if len(w.dispatched) != 1 {
 		t.Fatalf("expected one wal dispatch append, got %d", len(w.dispatched))
 	}
@@ -536,7 +536,7 @@ func TestStaleAckSessionMismatchIgnored(t *testing.T) {
 		},
 	}
 
-	r.dispatchDirect("orders.created", "msg-4", []byte(`{"id":"msg-4"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-4", []byte(`{"id":"msg-4"}`), "normal")
 	r.handleAck("msg-4", "worker-1", "sess_old")
 
 	if got := r.metrics.Acked; got != 0 {
@@ -566,8 +566,8 @@ func TestDeferredDispatchForSlowConsumer(t *testing.T) {
 		return nil
 	}
 
-	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
-	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal")
 	if got := r.metrics.Deferred; got != 1 {
 		t.Fatalf("expected deferred=1, got %d", got)
 	}
@@ -595,9 +595,9 @@ func TestPerTopicQueueBoundDropsExcess(t *testing.T) {
 		},
 	}
 
-	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
-	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal")
-	r.dispatchDirect("orders.created", "msg-3", []byte(`{"id":"msg-3"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-3", []byte(`{"id":"msg-3"}`), "normal")
 
 	if got := r.metrics.Dropped; got != 1 {
 		t.Fatalf("expected dropped=1 for bounded queue overflow, got %d", got)
@@ -619,8 +619,8 @@ func TestGlobalIngressLimitDropsNewDispatch(t *testing.T) {
 		},
 	}
 
-	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
-	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal")
 
 	if got := r.metrics.Dropped; got != 1 {
 		t.Fatalf("expected dropped=1 for global ingress protection, got %d", got)
@@ -678,7 +678,7 @@ func TestRetryExhaustionAppendsDeadLetterToWAL(t *testing.T) {
 		},
 	}
 
-	r.dispatchDirect("orders.created", "msg-exhaust", []byte(`{"id":"msg-exhaust"}`), "normal")
+	r.dispatchDirect("", "orders.created", "msg-exhaust", []byte(`{"id":"msg-exhaust"}`), "normal")
 	r.handleNack("msg-exhaust", "worker-1", "sess_000001", "retryable_error")
 	now = now.Add(51 * time.Millisecond)
 	r.promoteScheduledDue()
@@ -829,7 +829,7 @@ func TestScheduledPublishPromotesWhenDue(t *testing.T) {
 	sends := 0
 	r.directSender = func(identity []byte, topic string, payload []byte) error { sends++; return nil }
 
-	r.scheduleDispatch("orders.created", "msg-scheduled", []byte(`{"id":"msg-scheduled"}`), "normal", 0, 1, now.Add(time.Second), "publish")
+	r.scheduleDispatch("", "orders.created", "msg-scheduled", []byte(`{"id":"msg-scheduled"}`), "normal", 0, 1, now.Add(time.Second), "publish")
 	if sends != 0 {
 		t.Fatalf("expected no immediate send for scheduled publish")
 	}
@@ -854,8 +854,8 @@ func TestScheduledRetryPromotionPreservesOrdering(t *testing.T) {
 		return nil
 	}
 
-	r.scheduleDispatch("orders.created", "msg-2", []byte("second"), "normal", 0, 1, now.Add(2*time.Second), "retry")
-	r.scheduleDispatch("orders.created", "msg-1", []byte("first"), "normal", 0, 1, now.Add(time.Second), "retry")
+	r.scheduleDispatch("", "orders.created", "msg-2", []byte("second"), "normal", 0, 1, now.Add(2*time.Second), "retry")
+	r.scheduleDispatch("", "orders.created", "msg-1", []byte("first"), "normal", 0, 1, now.Add(time.Second), "retry")
 	now = now.Add(3 * time.Second)
 	r.promoteScheduledDue()
 	if len(order) != 2 || order[0] != "first" || order[1] != "second" {
@@ -894,8 +894,8 @@ func TestDirectQueueDispatchesHigherPriorityFirst(t *testing.T) {
 	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
 	r.directSessions["worker-1"] = &consumerSession{SessionID: "sess_000001", ConsumerID: "worker-1", TransportIdentity: []byte("cid1"), Capabilities: capabilityHints{SupportsAck: true, Resumable: true}, MaxInflight: 1, Subscriptions: map[string]struct{}{"orders.created": {}}}
 
-	r.dispatchDirect("orders.created", "msg-low", []byte(`{"id":"msg-low"}`), "low")
-	r.dispatchDirect("orders.created", "msg-high", []byte(`{"id":"msg-high"}`), "high")
+	r.dispatchDirect("", "orders.created", "msg-low", []byte(`{"id":"msg-low"}`), "low")
+	r.dispatchDirect("", "orders.created", "msg-high", []byte(`{"id":"msg-high"}`), "high")
 	r.handleAck("msg-low", "worker-1", "sess_000001")
 
 	if got := r.inflight["msg-high"]; got == nil || got.Priority != "high" {
@@ -907,8 +907,8 @@ func TestDirectQueuePriorityOrderingIsStableWithinClass(t *testing.T) {
 	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
 	r.directSessions["worker-1"] = &consumerSession{SessionID: "sess_000001", ConsumerID: "worker-1", TransportIdentity: []byte("cid1"), Capabilities: capabilityHints{SupportsAck: true, Resumable: true}, MaxInflight: 1, Subscriptions: map[string]struct{}{"orders.created": {}}}
 
-	r.dispatchDirect("orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "high")
-	r.dispatchDirect("orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "high")
+	r.dispatchDirect("", "orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "high")
+	r.dispatchDirect("", "orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "high")
 	r.handleAck("msg-1", "worker-1", "sess_000001")
 
 	if got := r.inflight["msg-2"]; got == nil || got.EnqueueSequence == 0 {
@@ -921,9 +921,9 @@ func TestPriorityBoostPreventsStarvationAcrossTopics(t *testing.T) {
 	r.SetPriorityPolicy([]string{"urgent", "high", "normal", "low"}, map[string]int{"urgent": 4, "high": 3, "normal": 2, "low": 1}, true, 1, 10)
 	r.directSessions["worker-1"] = &consumerSession{SessionID: "sess_000001", ConsumerID: "worker-1", TransportIdentity: []byte("cid1"), Capabilities: capabilityHints{SupportsAck: true, Resumable: true}, MaxInflight: 1, Subscriptions: map[string]struct{}{"orders.high": {}, "orders.low": {}}}
 
-	r.dispatchDirect("orders.high", "msg-high-1", []byte(`{"id":"msg-high-1"}`), "high")
-	r.dispatchDirect("orders.low", "msg-low-1", []byte(`{"id":"msg-low-1"}`), "low")
-	r.dispatchDirect("orders.high", "msg-high-2", []byte(`{"id":"msg-high-2"}`), "high")
+	r.dispatchDirect("", "orders.high", "msg-high-1", []byte(`{"id":"msg-high-1"}`), "high")
+	r.dispatchDirect("", "orders.low", "msg-low-1", []byte(`{"id":"msg-low-1"}`), "low")
+	r.dispatchDirect("", "orders.high", "msg-high-2", []byte(`{"id":"msg-high-2"}`), "high")
 	r.handleAck("msg-high-1", "worker-1", "sess_000001")
 
 	if got := r.inflight["msg-low-1"]; got == nil || got.Topic != "orders.low" {
@@ -964,7 +964,7 @@ func TestScheduledPayloadRetainsNormalizedPriority(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode event: %v", err)
 	}
-	r.scheduleDispatch("orders.created", "msg-pri", payload, "high", 9, 1, now.Add(time.Second), "publish")
+	r.scheduleDispatch("", "orders.created", "msg-pri", payload, "high", 9, 1, now.Add(time.Second), "publish")
 	now = now.Add(time.Second)
 	r.promoteScheduledDue()
 
@@ -977,5 +977,37 @@ func TestScheduledPayloadRetainsNormalizedPriority(t *testing.T) {
 	}
 	if r.inflight["msg-pri"].Priority != "high" {
 		t.Fatalf("expected scheduled priority preserved, got %#v", r.inflight["msg-pri"])
+	}
+}
+
+func TestTenantMetricsAndDeadLetterMetadataAreTracked(t *testing.T) {
+	w := &stubWAL{}
+	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 1, time.Second, w)
+	r.directSessions["worker-1"] = &consumerSession{SessionID: "sess_000001", ConsumerID: "worker-1", TransportIdentity: []byte("cid1"), Capabilities: capabilityHints{SupportsAck: true}, MaxInflight: 1, Subscriptions: map[string]struct{}{"orders.created": {}}}
+
+	r.dispatchDirect("tenant-a", "orders.created", "msg-tenant", []byte(`{"id":"msg-tenant","tenant_id":"tenant-a"}`), "normal")
+	r.handleNack("msg-tenant", "worker-1", "sess_000001", "terminal_error")
+
+	metrics := r.TenantMetricsSnapshot()["tenant-a"]
+	if metrics.Dispatched != 1 || metrics.Nacked != 1 || metrics.DeadLettered != 1 {
+		t.Fatalf("expected tenant metrics to track lifecycle, got %+v", metrics)
+	}
+	if len(w.deadLettered) != 1 || w.deadLettered[0].TenantID != "tenant-a" {
+		t.Fatalf("expected dead-letter tenant metadata preserved, got %#v", w.deadLettered)
+	}
+}
+
+func TestTenantQuotaDropsMessagesWithinTenantPartition(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	r.SetTenantQuota("tenant-a", TenantQuota{MaxQueued: 1, MaxIngress: 1})
+
+	r.dispatchDirect("tenant-a", "orders.created", "msg-1", []byte(`{"id":"msg-1"}`), "normal")
+	r.dispatchDirect("tenant-a", "orders.created", "msg-2", []byte(`{"id":"msg-2"}`), "normal")
+
+	if got := r.TenantMetricsSnapshot()["tenant-a"].Dropped; got != 1 {
+		t.Fatalf("expected tenant quota drop, got %d", got)
+	}
+	if got := r.TenantMetricsSnapshot()["tenant-a"].Deferred; got != 1 {
+		t.Fatalf("expected one deferred message within tenant queue, got %d", got)
 	}
 }

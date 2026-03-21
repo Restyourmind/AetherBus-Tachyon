@@ -529,6 +529,20 @@ The following metadata are RECOMMENDED for observability:
 
 A broker SHOULD emit traceable structured logs using these fields.
 
+### 19.1 Tenant-Aware Broker State
+
+When a broker supports multi-tenancy, `tenant_id` SHOULD remain a first-class metadata field
+instead of being inferred from a topic prefix.
+
+The reference implementation uses internal tenant partitioning:
+
+- route lookup uses `(tenant_id, topic)` as the logical route key
+- direct-delivery inflight, deferred, scheduled-retry, and dead-letter state preserve `tenant_id`
+- per-tenant counters and quota hooks can be applied independently of the shared topic name
+
+Topic-prefix tenancy remains interoperable at the protocol edge, but it is no longer the
+reference isolation mechanism for broker internals.
+
 ## 20. Security Considerations
 
 abtp/1 does not mandate a single authentication mechanism.

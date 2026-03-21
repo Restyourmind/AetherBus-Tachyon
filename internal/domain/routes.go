@@ -17,6 +17,12 @@ type Route struct {
 	Metadata      map[string]string `json:"metadata,omitempty"`
 }
 
+// RouteKey identifies a route within a tenant partition and topic namespace.
+type RouteKey struct {
+	TenantID string
+	Topic    string
+}
+
 // RouteCatalogSnapshot is the versioned persistence shape for route catalogs.
 type RouteCatalogSnapshot struct {
 	Version int     `json:"version"`
