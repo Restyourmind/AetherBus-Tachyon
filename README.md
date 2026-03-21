@@ -230,22 +230,22 @@ This version of the diagram is aligned with the current logical storage model de
 
 The broker currently uses a **hybrid in-memory + append-only WAL** model instead of a full relational database. The logical data structures are:
 
-### 1) Route store (in-memory ART)
+### 1) Route store (ART + persisted catalog)
 
 - Purpose: topic-to-destination lookup for routing decisions
-- Shape: key-value map over ART nodes
-- Lifecycle: runtime memory only (reconstructed from bootstrap routes on restart)
+- Shape: adaptive radix tree in memory plus a versioned JSON route catalog on disk
+- Lifecycle: loaded from `ROUTE_CATALOG_PATH` on startup, mutated in memory during runtime, persisted after route changes
 
 | Field | Type | Description |
 |---|---|---|
 | `topic` | string | Topic key used for route lookup |
 | `destination` | string | Target consumer/node identifier |
 
-### 2) Direct consumer session table (in-memory)
+### 2) Direct consumer session table (in-memory + resumable snapshots)
 
 - Purpose: active consumer capability/session tracking for direct delivery
 - Shape: map keyed by `consumer_id`
-- Lifecycle: runtime memory only
+- Lifecycle: active state lives in memory; resumable metadata can be restored from WAL-backed session snapshots
 
 | Field | Type | Description |
 |---|---|---|
@@ -258,11 +258,11 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 | `inflight_count` | int | Current number of inflight messages |
 | `last_heartbeat` | timestamp | Last heartbeat seen from consumer |
 
-### 3) Inflight delivery table (in-memory)
+### 3) Inflight + scheduled delivery tables
 
-- Purpose: ACK/NACK, retry, timeout, and dead-letter control for direct mode
-- Shape: map keyed by `message_id`
-- Lifecycle: runtime memory; can be repopulated from WAL replay for unacked messages
+- Purpose: ACK/NACK, retry, timeout, dead-letter control, and delayed delivery scheduling for direct mode
+- Shape: maps keyed by `message_id` plus an ordered scheduled queue keyed by `deliver_at`
+- Lifecycle: inflight state lives in memory; retry/delayed queue ordering can be restored from WAL-backed scheduled entries
 
 | Field | Type | Description |
 |---|---|---|
@@ -308,35 +308,27 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 
 ## 💡 Function Proposals & Future Extensions
 
-> This section intentionally lists **forward-looking proposals only**. Items that are already implemented have been removed so this backlog stays focused on future work.
-
 ### English
 
-- **Route Bootstrap Persistence:** Add a persistent route catalog so the ART route store can be restored automatically without manual bootstrap configuration.
-- **Session Snapshot & Warm Restart:** Persist consumer session metadata and resumable capability hints to shorten recovery time after broker restarts.
-- **Delayed Delivery / Scheduled Publish:** Support future delivery timestamps and retry schedules as first-class broker behavior.
-- **Priority Queues for Direct Delivery:** Let operators assign message priority classes so urgent commands can bypass bulk background traffic.
-- **Dead-letter Inspection API:** Expose a dedicated API/CLI for browsing, replaying, and purging dead-lettered records safely.
-- **Replay Audit Trail:** Record operator-triggered replay actions and delivery state transitions for compliance and debugging.
-- **Tenant-aware Route Namespaces:** Isolate route lookup, quotas, and observability by tenant while preserving shared broker infrastructure.
-- **Adaptive Backpressure Policies:** Dynamically tune inflight and queue limits based on consumer lag, retry rate, and broker memory pressure.
-- **Geo-redundant WAL Replication:** Replicate WAL segments to a standby broker/object store for stronger disaster recovery.
-- **SQL/Analytics Export Pipeline:** Stream route, inflight, and WAL state changes into PostgreSQL, ClickHouse, or a warehouse for reporting.
-- **Operational Admin UI:** Build a lightweight dashboard for route topology, consumer sessions, inflight backlog, and replay controls.
+- **Priority-aware Delivery Classes:** Introduce weighted priority classes so operator commands, retries, and bulk sync traffic can coexist with predictable fairness.
+- **Dead-letter Inspection API + Replay Console:** Add a safe API/UI for browsing dead-lettered items, replaying subsets, and annotating operator decisions.
+- **Replay Audit Trail:** Persist operator-triggered replay actions and delivery state transitions for compliance and post-incident analysis.
+- **Tenant-aware Quotas and Isolation:** Extend route namespaces with per-tenant queue budgets, metrics, and admission-control policy.
+- **Geo-redundant Durability:** Replicate WAL, route catalog, and delayed queue state to a standby node or object storage target.
+- **Analytics Export Pipeline:** Stream route, inflight, backlog, and WAL transitions into PostgreSQL, ClickHouse, or warehouse tooling.
+- **SLO-driven Autoscaling Signals:** Emit broker pressure indicators that can feed orchestration or capacity planning automation.
+- **AuthN/AuthZ Control Plane:** Add operator authentication, signed control messages, and role-based access for administrative APIs.
 
 ### ภาษาไทย
 
-- **Route Bootstrap Persistence:** เพิ่มที่เก็บ route catalog แบบถาวร เพื่อให้ ART route store ฟื้นคืนได้อัตโนมัติโดยไม่ต้อง bootstrap ด้วยมือทุกครั้ง
-- **Session Snapshot และ Warm Restart:** บันทึก metadata ของ consumer session และ capability ที่นำกลับมาใช้ต่อได้ เพื่อลดเวลา recovery หลัง broker restart
-- **Delayed Delivery / Scheduled Publish:** รองรับการตั้งเวลาส่งล่วงหน้าและตาราง retry ในระดับความสามารถหลักของ broker
-- **Priority Queues สำหรับ Direct Delivery:** เปิดให้กำหนดลำดับความสำคัญของข้อความ เพื่อให้คำสั่งเร่งด่วนวิ่งแซงงานพื้นหลังที่มีปริมาณมากได้
-- **Dead-letter Inspection API:** เพิ่ม API/CLI สำหรับดูรายการ dead-letter, สั่ง replay และลบข้อมูลอย่างปลอดภัย
-- **Replay Audit Trail:** เก็บประวัติการ replay ที่ผู้ปฏิบัติงานสั่งเอง รวมถึง state transition ของการส่ง เพื่อใช้ด้าน compliance และ debugging
-- **Tenant-aware Route Namespaces:** แยก route lookup, quota และ observability ตาม tenant โดยยังใช้โครงสร้าง broker ร่วมกันได้
-- **Adaptive Backpressure Policies:** ปรับเพดาน inflight และ queue แบบไดนามิกตาม lag ของ consumer, อัตรา retry และแรงกดดันด้านหน่วยความจำ
-- **Geo-redundant WAL Replication:** ทำสำเนา WAL ไปยัง standby broker หรือ object store เพื่อเพิ่มความพร้อมด้าน disaster recovery
-- **SQL/Analytics Export Pipeline:** ส่งการเปลี่ยนแปลงของ route, inflight และ WAL ไปยัง PostgreSQL, ClickHouse หรือ data warehouse สำหรับงานรายงาน
-- **Operational Admin UI:** สร้างแดชบอร์ดขนาดเบาสำหรับดู topology ของ route, consumer sessions, inflight backlog และเครื่องมือควบคุม replay
+- **Priority-aware Delivery Classes:** เพิ่มระดับความสำคัญของการส่งแบบถ่วงน้ำหนัก เพื่อให้คำสั่งของผู้ปฏิบัติงาน งาน retry และทราฟฟิกปริมาณมากอยู่ร่วมกันได้อย่างเป็นธรรม
+- **Dead-letter Inspection API + Replay Console:** เพิ่ม API/UI สำหรับดูรายการ dead-letter, replay เป็นชุดย่อย และบันทึกเหตุผลของผู้ปฏิบัติงานอย่างปลอดภัย
+- **Replay Audit Trail:** บันทึกประวัติการ replay ที่ผู้ปฏิบัติงานสั่ง รวมถึง state transition ของการส่ง เพื่อรองรับ compliance และ post-incident analysis
+- **Tenant-aware Quotas and Isolation:** ขยาย route namespace ให้รองรับ quota, metrics และ admission-control policy แยกตาม tenant
+- **Geo-redundant Durability:** ทำสำเนา WAL, route catalog และสถานะ delayed queue ไปยัง standby node หรือ object storage
+- **Analytics Export Pipeline:** ส่งการเปลี่ยนแปลงของ route, inflight, backlog และ WAL ไปยัง PostgreSQL, ClickHouse หรือ warehouse tooling
+- **SLO-driven Autoscaling Signals:** ปล่อยสัญญาณแรงกดดันของ broker เพื่อนำไปใช้กับระบบ orchestration หรือ automation ด้าน capacity planning
+- **AuthN/AuthZ Control Plane:** เพิ่มการยืนยันตัวตนของผู้ปฏิบัติงาน, signed control messages และสิทธิ์แบบ role-based สำหรับ administrative APIs
 
 ## 📘 Deep Architecture & Protocol Docs
 

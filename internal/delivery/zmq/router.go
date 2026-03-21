@@ -317,6 +317,11 @@ func (r *Router) loop(ctx context.Context) {
 				continue
 			}
 			event.Topic = topic
+			normalizedEvent, err := r.codec.Encode(event)
+			if err != nil {
+				fmt.Printf("failed to re-encode event: %v\n", err)
+				continue
+			}
 			envelope := domain.Envelope{ClientID: clientID, Event: event, DeliverAt: event.DeliverAt}
 			if err := validateScheduleTimestamp(r.now(), envelope.DeliverAt); err != nil {
 				fmt.Printf("invalid delivery timestamp for %q: %v\n", event.ID, err)
@@ -351,13 +356,13 @@ func (r *Router) loop(ctx context.Context) {
 			r.mu.Lock()
 			r.metrics.Routed++
 			r.mu.Unlock()
-			if _, err := r.pubSocket.SendMessage(event.Topic, decompressedEvent); err != nil {
+			if _, err := r.pubSocket.SendMessage(event.Topic, normalizedEvent); err != nil {
 				fmt.Printf("failed to fan out event on PUB socket: %v\n", err)
 			}
 			if !event.DeliverAt.IsZero() && event.DeliverAt.After(r.now()) {
-				r.scheduleDispatch(topic, event.ID, decompressedEvent, 1, event.DeliverAt, "publish")
+				r.scheduleDispatch(topic, event.ID, normalizedEvent, 1, event.DeliverAt, "publish")
 			} else {
-				r.dispatchDirect(topic, event.ID, decompressedEvent)
+				r.dispatchDirect(topic, event.ID, normalizedEvent)
 			}
 		}
 		if ctx.Err() != nil {

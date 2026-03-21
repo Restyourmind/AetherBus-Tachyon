@@ -1,9 +1,13 @@
 package media
 
 import (
+	"encoding/binary"
 	"fmt"
+
 	"github.com/pierrec/lz4/v4"
 )
+
+const lz4HeaderSize = 4
 
 // LZ4Compressor implements the domain.Compressor interface using LZ4.
 type LZ4Compressor struct{}
@@ -13,39 +17,42 @@ func NewLZ4Compressor() *LZ4Compressor {
 	return &LZ4Compressor{}
 }
 
-// Compress compresses the given byte slice.
+// Compress compresses the given byte slice and prefixes the original size.
 func (c *LZ4Compressor) Compress(data []byte) ([]byte, error) {
-	compressedData := make([]byte, lz4.CompressBlockBound(len(data)))
-	n, err := lz4.CompressBlock(data, compressedData, nil)
+	compressedData := make([]byte, lz4HeaderSize+lz4.CompressBlockBound(len(data)))
+	binary.BigEndian.PutUint32(compressedData[:lz4HeaderSize], uint32(len(data)))
+	n, err := lz4.CompressBlock(data, compressedData[lz4HeaderSize:], nil)
 	if err != nil {
 		return nil, err
 	}
-	return compressedData[:n], nil
+	if n == 0 && len(data) > 0 {
+		return nil, fmt.Errorf("failed to compress block")
+	}
+	return compressedData[:lz4HeaderSize+n], nil
 }
 
-// Decompress decompress the given byte slice.
+// Decompress decompresses the given byte slice using the prefixed original size.
 func (c *LZ4Compressor) Decompress(data []byte) ([]byte, error) {
-	// FUTURE: For maximum safety, the original uncompressed size should be
-	// transmitted as part of the message protocol. This prevents decompression
-	// bombs and allocates the precise amount of memory needed.
-
-	// Start with a reasonable buffer size (e.g., 3x compressed size).
-	// This is a heuristic and might need tuning.
-	bufferSize := len(data) * 3
-	if bufferSize < 1024 { // Have a minimum buffer size
-		bufferSize = 1024
+	if len(data) < lz4HeaderSize {
+		return nil, fmt.Errorf("failed to decompress with lz4: missing size header")
 	}
 
-	decompressedData := make([]byte, bufferSize)
+	decompressedSize := int(binary.BigEndian.Uint32(data[:lz4HeaderSize]))
+	if decompressedSize < 0 {
+		return nil, fmt.Errorf("failed to decompress with lz4: invalid target size")
+	}
+	if decompressedSize == 0 {
+		return []byte{}, nil
+	}
 
-	n, err := lz4.UncompressBlock(data, decompressedData)
+	decompressedData := make([]byte, decompressedSize)
+	n, err := lz4.UncompressBlock(data[lz4HeaderSize:], decompressedData)
 	if err != nil {
-		// If the error indicates the buffer was too small, we could potentially
-		// try again with a larger buffer, but this can be risky.
-		// A better approach is to ensure the initial buffer is sufficient or
-		// transmit the original size.
 		return nil, fmt.Errorf("failed to decompress with lz4: %w", err)
 	}
+	if n != decompressedSize {
+		return nil, fmt.Errorf("failed to decompress with lz4: size mismatch got=%d want=%d", n, decompressedSize)
+	}
 
-	return decompressedData[:n], nil
+	return decompressedData, nil
 }

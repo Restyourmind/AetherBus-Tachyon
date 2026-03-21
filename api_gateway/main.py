@@ -1,30 +1,31 @@
-# api_gateway/main.py
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-import asyncio
+from textwrap import dedent
+from typing import Any, Dict
+
 import json
-import time
+import uvicorn
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
-# Import a more advanced immune system and the nervous system
-from tools.contracts.contract_checker import ContractChecker
 from api_gateway.aetherbus_extreme import AetherBusExtreme
+from tools.contracts.contract_checker import ContractChecker
 
-# Attempt to import the Tachyon Core (Brain)
 try:
     import tachyon_core
+
     tachyon_engine = tachyon_core.TachyonEngine()
     HAS_BRAIN = True
     print("🧠 Tachyon Core: CONNECTED")
 except ImportError:
+    tachyon_engine = None
     HAS_BRAIN = False
-    print("⚠️ Tachyon Core: NOT FOUND (Running in Spinal Reflex Mode)")
+    print("⚠️ Tachyon Core: NOT FOUND (Running in Gateway Demo Mode)")
 
-app = FastAPI(title="Aetherium Syndicate Interface")
+app = FastAPI(title="AetherBus Tachyon Control Surface")
 bus = AetherBusExtreme()
-immune_system = ContractChecker() # Now an AdvancedContractChecker
+immune_system = ContractChecker()
 
-# Allow CORS for dashboard access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,91 +33,239 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 1. Reflex Arcs (API Endpoints) ---
 
-@app.get("/")
-async def root():
-    return {"status": "ONLINE", "brain_connected": HAS_BRAIN, "mode": "Tachyon Connected" if HAS_BRAIN else "Spinal Reflex"}
+class ContractLoadRequest(BaseModel):
+    contract_id: str = Field(..., min_length=1, max_length=128)
+    schema_payload: Dict[str, Any] = Field(..., alias="schema")
+
+    model_config = {"populate_by_name": True}
+
+
+class SystemAlert(BaseModel):
+    level: str = Field(default="info")
+    message: str = Field(..., min_length=1, max_length=500)
+
+
+HOME_PAGE = dedent(
+    """
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>AetherBus Tachyon</title>
+        <style>
+          :root {
+            color-scheme: dark;
+            --bg: #07111f;
+            --panel: rgba(10, 22, 39, 0.86);
+            --border: rgba(110, 168, 255, 0.18);
+            --accent: #67e8f9;
+            --accent2: #8b5cf6;
+            --text: #e5eefc;
+            --muted: #97a8c2;
+            --ok: #34d399;
+            --warn: #f59e0b;
+          }
+          * { box-sizing: border-box; }
+          body {
+            margin: 0;
+            font-family: Inter, system-ui, sans-serif;
+            background: radial-gradient(circle at top, #102647 0%, var(--bg) 55%);
+            color: var(--text);
+          }
+          .shell { max-width: 1200px; margin: 0 auto; padding: 32px 20px 56px; }
+          .hero, .grid, .timeline { display: grid; gap: 20px; }
+          .hero { grid-template-columns: 1.4fr 1fr; align-items: stretch; }
+          .card {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            box-shadow: 0 18px 60px rgba(0, 0, 0, 0.26);
+            backdrop-filter: blur(14px);
+          }
+          .hero-card { padding: 30px; }
+          h1 { margin: 0 0 12px; font-size: clamp(2.2rem, 4vw, 4rem); }
+          h2 { margin: 0 0 16px; font-size: 1.2rem; }
+          p { color: var(--muted); line-height: 1.6; }
+          .badge { display:inline-flex; gap:8px; align-items:center; padding:8px 12px; border-radius:999px; background:rgba(103,232,249,.12); color:var(--accent); font-size:.9rem; }
+          .stats, .grid { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+          .stat { padding: 20px; }
+          .metric { font-size: 2rem; font-weight: 700; margin-top: 10px; }
+          .label { color: var(--muted); font-size: .92rem; }
+          .action-list, .feed { list-style: none; margin: 0; padding: 0; }
+          .action-list li, .feed li { padding: 14px 0; border-top: 1px solid rgba(255,255,255,.06); }
+          .action-list li:first-child, .feed li:first-child { border-top: 0; padding-top: 0; }
+          .pill { display:inline-block; padding:4px 10px; border-radius:999px; font-size:.78rem; background:rgba(139,92,246,.18); color:#d8c7ff; }
+          .layout { display:grid; grid-template-columns: 1.1fr .9fr; gap:20px; margin-top:20px; }
+          .panel { padding: 24px; }
+          code { color: var(--accent); }
+          .footer { margin-top: 18px; color: var(--muted); font-size: .9rem; }
+          @media (max-width: 900px) { .hero, .layout { grid-template-columns: 1fr; } }
+        </style>
+      </head>
+      <body>
+        <main class="shell">
+          <section class="hero">
+            <article class="card hero-card">
+              <span class="badge">⚡ AetherBus Tachyon Control Surface</span>
+              <h1>Observe the broker, contracts, and recovery state from one launch page.</h1>
+              <p>
+                This redesigned landing page exposes runtime health, contract registry status,
+                WebSocket activity, and the most important operating paths for the gateway.
+              </p>
+              <div class="footer">Primary endpoints: <code>/api/system/overview</code>, <code>/api/contracts/load</code>, <code>/ws/feed</code></div>
+            </article>
+            <article class="card panel">
+              <h2>Live status</h2>
+              <div class="stats">
+                <div class="stat"><div class="label">Gateway</div><div class="metric" id="gateway-status">ONLINE</div></div>
+                <div class="stat"><div class="label">Brain mode</div><div class="metric" id="brain-mode">Loading…</div></div>
+                <div class="stat"><div class="label">Known contracts</div><div class="metric" id="contract-count">0</div></div>
+              </div>
+            </article>
+          </section>
+
+          <section class="layout">
+            <article class="card panel">
+              <h2>Operator playbook</h2>
+              <ul class="action-list">
+                <li><span class="pill">1</span> Load contracts with <code>POST /api/contracts/load</code> using an object schema.</li>
+                <li><span class="pill">2</span> Mint demo identities with <code>POST /api/genesis/mint</code> when the Tachyon core is attached.</li>
+                <li><span class="pill">3</span> Stream events from <code>/ws/feed</code> for dashboards and local tooling.</li>
+                <li><span class="pill">4</span> Inspect the latest gateway activity via <code>/api/system/overview</code>.</li>
+              </ul>
+            </article>
+            <article class="card panel">
+              <h2>Recent bus events</h2>
+              <ul class="feed" id="event-feed">
+                <li>Waiting for gateway telemetry…</li>
+              </ul>
+            </article>
+          </section>
+        </main>
+        <script>
+          async function refreshOverview() {
+            const response = await fetch('/api/system/overview');
+            const data = await response.json();
+            document.getElementById('brain-mode').textContent = data.mode;
+            document.getElementById('contract-count').textContent = String(data.contract_count);
+            const feed = document.getElementById('event-feed');
+            feed.innerHTML = '';
+            const items = data.recent_events.length ? data.recent_events : [{topic: 'SYSTEM', payload: {message: 'No activity yet'}}];
+            for (const item of items) {
+              const li = document.createElement('li');
+              const payload = typeof item.payload === 'object' ? JSON.stringify(item.payload) : String(item.payload);
+              li.textContent = `${item.topic} — ${payload}`;
+              feed.appendChild(li);
+            }
+          }
+          refreshOverview();
+          setInterval(refreshOverview, 5000);
+        </script>
+      </body>
+    </html>
+    """
+)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def root() -> HTMLResponse:
+    return HTMLResponse(HOME_PAGE)
+
+
+@app.get("/api/system/overview")
+async def system_overview() -> Dict[str, Any]:
+    return {
+        "status": "ONLINE",
+        "brain_connected": HAS_BRAIN,
+        "mode": "Tachyon Connected" if HAS_BRAIN else "Gateway Demo Mode",
+        "contract_count": len(immune_system.schemas),
+        "contracts": sorted(immune_system.schemas.keys()),
+        "recent_events": bus.recent_events(limit=8),
+    }
+
 
 @app.post("/api/contracts/load")
-async def load_contract(contract_id: str, schema: dict):
-    """Dynamically loads a new data contract (DNA) into the immune system."""
-    schema_str = json.dumps(schema)
-    success = immune_system.load_dynamic_schema(contract_id, schema_str)
+async def load_contract(request: ContractLoadRequest) -> Dict[str, Any]:
+    schema_str = json.dumps(request.schema_payload)
+    success = immune_system.load_dynamic_schema(request.contract_id, schema_str)
     if not success:
         raise HTTPException(status_code=400, detail="Invalid schema format.")
-    return {"status": "Contract loaded successfully", "contract_id": contract_id}
+
+    await bus.emit(
+        "CONTRACT_LOADED",
+        {"contract_id": request.contract_id, "field_count": len(request.schema_payload.get("properties", {}))},
+    )
+    return {"status": "Contract loaded successfully", "contract_id": request.contract_id}
+
+
+@app.post("/api/system/alerts")
+async def publish_alert(alert: SystemAlert) -> Dict[str, str]:
+    await bus.emit("SYSTEM_ALERT", alert.model_dump())
+    return {"status": "Alert published"}
 
 
 @app.post("/api/genesis/mint")
-async def mint_agent(seed: int = 1000):
-    """Commands the brain to create a new Agent (Identity Crystallization)."""
-    if not HAS_BRAIN:
+async def mint_agent(seed: int = 1000) -> Dict[str, Any]:
+    if not HAS_BRAIN or tachyon_engine is None:
         raise HTTPException(status_code=503, detail="Brain (Tachyon Core) is not connected.")
-    
-    # 1. Call the Tachyon Core (Rust)
-    try:
-        deck_bytes = tachyon_engine.mint_starter_deck(seed)
-        sentinel, catalyst, harmonizer = deck_bytes
-    except Exception as e:
-        await bus.emit("SYSTEM_ALERT", {"level": "critical", "message": f"Tachyon Core Error during minting: {e}"})
-        raise HTTPException(status_code=500, detail="Error communicating with Tachyon Core.")
 
-    # 2. Convert to JSON for response
+    try:
+        sentinel, catalyst, harmonizer = tachyon_engine.mint_starter_deck(seed)
+    except Exception as exc:
+        await bus.emit("SYSTEM_ALERT", {"level": "critical", "message": f"Tachyon Core Error during minting: {exc}"})
+        raise HTTPException(status_code=500, detail="Error communicating with Tachyon Core.") from exc
+
     agents = {
         "sentinel": json.loads(tachyon_engine.inspect_identity_json(sentinel)),
         "catalyst": json.loads(tachyon_engine.inspect_identity_json(catalyst)),
-        "harmonizer": json.loads(tachyon_engine.inspect_identity_json(harmonizer))
+        "harmonizer": json.loads(tachyon_engine.inspect_identity_json(harmonizer)),
     }
-    
-    # 3. Use the Immune System to validate the intent of the newly created agent data
-    # Example: We expect the sentinel to have the intent 'guardian'
-    is_valid_intent = immune_system.validate_intent(agents['sentinel'], expected_intent="guardian")
+
+    is_valid_intent = immune_system.validate_intent(agents["sentinel"], expected_intent="guardian")
     if not is_valid_intent:
         await bus.emit("SYSTEM_ALERT", {"level": "warning", "message": "Minted agent failed intent validation!"})
-        # Decide whether to reject the mint or just warn
-        # For now, we will add a flag to the response
         agents["validation_warning"] = "Sentinel intent mismatch"
 
-    # 4. Signal the nervous system (for real-time dashboard updates)
     await bus.emit("AGENT_MINTED", agents)
-    
     return agents
 
-# --- 2. Neural Pathway (WebSocket) ---
 
 @app.websocket("/ws/feed")
-async def websocket_endpoint(websocket: WebSocket):
-    """Real-time data feed to the dashboard."""
+async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
-    
-    # A handler function to listen to the bus (like a synapse)
-    async def synapse_handler(event_data: dict):
+
+    async def synapse_handler(event_data: Dict[str, Any]) -> None:
         try:
-            # Add topic to the payload for the client to filter
             await websocket.send_json(event_data)
         except Exception:
-            pass # Connection closed
+            pass
 
-    # Connect synapses to the bus
-    # We create a wrapper to pass the topic along with the payload
-    async def mint_handler(payload): await synapse_handler({"topic": "AGENT_MINTED", "payload": payload})
-    async def alert_handler(payload): await synapse_handler({"topic": "SYSTEM_ALERT", "payload": payload})
+    async def mint_handler(payload: Any) -> None:
+        await synapse_handler({"topic": "AGENT_MINTED", "payload": payload})
+
+    async def alert_handler(payload: Any) -> None:
+        await synapse_handler({"topic": "SYSTEM_ALERT", "payload": payload})
+
+    async def contract_handler(payload: Any) -> None:
+        await synapse_handler({"topic": "CONTRACT_LOADED", "payload": payload})
 
     await bus.subscribe("AGENT_MINTED", mint_handler)
     await bus.subscribe("SYSTEM_ALERT", alert_handler)
+    await bus.subscribe("CONTRACT_LOADED", contract_handler)
 
     try:
         while True:
-            # Keep the connection alive, optionally receive data from the dashboard
-            data = await websocket.receive_text()
-            # We can forward this to the bus if needed
-            # await bus.emit("USER_INPUT", {"source": "dashboard", "data": data})
+            await websocket.receive_text()
     except WebSocketDisconnect:
-        print("🔌 Dashboard Disconnected from Neural Pathway")
+        print("🔌 Dashboard disconnected from /ws/feed")
+    finally:
+        await bus.unsubscribe("AGENT_MINTED", mint_handler)
+        await bus.unsubscribe("SYSTEM_ALERT", alert_handler)
+        await bus.unsubscribe("CONTRACT_LOADED", contract_handler)
 
-# --- 3. System Awakening Sequence ---
 
 if __name__ == "__main__":
-    print("🚀 Aetherium Manifest: Awakening Sequence Initiated...")
+    print("🚀 AetherBus Tachyon gateway starting on http://0.0.0.0:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)
