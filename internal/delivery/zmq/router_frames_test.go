@@ -12,6 +12,7 @@ type stubWAL struct {
 	committed    []string
 	deadLettered []string
 	replay       []walDispatchedEntry
+	snapshots    map[string]sessionSnapshot
 }
 
 func (w *stubWAL) AppendDispatched(entry walDispatchedEntry) error {
@@ -30,6 +31,27 @@ func (w *stubWAL) AppendDeadLettered(messageID string) error {
 }
 func (w *stubWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 	return append([]walDispatchedEntry(nil), w.replay...), nil
+}
+
+func (w *stubWAL) SaveSessionSnapshot(snapshot sessionSnapshot) error {
+	if w.snapshots == nil {
+		w.snapshots = map[string]sessionSnapshot{}
+	}
+	w.snapshots[snapshot.ConsumerID] = snapshot
+	return nil
+}
+
+func (w *stubWAL) LoadSessionSnapshots() ([]sessionSnapshot, error) {
+	out := make([]sessionSnapshot, 0, len(w.snapshots))
+	for _, snapshot := range w.snapshots {
+		out = append(out, snapshot)
+	}
+	return out, nil
+}
+
+func (w *stubWAL) DeleteSessionSnapshot(consumerID string) error {
+	delete(w.snapshots, consumerID)
+	return nil
 }
 
 func TestParseFrames(t *testing.T) {
@@ -120,11 +142,11 @@ func TestValidateTopic(t *testing.T) {
 func TestHandleAckDuplicateAndStale(t *testing.T) {
 	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    10,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       10,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -154,11 +176,11 @@ func TestHandleAckDuplicateAndStale(t *testing.T) {
 func TestRetryableNackRetried(t *testing.T) {
 	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    10,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       10,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -193,11 +215,11 @@ func TestRetryableNackRetried(t *testing.T) {
 func TestTerminalNackDeadLettered(t *testing.T) {
 	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    10,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       10,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -223,11 +245,11 @@ func TestTerminalNackDeadLettered(t *testing.T) {
 func TestTimeoutRetry(t *testing.T) {
 	r := NewRouterWithOptions("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 3, 50*time.Millisecond)
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    10,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       10,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -265,11 +287,11 @@ func TestTimeoutRetry(t *testing.T) {
 func TestTimeoutDeadLetter(t *testing.T) {
 	r := NewRouterWithOptions("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 1, 50*time.Millisecond)
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    10,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       10,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -299,11 +321,11 @@ func TestTimeoutDeadLetter(t *testing.T) {
 func TestConsumerSaturationStopsDirectDispatch(t *testing.T) {
 	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    1,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       1,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -329,11 +351,11 @@ func TestConsumerSaturationStopsDirectDispatch(t *testing.T) {
 func TestDispatchPauseTracksConsumerBacklog(t *testing.T) {
 	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    1,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       1,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -359,11 +381,11 @@ func TestDispatchPauseTracksConsumerBacklog(t *testing.T) {
 func TestResumeDispatchAfterAckDropsInflight(t *testing.T) {
 	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    1,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       1,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -390,11 +412,11 @@ func TestDispatchDirectWritesWALAndAckCommits(t *testing.T) {
 	w := &stubWAL{}
 	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 3, time.Second, w)
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    10,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       10,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -437,6 +459,7 @@ func TestReplayFromWALOnRegister(t *testing.T) {
 	}
 	msg.Capabilities.SupportsAck = true
 	msg.Capabilities.MaxInflight = 10
+	msg.Capabilities.Resumable = true
 	r.registerConsumerSession([]byte("cid1"), msg)
 
 	if sent != 1 {
@@ -453,11 +476,11 @@ func TestReplayFromWALOnRegister(t *testing.T) {
 func TestStaleAckSessionMismatchIgnored(t *testing.T) {
 	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    10,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       10,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -478,11 +501,11 @@ func TestDeferredDispatchForSlowConsumer(t *testing.T) {
 	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
 	r.SetQueueBounds(4, 8)
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    1,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       1,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -512,11 +535,11 @@ func TestPerTopicQueueBoundDropsExcess(t *testing.T) {
 	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
 	r.SetQueueBounds(1, 8)
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    1,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       1,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -536,11 +559,11 @@ func TestGlobalIngressLimitDropsNewDispatch(t *testing.T) {
 	r.SetQueueBounds(4, 8)
 	r.SetGlobalIngressLimit(1)
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    1,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       1,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -568,12 +591,12 @@ func TestReplayFromWALPreservesIdentityAndAttempt(t *testing.T) {
 	}}}
 	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 3, time.Second, w)
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_new",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    10,
-		Subscriptions:  map[string]struct{}{"orders.created": {}},
+		SessionID:         "sess_new",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       10,
+		Subscriptions:     map[string]struct{}{"orders.created": {}},
 	}
 
 	r.replayFromWAL("worker-1")
@@ -593,11 +616,11 @@ func TestRetryExhaustionAppendsDeadLetterToWAL(t *testing.T) {
 	w := &stubWAL{}
 	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 2, 50*time.Millisecond, w)
 	r.directSessions["worker-1"] = &consumerSession{
-		SessionID:      "sess_000001",
-		ConsumerID:     "worker-1",
-		SocketIdentity: []byte("cid1"),
-		SupportsAck:    true,
-		MaxInflight:    10,
+		SessionID:         "sess_000001",
+		ConsumerID:        "worker-1",
+		TransportIdentity: []byte("cid1"),
+		Capabilities:      capabilityHints{SupportsAck: true, Resumable: true},
+		MaxInflight:       10,
 		Subscriptions: map[string]struct{}{
 			"orders.created": {},
 		},
@@ -612,5 +635,134 @@ func TestRetryExhaustionAppendsDeadLetterToWAL(t *testing.T) {
 	}
 	if len(w.deadLettered) != 1 || w.deadLettered[0] != "msg-exhaust" {
 		t.Fatalf("expected wal dead-letter append for exhausted retry, got %#v", w.deadLettered)
+	}
+}
+
+func TestLoadSessionSnapshotsMarksResumablePendingUntilRegister(t *testing.T) {
+	w := &stubWAL{snapshots: map[string]sessionSnapshot{
+		"worker-1": {
+			SessionID:           "sess_000007",
+			ConsumerID:          "worker-1",
+			Subscriptions:       []string{"orders.created"},
+			ConnectedAt:         time.Unix(100, 0).UTC(),
+			LastHeartbeat:       time.Unix(200, 0).UTC(),
+			MaxInflight:         7,
+			SupportsAck:         true,
+			SupportsCompression: []string{"lz4"},
+			SupportsCodec:       []string{"json"},
+			Resumable:           true,
+		},
+	}}
+	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 3, time.Second, w)
+	r.now = func() time.Time { return time.Unix(250, 0).UTC() }
+
+	if err := r.loadSessionSnapshots(); err != nil {
+		t.Fatalf("load snapshots: %v", err)
+	}
+	session := r.directSessions["worker-1"]
+	if session == nil {
+		t.Fatalf("expected snapshot session loaded")
+	}
+	if session.Live {
+		t.Fatalf("expected recovered session to remain non-live")
+	}
+	if !session.ResumablePending {
+		t.Fatalf("expected resumable pending state")
+	}
+	if len(session.TransportIdentity) != 0 {
+		t.Fatalf("expected no transport identity for recovered session")
+	}
+	if session.MaxInflight != 7 {
+		t.Fatalf("expected max inflight restored, got %d", session.MaxInflight)
+	}
+	if got := session.Capabilities.SupportsCompression[0]; got != "lz4" {
+		t.Fatalf("expected compression hint restored, got %q", got)
+	}
+	if r.selectSession("orders.created") != nil {
+		t.Fatalf("expected recovered non-live session not selected for dispatch")
+	}
+}
+
+func TestRegisterConsumerSessionRehydratesRecoveredSessionMetadata(t *testing.T) {
+	w := &stubWAL{snapshots: map[string]sessionSnapshot{
+		"worker-1": {
+			SessionID:           "sess_000009",
+			ConsumerID:          "worker-1",
+			Subscriptions:       []string{"orders.created"},
+			ConnectedAt:         time.Unix(100, 0).UTC(),
+			LastHeartbeat:       time.Unix(200, 0).UTC(),
+			MaxInflight:         5,
+			SupportsAck:         true,
+			SupportsCompression: []string{"lz4"},
+			SupportsCodec:       []string{"json"},
+			Resumable:           true,
+		},
+	}}
+	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 3, time.Second, w)
+	r.now = func() time.Time { return time.Unix(250, 0).UTC() }
+	sentIdentity := ""
+	r.directSender = func(identity []byte, topic string, payload []byte) error {
+		sentIdentity = string(identity)
+		return nil
+	}
+	if err := r.loadSessionSnapshots(); err != nil {
+		t.Fatalf("load snapshots: %v", err)
+	}
+	w.replay = []walDispatchedEntry{{MessageID: "msg-r3", Consumer: "worker-1", SessionID: "sess_old", Topic: "orders.created", Payload: []byte(`{"id":"msg-r3"}`), Attempt: 1}}
+
+	msg := controlMessage{Mode: "direct", ConsumerID: "worker-1", Subscriptions: []string{"orders.created"}}
+	msg.Capabilities.SupportsAck = true
+	msg.Capabilities.SupportsCompression = []string{"zstd", "lz4"}
+	msg.Capabilities.SupportsCodec = []string{"json", "msgpack"}
+	msg.Capabilities.Resumable = true
+	msg.Capabilities.MaxInflight = 11
+	r.registerConsumerSession([]byte("cid-new"), msg)
+
+	session := r.directSessions["worker-1"]
+	if session == nil {
+		t.Fatalf("expected session registered")
+	}
+	if session.SessionID != "sess_000009" {
+		t.Fatalf("expected logical session id preserved, got %q", session.SessionID)
+	}
+	if !session.Live || !session.ResumablePending {
+		t.Fatalf("expected registered session live and resumable")
+	}
+	if got := string(session.TransportIdentity); got != "cid-new" {
+		t.Fatalf("expected transport identity updated, got %q", got)
+	}
+	if session.MaxInflight != 11 {
+		t.Fatalf("expected max inflight updated, got %d", session.MaxInflight)
+	}
+	if sentIdentity != "cid-new" {
+		t.Fatalf("expected WAL replay to use new identity, got %q", sentIdentity)
+	}
+	persisted := w.snapshots["worker-1"]
+	if len(persisted.SupportsCodec) != 2 || persisted.SupportsCodec[0] != "json" {
+		t.Fatalf("expected snapshot capabilities persisted, got %#v", persisted.SupportsCodec)
+	}
+}
+
+func TestLoadSessionSnapshotsDiscardsStaleSessions(t *testing.T) {
+	w := &stubWAL{snapshots: map[string]sessionSnapshot{
+		"worker-1": {
+			SessionID:     "sess_000004",
+			ConsumerID:    "worker-1",
+			LastHeartbeat: time.Unix(100, 0).UTC(),
+			Resumable:     true,
+		},
+	}}
+	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 3, time.Second, w)
+	r.sessionSnapshotTTL = 30 * time.Second
+	r.now = func() time.Time { return time.Unix(200, 0).UTC() }
+
+	if err := r.loadSessionSnapshots(); err != nil {
+		t.Fatalf("load snapshots: %v", err)
+	}
+	if _, ok := r.directSessions["worker-1"]; ok {
+		t.Fatalf("expected stale snapshot discarded")
+	}
+	if _, ok := w.snapshots["worker-1"]; ok {
+		t.Fatalf("expected stale snapshot deleted from durability store")
 	}
 }

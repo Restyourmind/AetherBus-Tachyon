@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 )
 
@@ -16,6 +17,9 @@ type WAL interface {
 	AppendCommitted(messageID string) error
 	AppendDeadLettered(messageID string) error
 	ReplayUnacked() ([]walDispatchedEntry, error)
+	SaveSessionSnapshot(snapshot sessionSnapshot) error
+	LoadSessionSnapshots() ([]sessionSnapshot, error)
+	DeleteSessionSnapshot(consumerID string) error
 }
 
 type fileWAL struct {
@@ -42,43 +46,21 @@ type walDispatchedEntry struct {
 	Attempt   int
 }
 
-func NewFileWAL(path string) WAL {
-	return &fileWAL{path: path}
-}
+func NewFileWAL(path string) WAL { return &fileWAL{path: path} }
 
 func (w *fileWAL) AppendDispatched(entry walDispatchedEntry) error {
-	rec := walRecord{
-		Type:      "dispatched",
-		MessageID: entry.MessageID,
-		Consumer:  entry.Consumer,
-		SessionID: entry.SessionID,
-		Topic:     entry.Topic,
-		Payload:   base64.StdEncoding.EncodeToString(entry.Payload),
-		Attempt:   entry.Attempt,
-	}
-	return w.appendRecord(rec)
+	return w.appendRecord(walRecord{Type: "dispatched", MessageID: entry.MessageID, Consumer: entry.Consumer, SessionID: entry.SessionID, Topic: entry.Topic, Payload: base64.StdEncoding.EncodeToString(entry.Payload), Attempt: entry.Attempt})
 }
-
 func (w *fileWAL) AppendCommitted(messageID string) error {
-	rec := walRecord{
-		Type:      "committed",
-		MessageID: messageID,
-	}
-	return w.appendRecord(rec)
+	return w.appendRecord(walRecord{Type: "committed", MessageID: messageID})
 }
-
 func (w *fileWAL) AppendDeadLettered(messageID string) error {
-	rec := walRecord{
-		Type:      "dead_lettered",
-		MessageID: messageID,
-	}
-	return w.appendRecord(rec)
+	return w.appendRecord(walRecord{Type: "dead_lettered", MessageID: messageID})
 }
 
 func (w *fileWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
 	f, err := os.Open(w.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -87,7 +69,6 @@ func (w *fileWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 		return nil, err
 	}
 	defer f.Close()
-
 	scanner := bufio.NewScanner(f)
 	finalized := map[string]struct{}{}
 	pending := map[string]walDispatchedEntry{}
@@ -101,10 +82,7 @@ func (w *fileWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 			return nil, fmt.Errorf("decode wal line: %w", err)
 		}
 		switch rec.Type {
-		case "committed":
-			finalized[rec.MessageID] = struct{}{}
-			delete(pending, rec.MessageID)
-		case "dead_lettered":
+		case "committed", "dead_lettered":
 			finalized[rec.MessageID] = struct{}{}
 			delete(pending, rec.MessageID)
 		case "dispatched":
@@ -118,31 +96,60 @@ func (w *fileWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 			if err != nil {
 				return nil, fmt.Errorf("decode wal payload: %w", err)
 			}
-			pending[rec.MessageID] = walDispatchedEntry{
-				MessageID: rec.MessageID,
-				Consumer:  rec.Consumer,
-				SessionID: rec.SessionID,
-				Topic:     rec.Topic,
-				Payload:   payload,
-				Attempt:   rec.Attempt,
-			}
+			pending[rec.MessageID] = walDispatchedEntry{MessageID: rec.MessageID, Consumer: rec.Consumer, SessionID: rec.SessionID, Topic: rec.Topic, Payload: payload, Attempt: rec.Attempt}
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-
 	out := make([]walDispatchedEntry, 0, len(pending))
 	for _, entry := range pending {
 		out = append(out, entry)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].MessageID < out[j].MessageID })
 	return out, nil
+}
+
+func (w *fileWAL) SaveSessionSnapshot(snapshot sessionSnapshot) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	snapshots, err := w.loadSnapshotsLocked()
+	if err != nil {
+		return err
+	}
+	snapshots[snapshot.ConsumerID] = snapshot
+	return w.writeSnapshotsLocked(snapshots)
+}
+
+func (w *fileWAL) LoadSessionSnapshots() ([]sessionSnapshot, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	snapshots, err := w.loadSnapshotsLocked()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]sessionSnapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		out = append(out, snapshot)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ConsumerID < out[j].ConsumerID })
+	return out, nil
+}
+
+func (w *fileWAL) DeleteSessionSnapshot(consumerID string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	snapshots, err := w.loadSnapshotsLocked()
+	if err != nil {
+		return err
+	}
+	delete(snapshots, consumerID)
+	return w.writeSnapshotsLocked(snapshots)
 }
 
 func (w *fileWAL) appendRecord(rec walRecord) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
 	if err := os.MkdirAll(filepath.Dir(w.path), 0o755); err != nil {
 		return err
 	}
@@ -151,7 +158,6 @@ func (w *fileWAL) appendRecord(rec walRecord) error {
 		return err
 	}
 	defer f.Close()
-
 	encoded, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -160,4 +166,43 @@ func (w *fileWAL) appendRecord(rec walRecord) error {
 		return err
 	}
 	return f.Sync()
+}
+
+func (w *fileWAL) snapshotPath() string { return w.path + ".sessions" }
+
+func (w *fileWAL) loadSnapshotsLocked() (map[string]sessionSnapshot, error) {
+	path := w.snapshotPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return map[string]sessionSnapshot{}, nil
+		}
+		return nil, err
+	}
+	if len(data) == 0 {
+		return map[string]sessionSnapshot{}, nil
+	}
+	var snapshots map[string]sessionSnapshot
+	if err := json.Unmarshal(data, &snapshots); err != nil {
+		return nil, fmt.Errorf("decode session snapshots: %w", err)
+	}
+	if snapshots == nil {
+		snapshots = map[string]sessionSnapshot{}
+	}
+	return snapshots, nil
+}
+
+func (w *fileWAL) writeSnapshotsLocked(snapshots map[string]sessionSnapshot) error {
+	if err := os.MkdirAll(filepath.Dir(w.snapshotPath()), 0o755); err != nil {
+		return err
+	}
+	encoded, err := json.MarshalIndent(snapshots, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := w.snapshotPath() + ".tmp"
+	if err := os.WriteFile(tmp, append(encoded, '\n'), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, w.snapshotPath())
 }

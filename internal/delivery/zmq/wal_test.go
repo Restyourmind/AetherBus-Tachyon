@@ -3,6 +3,7 @@ package zmq
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestFileWALAppendReplayAndCommit(t *testing.T) {
@@ -48,5 +49,31 @@ func TestFileWALReplaySkipsDeadLettered(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("expected no replay entries after dead-letter finalize, got %d", len(entries))
+	}
+}
+
+func TestFileWALSessionSnapshotsRoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	w := NewFileWAL(filepath.Join(tmp, "delivery.wal"))
+
+	if err := w.SaveSessionSnapshot(sessionSnapshot{ConsumerID: "worker-1", SessionID: "sess_1", LastHeartbeat: time.Unix(100, 0).UTC(), MaxInflight: 5, SupportsAck: true, SupportsCompression: []string{"lz4"}, SupportsCodec: []string{"json"}, Resumable: true}); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+	snapshots, err := w.LoadSessionSnapshots()
+	if err != nil {
+		t.Fatalf("load snapshots: %v", err)
+	}
+	if len(snapshots) != 1 || snapshots[0].ConsumerID != "worker-1" {
+		t.Fatalf("expected worker-1 snapshot, got %#v", snapshots)
+	}
+	if err := w.DeleteSessionSnapshot("worker-1"); err != nil {
+		t.Fatalf("delete snapshot: %v", err)
+	}
+	snapshots, err = w.LoadSessionSnapshots()
+	if err != nil {
+		t.Fatalf("reload snapshots: %v", err)
+	}
+	if len(snapshots) != 0 {
+		t.Fatalf("expected snapshots empty after delete, got %#v", snapshots)
 	}
 }

@@ -40,6 +40,7 @@ type Router struct {
 	maxPerTopicQueue       int
 	maxQueuedDirect        int
 	maxGlobalIngress       int
+	sessionSnapshotTTL     time.Duration
 	directQueue            map[string][]queuedDirectMessage
 	directSender           func(identity []byte, topic string, payload []byte) error
 }
@@ -56,17 +57,41 @@ const (
 	controlTopic = "_control"
 )
 
+type capabilityHints struct {
+	SupportsAck         bool
+	SupportsCompression []string
+	SupportsCodec       []string
+	Resumable           bool
+}
+
 type consumerSession struct {
-	SessionID      string
-	ConsumerID     string
-	SocketIdentity []byte
-	Subscriptions  map[string]struct{}
-	SupportsAck    bool
-	MaxInflight    int
-	InflightCount  int
-	BacklogCount   uint64
-	ConnectedAt    time.Time
-	LastHeartbeat  time.Time
+	SessionID         string
+	ConsumerID        string
+	TransportIdentity []byte
+	Subscriptions     map[string]struct{}
+	Capabilities      capabilityHints
+	MaxInflight       int
+	InflightCount     int
+	BacklogCount      uint64
+	ConnectedAt       time.Time
+	LastHeartbeat     time.Time
+	Live              bool
+	ResumablePending  bool
+}
+
+type sessionSnapshot struct {
+	SessionID           string    `json:"session_id"`
+	ConsumerID          string    `json:"consumer_id"`
+	Subscriptions       []string  `json:"subscriptions"`
+	ConnectedAt         time.Time `json:"connected_at"`
+	LastHeartbeat       time.Time `json:"last_heartbeat"`
+	MaxInflight         int       `json:"max_inflight"`
+	SupportsAck         bool      `json:"supports_ack"`
+	SupportsCompression []string  `json:"supports_compression,omitempty"`
+	SupportsCodec       []string  `json:"supports_codec,omitempty"`
+	Resumable           bool      `json:"resumable"`
+	Live                bool      `json:"live"`
+	ResumablePending    bool      `json:"resumable_pending"`
 }
 
 type inflightMessage struct {
@@ -123,8 +148,11 @@ type controlMessage struct {
 	Mode          string   `json:"mode"`
 	Subscriptions []string `json:"subscriptions"`
 	Capabilities  struct {
-		SupportsAck bool `json:"supports_ack"`
-		MaxInflight int  `json:"max_inflight"`
+		SupportsAck         bool     `json:"supports_ack"`
+		SupportsCompression []string `json:"supports_compression"`
+		SupportsCodec       []string `json:"supports_codec"`
+		Resumable           bool     `json:"resumable"`
+		MaxInflight         int      `json:"max_inflight"`
 	} `json:"capabilities"`
 }
 
@@ -161,11 +189,58 @@ func NewRouterWithDurability(bindAddress, pubAddress string, publisher domain.Ev
 		maxPerTopicQueue:       256,
 		maxQueuedDirect:        4096,
 		maxGlobalIngress:       8192,
+		sessionSnapshotTTL:     5 * time.Minute,
 		directQueue:            map[string][]queuedDirectMessage{},
 		deliveryTimeout:        deliveryTimeout,
 		now:                    func() time.Time { return time.Now().UTC() },
 		wal:                    durability,
 	}
+}
+
+func (r *Router) Start(ctx context.Context) error {
+	if err := r.loadSessionSnapshots(); err != nil {
+		return fmt.Errorf("failed to load session snapshots: %w", err)
+	}
+
+	routerSocket, err := zmq4.NewSocket(zmq4.ROUTER)
+	if err != nil {
+		return fmt.Errorf("failed to create router socket: %w", err)
+	}
+	r.routerSocket = routerSocket
+
+	pubSocket, err := zmq4.NewSocket(zmq4.PUB)
+	if err != nil {
+		return fmt.Errorf("failed to create pub socket: %w", err)
+	}
+	r.pubSocket = pubSocket
+
+	if err := r.routerSocket.Bind(r.bindAddress); err != nil {
+		return fmt.Errorf("failed to bind router socket: %w", err)
+	}
+	if err := r.pubSocket.Bind(r.pubAddress); err != nil {
+		return fmt.Errorf("failed to bind pub socket: %w", err)
+	}
+
+	fmt.Println("ZMQ Router started")
+
+	r.directSender = func(identity []byte, topic string, payload []byte) error {
+		_, err := r.routerSocket.SendMessage(identity, "", topic, payload)
+		return err
+	}
+
+	go r.loop(ctx)
+	return nil
+}
+
+// Stop gracefully closes the ZMQ sockets.
+func (r *Router) Stop() {
+	if r.routerSocket != nil {
+		_ = r.routerSocket.Close()
+	}
+	if r.pubSocket != nil {
+		_ = r.pubSocket.Close()
+	}
+	fmt.Println("ZMQ Router stopped")
 }
 
 // SetMaxInflightPerConsumer configures the hard upper bound for a direct consumer inflight window.
@@ -200,50 +275,6 @@ func (r *Router) SetGlobalIngressLimit(limit int) {
 	r.maxGlobalIngress = limit
 }
 
-// Start initializes and runs the ZMQ ROUTER socket loop.
-func (r *Router) Start(ctx context.Context) error {
-	routerSocket, err := zmq4.NewSocket(zmq4.ROUTER)
-	if err != nil {
-		return fmt.Errorf("failed to create router socket: %w", err)
-	}
-	r.routerSocket = routerSocket
-
-	pubSocket, err := zmq4.NewSocket(zmq4.PUB)
-	if err != nil {
-		return fmt.Errorf("failed to create pub socket: %w", err)
-	}
-	r.pubSocket = pubSocket
-
-	if err := r.routerSocket.Bind(r.bindAddress); err != nil {
-		return fmt.Errorf("failed to bind router socket: %w", err)
-	}
-	if err := r.pubSocket.Bind(r.pubAddress); err != nil {
-		return fmt.Errorf("failed to bind pub socket: %w", err)
-	}
-
-	fmt.Println("ZMQ Router started")
-
-	r.directSender = func(identity []byte, topic string, payload []byte) error {
-		_, err := r.routerSocket.SendMessage(identity, "", topic, payload)
-		return err
-	}
-
-	go r.loop(ctx)
-
-	return nil
-}
-
-// Stop gracefully closes the ZMQ sockets.
-func (r *Router) Stop() {
-	if r.routerSocket != nil {
-		_ = r.routerSocket.Close()
-	}
-	if r.pubSocket != nil {
-		_ = r.pubSocket.Close()
-	}
-	fmt.Println("ZMQ Router stopped")
-}
-
 func (r *Router) loop(ctx context.Context) {
 	defer r.Stop()
 
@@ -271,18 +302,15 @@ func (r *Router) loop(ctx context.Context) {
 			if err != nil {
 				continue
 			}
-
 			if err := validateTopic(topic); err != nil {
 				fmt.Printf("invalid topic %q: %v\n", topic, err)
 				continue
 			}
-
 			decompressedEvent, err := r.compressor.Decompress(rawEvent)
 			if err != nil {
 				fmt.Printf("failed to decompress event: %v\n", err)
 				continue
 			}
-
 			if topic == controlTopic {
 				r.handleControl(clientID, decompressedEvent)
 				continue
@@ -293,13 +321,8 @@ func (r *Router) loop(ctx context.Context) {
 				fmt.Printf("failed to decode event: %v\n", err)
 				continue
 			}
-
 			event.Topic = topic
-
-			envelope := domain.Envelope{
-				ClientID: clientID,
-				Event:    event,
-			}
+			envelope := domain.Envelope{ClientID: clientID, Event: event}
 
 			r.metrics.Ingress++
 			publishResult := domain.PublishResult{Status: domain.RouteStatusRouted, Topic: event.Topic}
@@ -310,7 +333,7 @@ func (r *Router) loop(ctx context.Context) {
 					continue
 				}
 				publishResult = resolved
-			} else {
+			} else if r.publisher != nil {
 				if err := r.publisher.Publish(ctx, envelope); err != nil {
 					fmt.Printf("failed to publish event: %v\n", err)
 					continue
@@ -326,21 +349,52 @@ func (r *Router) loop(ctx context.Context) {
 			if _, err := r.pubSocket.SendMessage(event.Topic, decompressedEvent); err != nil {
 				fmt.Printf("failed to fan out event on PUB socket: %v\n", err)
 			}
-
 			r.dispatchDirect(event.Topic, event.ID, decompressedEvent)
 		}
-
 		if ctx.Err() != nil {
 			break
 		}
 	}
 }
 
+func (r *Router) loadSessionSnapshots() error {
+	if r.wal == nil {
+		return nil
+	}
+	snapshots, err := r.wal.LoadSessionSnapshots()
+	if err != nil {
+		return err
+	}
+	now := r.now()
+	for _, snapshot := range snapshots {
+		if snapshot.ConsumerID == "" {
+			continue
+		}
+		if r.sessionSnapshotTTL > 0 && !snapshot.LastHeartbeat.IsZero() && now.Sub(snapshot.LastHeartbeat) > r.sessionSnapshotTTL {
+			if err := r.wal.DeleteSessionSnapshot(snapshot.ConsumerID); err != nil {
+				fmt.Printf("failed to delete stale session snapshot: %v\n", err)
+			}
+			continue
+		}
+		session := sessionFromSnapshot(snapshot)
+		if session.ResumablePending {
+			session.Live = false
+			session.TransportIdentity = nil
+		}
+		if existing, ok := r.directSessions[session.ConsumerID]; !ok || existing.LastHeartbeat.Before(session.LastHeartbeat) {
+			r.directSessions[session.ConsumerID] = session
+			if n := parseSessionOrdinal(session.SessionID); n > r.nextSessionID {
+				r.nextSessionID = n
+			}
+		}
+	}
+	return nil
+}
+
 func (r *Router) replayFromWAL(consumerID string) {
 	if r.wal == nil {
 		return
 	}
-
 	entries, err := r.wal.ReplayUnacked()
 	if err != nil {
 		fmt.Printf("failed to replay wal: %v\n", err)
@@ -354,7 +408,7 @@ func (r *Router) replayFromWAL(consumerID string) {
 			continue
 		}
 		session, ok := r.directSessions[entry.Consumer]
-		if !ok {
+		if !ok || !isSessionLive(session) {
 			continue
 		}
 		if _, exists := r.inflight[entry.MessageID]; exists {
@@ -367,36 +421,19 @@ func (r *Router) replayFromWAL(consumerID string) {
 		if attempt <= 0 {
 			attempt = 1
 		}
-		r.inflight[entry.MessageID] = &inflightMessage{
-			MessageID:       entry.MessageID,
-			ConsumerID:      entry.Consumer,
-			SessionID:       session.SessionID,
-			Topic:           entry.Topic,
-			Payload:         append([]byte(nil), entry.Payload...),
-			DeliveryAttempt: attempt,
-			Status:          statusDispatched,
-			DispatchedAt:    r.now(),
-		}
+		r.inflight[entry.MessageID] = &inflightMessage{MessageID: entry.MessageID, ConsumerID: entry.Consumer, SessionID: session.SessionID, Topic: entry.Topic, Payload: append([]byte(nil), entry.Payload...), DeliveryAttempt: attempt, Status: statusDispatched, DispatchedAt: r.now()}
 		session.InflightCount++
 		r.metrics.WALReplayed++
-		deferred = append(deferred, retryDispatch{identity: append([]byte(nil), session.SocketIdentity...), topic: entry.Topic, payload: append([]byte(nil), entry.Payload...)})
+		deferred = append(deferred, retryDispatch{identity: append([]byte(nil), session.TransportIdentity...), topic: entry.Topic, payload: append([]byte(nil), entry.Payload...)})
 	}
 	r.mu.Unlock()
-
-	for _, retry := range deferred {
-		if r.directSender == nil {
-			continue
-		}
-		if err := r.directSender(retry.identity, retry.topic, retry.payload); err != nil {
-			fmt.Printf("failed to replay wal event: %v\n", err)
-		}
-	}
+	r.sendDeferred(deferred)
 }
 
 func (r *Router) promoteDeferredForConsumer(consumerID string) {
 	r.mu.Lock()
 	session, ok := r.directSessions[consumerID]
-	if !ok {
+	if !ok || !isSessionLive(session) {
 		r.mu.Unlock()
 		return
 	}
@@ -452,34 +489,21 @@ func (r *Router) processInflightTimeouts() {
 		if now.Sub(record.DispatchedAt) < r.deliveryTimeout {
 			continue
 		}
-
 		r.metrics.DeliveryTimeout++
 		if record.DeliveryAttempt < r.maxDirectRetries {
 			session, ok := r.directSessions[record.ConsumerID]
-			if !ok {
-				delete(r.inflight, messageID)
-				r.completed[messageID] = statusDeadLettered
-				r.metrics.DeadLettered++
-				if r.wal != nil {
-					deadLetteredIDs = append(deadLetteredIDs, messageID)
-				}
+			if !ok || !isSessionLive(session) {
 				continue
 			}
-
 			record.DeliveryAttempt++
 			record.Status = statusRetry
 			record.DispatchedAt = now
 			r.metrics.Retried++
 			r.metrics.RetryDueToTimeout++
 			r.metrics.Dispatched++
-			deferredRetries = append(deferredRetries, retryDispatch{
-				identity: append([]byte(nil), session.SocketIdentity...),
-				topic:    record.Topic,
-				payload:  append([]byte(nil), record.Payload...),
-			})
+			deferredRetries = append(deferredRetries, retryDispatch{identity: append([]byte(nil), session.TransportIdentity...), topic: record.Topic, payload: append([]byte(nil), record.Payload...)})
 			continue
 		}
-
 		if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
 			s.InflightCount--
 		}
@@ -491,21 +515,12 @@ func (r *Router) processInflightTimeouts() {
 		}
 	}
 	r.mu.Unlock()
-
 	for _, messageID := range deadLetteredIDs {
 		if err := r.wal.AppendDeadLettered(messageID); err != nil {
 			fmt.Printf("failed to append wal dead-letter: %v\n", err)
 		}
 	}
-
-	for _, retry := range deferredRetries {
-		if r.directSender == nil {
-			continue
-		}
-		if err := r.directSender(retry.identity, retry.topic, retry.payload); err != nil {
-			fmt.Printf("failed to retry timed out direct-dispatch event: %v\n", err)
-		}
-	}
+	r.sendDeferred(deferredRetries)
 }
 
 type retryDispatch struct {
@@ -520,7 +535,6 @@ func (r *Router) handleControl(clientID []byte, raw []byte) {
 		fmt.Printf("failed to decode control message: %v\n", err)
 		return
 	}
-
 	switch msg.Type {
 	case "consumer.register":
 		r.registerConsumerSession(clientID, msg)
@@ -537,36 +551,55 @@ func (r *Router) registerConsumerSession(clientID []byte, msg controlMessage) {
 	if msg.Mode != "direct" || msg.ConsumerID == "" {
 		return
 	}
+	now := r.now()
 	r.mu.Lock()
-	r.nextSessionID++
-	session := &consumerSession{
-		SessionID:      fmt.Sprintf("sess_%06d", r.nextSessionID),
-		ConsumerID:     msg.ConsumerID,
-		SocketIdentity: append([]byte(nil), clientID...),
-		SupportsAck:    msg.Capabilities.SupportsAck,
-		Subscriptions:  map[string]struct{}{},
-		ConnectedAt:    r.now(),
-		LastHeartbeat:  r.now(),
-		MaxInflight:    msg.Capabilities.MaxInflight,
-	}
-	if session.MaxInflight <= 0 || session.MaxInflight > r.maxInflightPerConsumer {
-		session.MaxInflight = r.maxInflightPerConsumer
-	}
-	for _, topic := range msg.Subscriptions {
-		session.Subscriptions[topic] = struct{}{}
-	}
-	r.directSessions[msg.ConsumerID] = session
+	session := r.upsertSessionLocked(clientID, msg, now)
 	r.mu.Unlock()
-
+	if err := r.persistSessionSnapshot(session); err != nil {
+		fmt.Printf("failed to persist session snapshot: %v\n", err)
+	}
 	r.replayFromWAL(msg.ConsumerID)
 	r.promoteDeferredForConsumer(msg.ConsumerID)
 }
 
+func (r *Router) upsertSessionLocked(clientID []byte, msg controlMessage, now time.Time) *consumerSession {
+	existing, ok := r.directSessions[msg.ConsumerID]
+	if !ok || existing.SessionID == "" {
+		r.nextSessionID++
+		existing = &consumerSession{SessionID: fmt.Sprintf("sess_%06d", r.nextSessionID), ConsumerID: msg.ConsumerID, ConnectedAt: now}
+		r.directSessions[msg.ConsumerID] = existing
+	}
+	existing.TransportIdentity = append(existing.TransportIdentity[:0], clientID...)
+	existing.Subscriptions = make(map[string]struct{}, len(msg.Subscriptions))
+	for _, topic := range msg.Subscriptions {
+		existing.Subscriptions[topic] = struct{}{}
+	}
+	existing.Capabilities = capabilityHints{SupportsAck: msg.Capabilities.SupportsAck, SupportsCompression: cloneStrings(msg.Capabilities.SupportsCompression), SupportsCodec: cloneStrings(msg.Capabilities.SupportsCodec), Resumable: msg.Capabilities.Resumable}
+	existing.MaxInflight = msg.Capabilities.MaxInflight
+	if existing.MaxInflight <= 0 || existing.MaxInflight > r.maxInflightPerConsumer {
+		existing.MaxInflight = r.maxInflightPerConsumer
+	}
+	if existing.ConnectedAt.IsZero() {
+		existing.ConnectedAt = now
+	}
+	existing.LastHeartbeat = now
+	existing.Live = true
+	existing.ResumablePending = existing.Capabilities.Resumable
+	return cloneSession(existing)
+}
+
 func (r *Router) heartbeatConsumer(consumerID string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var snapshot *consumerSession
 	if session, ok := r.directSessions[consumerID]; ok {
 		session.LastHeartbeat = r.now()
+		snapshot = cloneSession(session)
+	}
+	r.mu.Unlock()
+	if snapshot != nil {
+		if err := r.persistSessionSnapshot(snapshot); err != nil {
+			fmt.Printf("failed to persist session heartbeat: %v\n", err)
+		}
 	}
 }
 
@@ -588,7 +621,6 @@ func (r *Router) dispatchDirect(topic, messageID string, payload []byte) {
 	}
 	identity, walEntry, needsWAL := r.prepareDispatchLocked(session, topic, messageID, payload, 1)
 	r.mu.Unlock()
-
 	if needsWAL {
 		if err := r.wal.AppendDispatched(walEntry); err != nil {
 			fmt.Printf("failed to append wal dispatch: %v\n", err)
@@ -598,32 +630,18 @@ func (r *Router) dispatchDirect(topic, messageID string, payload []byte) {
 			r.mu.Unlock()
 		}
 	}
-
-	if r.directSender != nil {
-		if err := r.directSender(identity, topic, payload); err != nil {
-			fmt.Printf("failed to direct-dispatch event: %v\n", err)
-		}
-	}
+	r.sendDeferred([]retryDispatch{{identity: identity, topic: topic, payload: payload}})
 }
 
 func (r *Router) prepareDispatchLocked(session *consumerSession, topic, messageID string, payload []byte, attempt int) ([]byte, walDispatchedEntry, bool) {
-	if session.SupportsAck && messageID != "" {
-		r.inflight[messageID] = &inflightMessage{
-			MessageID:       messageID,
-			ConsumerID:      session.ConsumerID,
-			SessionID:       session.SessionID,
-			Topic:           topic,
-			Payload:         append([]byte(nil), payload...),
-			DeliveryAttempt: attempt,
-			Status:          statusDispatched,
-			DispatchedAt:    r.now(),
-		}
+	if session.Capabilities.SupportsAck && messageID != "" {
+		r.inflight[messageID] = &inflightMessage{MessageID: messageID, ConsumerID: session.ConsumerID, SessionID: session.SessionID, Topic: topic, Payload: append([]byte(nil), payload...), DeliveryAttempt: attempt, Status: statusDispatched, DispatchedAt: r.now()}
 		session.InflightCount++
 	}
 	r.metrics.Dispatched++
-	identity := append([]byte(nil), session.SocketIdentity...)
+	identity := append([]byte(nil), session.TransportIdentity...)
 	walEntry := walDispatchedEntry{MessageID: messageID, Consumer: session.ConsumerID, SessionID: session.SessionID, Topic: topic, Payload: append([]byte(nil), payload...), Attempt: attempt}
-	needsWAL := r.wal != nil && session.SupportsAck && messageID != ""
+	needsWAL := r.wal != nil && session.Capabilities.SupportsAck && messageID != ""
 	return identity, walEntry, needsWAL
 }
 
@@ -659,9 +677,7 @@ func (r *Router) totalQueuedLocked() int {
 	return total
 }
 
-func (r *Router) totalDirectLoadLocked() int {
-	return len(r.inflight) + r.totalQueuedLocked()
-}
+func (r *Router) totalDirectLoadLocked() int { return len(r.inflight) + r.totalQueuedLocked() }
 
 func (r *Router) selectSession(topic string) *consumerSession {
 	if len(r.directSessions) == 0 {
@@ -674,6 +690,9 @@ func (r *Router) selectSession(topic string) *consumerSession {
 	sort.Strings(ids)
 	for _, id := range ids {
 		s := r.directSessions[id]
+		if !isSessionLive(s) {
+			continue
+		}
 		if _, ok := s.Subscriptions[topic]; !ok {
 			continue
 		}
@@ -692,11 +711,7 @@ func (r *Router) ConsumerBacklogSnapshot() map[string]ConsumerBacklogMetrics {
 	defer r.mu.Unlock()
 	out := make(map[string]ConsumerBacklogMetrics, len(r.directSessions))
 	for consumerID, s := range r.directSessions {
-		out[consumerID] = ConsumerBacklogMetrics{
-			Inflight:    s.InflightCount,
-			MaxInflight: s.MaxInflight,
-			Backlog:     s.BacklogCount,
-		}
+		out[consumerID] = ConsumerBacklogMetrics{Inflight: s.InflightCount, MaxInflight: s.MaxInflight, Backlog: s.BacklogCount}
 	}
 	return out
 }
@@ -726,7 +741,6 @@ func (r *Router) handleAck(messageID, consumerID, sessionID string) {
 	r.metrics.Acked++
 	shouldCommit := r.wal != nil
 	r.mu.Unlock()
-
 	if shouldCommit {
 		if err := r.wal.AppendCommitted(messageID); err != nil {
 			fmt.Printf("failed to append wal commit: %v\n", err)
@@ -750,7 +764,7 @@ func (r *Router) handleNack(messageID, consumerID, sessionID, status string) {
 	isRetryable := status == "retryable_error" || status == "retryable"
 	if isRetryable && record.DeliveryAttempt < r.maxDirectRetries {
 		session, ok := r.directSessions[record.ConsumerID]
-		if !ok {
+		if !ok || !isSessionLive(session) {
 			r.mu.Unlock()
 			return
 		}
@@ -759,18 +773,13 @@ func (r *Router) handleNack(messageID, consumerID, sessionID, status string) {
 		record.DispatchedAt = r.now()
 		r.metrics.Retried++
 		r.metrics.Dispatched++
-		identity := append([]byte(nil), session.SocketIdentity...)
+		identity := append([]byte(nil), session.TransportIdentity...)
 		topic := record.Topic
 		payload := append([]byte(nil), record.Payload...)
 		r.mu.Unlock()
-		if r.directSender != nil {
-			if err := r.directSender(identity, topic, payload); err != nil {
-				fmt.Printf("failed to retry direct-dispatch event: %v\n", err)
-			}
-		}
+		r.sendDeferred([]retryDispatch{{identity: identity, topic: topic, payload: payload}})
 		return
 	}
-
 	if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
 		s.InflightCount--
 	}
@@ -780,7 +789,6 @@ func (r *Router) handleNack(messageID, consumerID, sessionID, status string) {
 	r.metrics.DeadLettered++
 	shouldDeadLetter := r.wal != nil
 	r.mu.Unlock()
-
 	if shouldDeadLetter {
 		if err := r.wal.AppendDeadLettered(messageID); err != nil {
 			fmt.Printf("failed to append wal dead-letter: %v\n", err)
@@ -820,55 +828,76 @@ func (r *Router) drainDeferredLocked(topic string) []retryDispatch {
 
 func (r *Router) sendDeferred(retries []retryDispatch) {
 	for _, retry := range retries {
-		if r.directSender == nil {
+		if r.directSender == nil || len(retry.identity) == 0 {
 			continue
 		}
 		if err := r.directSender(retry.identity, retry.topic, retry.payload); err != nil {
 			fmt.Printf("failed to direct-dispatch deferred event: %v\n", err)
 		}
 	}
-	r.mu.Unlock()
-	r.sendDeferred(drain)
 }
 
-func (r *Router) drainDeferredLocked(topic string) []retryDispatch {
-	queue := r.directQueue[topic]
-	if len(queue) == 0 {
+func isSessionLive(session *consumerSession) bool {
+	if session == nil || len(session.TransportIdentity) == 0 {
+		return false
+	}
+	if session.Live {
+		return true
+	}
+	return !session.ResumablePending
+}
+
+func (r *Router) persistSessionSnapshot(session *consumerSession) error {
+	if r.wal == nil || session == nil || !session.Capabilities.Resumable {
 		return nil
 	}
-	session := r.selectSession(topic)
+	return r.wal.SaveSessionSnapshot(snapshotFromSession(session))
+}
+
+func snapshotFromSession(session *consumerSession) sessionSnapshot {
+	subscriptions := make([]string, 0, len(session.Subscriptions))
+	for topic := range session.Subscriptions {
+		subscriptions = append(subscriptions, topic)
+	}
+	sort.Strings(subscriptions)
+	return sessionSnapshot{SessionID: session.SessionID, ConsumerID: session.ConsumerID, Subscriptions: subscriptions, ConnectedAt: session.ConnectedAt, LastHeartbeat: session.LastHeartbeat, MaxInflight: session.MaxInflight, SupportsAck: session.Capabilities.SupportsAck, SupportsCompression: cloneStrings(session.Capabilities.SupportsCompression), SupportsCodec: cloneStrings(session.Capabilities.SupportsCodec), Resumable: session.Capabilities.Resumable, Live: session.Live, ResumablePending: session.ResumablePending}
+}
+
+func sessionFromSnapshot(snapshot sessionSnapshot) *consumerSession {
+	subs := make(map[string]struct{}, len(snapshot.Subscriptions))
+	for _, topic := range snapshot.Subscriptions {
+		subs[topic] = struct{}{}
+	}
+	return &consumerSession{SessionID: snapshot.SessionID, ConsumerID: snapshot.ConsumerID, Subscriptions: subs, Capabilities: capabilityHints{SupportsAck: snapshot.SupportsAck, SupportsCompression: cloneStrings(snapshot.SupportsCompression), SupportsCodec: cloneStrings(snapshot.SupportsCodec), Resumable: snapshot.Resumable}, MaxInflight: snapshot.MaxInflight, ConnectedAt: snapshot.ConnectedAt, LastHeartbeat: snapshot.LastHeartbeat, Live: false, ResumablePending: snapshot.Resumable}
+}
+
+func cloneSession(session *consumerSession) *consumerSession {
 	if session == nil {
 		return nil
 	}
-	msg := queue[0]
-	if len(queue) == 1 {
-		delete(r.directQueue, topic)
-	} else {
-		r.directQueue[topic] = queue[1:]
+	copy := *session
+	copy.TransportIdentity = append([]byte(nil), session.TransportIdentity...)
+	copy.Capabilities = capabilityHints{SupportsAck: session.Capabilities.SupportsAck, SupportsCompression: cloneStrings(session.Capabilities.SupportsCompression), SupportsCodec: cloneStrings(session.Capabilities.SupportsCodec), Resumable: session.Capabilities.Resumable}
+	copy.Subscriptions = make(map[string]struct{}, len(session.Subscriptions))
+	for k := range session.Subscriptions {
+		copy.Subscriptions[k] = struct{}{}
 	}
-	if session.BacklogCount > 0 {
-		session.BacklogCount--
-	}
-	identity, walEntry, needsWAL := r.prepareDispatchLocked(session, msg.Topic, msg.MessageID, msg.Payload, 1)
-	if needsWAL {
-		if err := r.wal.AppendDispatched(walEntry); err != nil {
-			fmt.Printf("failed to append wal dispatch: %v\n", err)
-		} else {
-			r.metrics.WALWritten++
-		}
-	}
-	return []retryDispatch{{identity: identity, topic: msg.Topic, payload: msg.Payload}}
+	return &copy
 }
 
-func (r *Router) sendDeferred(retries []retryDispatch) {
-	for _, retry := range retries {
-		if r.directSender == nil {
-			continue
-		}
-		if err := r.directSender(retry.identity, retry.topic, retry.payload); err != nil {
-			fmt.Printf("failed to direct-dispatch deferred event: %v\n", err)
-		}
+func cloneStrings(in []string) []string {
+	if len(in) == 0 {
+		return nil
 	}
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
+}
+
+func parseSessionOrdinal(sessionID string) uint64 {
+	var n uint64
+	_, _ = fmt.Sscanf(sessionID, "sess_%d", &n)
+	return n
 }
 
 // MetricsSnapshot returns a thread-safe copy of delivery counters.
@@ -881,10 +910,8 @@ func (r *Router) MetricsSnapshot() DeliveryMetrics {
 func parseFrames(msg [][]byte) ([]byte, string, []byte, error) {
 	switch {
 	case len(msg) == 3:
-		// [ClientID, Topic, Payload]
 		return msg[0], string(msg[1]), msg[2], nil
 	case len(msg) == 4 && len(msg[1]) == 0:
-		// [ClientID, Delimiter, Topic, Payload]
 		return msg[0], string(msg[2]), msg[3], nil
 	default:
 		return nil, "", nil, fmt.Errorf("malformed message: expected 3 frames or 4 frames with delimiter, got %d", len(msg))
@@ -895,16 +922,13 @@ func validateTopic(topic string) error {
 	if topic == "" {
 		return fmt.Errorf("topic must not be empty")
 	}
-
 	if strings.HasPrefix(topic, ".") || strings.HasSuffix(topic, ".") || strings.Contains(topic, "..") {
 		return fmt.Errorf("topic segments must be non-empty")
 	}
-
 	for _, r := range topic {
 		if unicode.IsSpace(r) {
 			return fmt.Errorf("topic must not contain whitespace")
 		}
 	}
-
 	return nil
 }

@@ -149,12 +149,16 @@ A session SHOULD include:
 
 - session_id
 - consumer_id
-- socket_identity
+- logical consumer session metadata
+- transport_identity
 - subscriptions
 - connected_at
 - last_heartbeat
 - max_inflight
 - supports_ack
+- supports_compression
+- supports_codec
+- resumable
 - status
 
 ### 7.2 Session Lifecycle
@@ -166,6 +170,24 @@ A session typically progresses through:
 - message delivery eligibility
 - graceful deregistration or timeout
 - cleanup
+
+### 7.3 Restart Recovery
+
+If direct sessions are marked resumable, the broker MAY persist a session snapshot containing:
+
+- session_id
+- consumer_id
+- subscriptions
+- last_heartbeat
+- max_inflight
+- supports_ack
+- supports_compression
+- supports_codec
+- resumable
+
+On restart, the broker SHOULD reload those snapshots as resumable-but-not-yet-live logical sessions.
+The previous transport identity MUST NOT be treated as valid until the consumer re-registers and proves a new live socket identity.
+Stale snapshots SHOULD be discarded after the configured heartbeat/snapshot TTL expires.
 
 ## 8. Consumer Registration
 
@@ -186,6 +208,7 @@ Example:
     "supports_ack": true,
     "supports_compression": ["lz4"],
     "supports_codec": ["json"],
+    "resumable": true,
     "max_inflight": 1024
   }
 }

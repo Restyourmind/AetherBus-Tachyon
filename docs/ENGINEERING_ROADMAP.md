@@ -104,10 +104,10 @@ This roadmap is grounded in the current repository shape and documented protocol
 ## Later (durability, scale, federation, intent-aware runway)
 
 ### 10) Pluggable durability layer (WAL first, queue snapshots second)
-- **Durability gap addressed:** Current runtime is in-memory only.
+- **Durability gap addressed:** Current runtime is in-memory only. Session snapshot persistence for resumable consumers is now implemented in the ZMQ router/WAL path; queue snapshots and broader runtime integration remain open.
 - **Impacted files/packages:** new `internal/durability/*`, integration in `internal/app/runtime.go`.
 - **Risk:** **High** (ordering, fsync tradeoffs, recovery logic).
-- **Acceptance criteria:** crash recovery for inflight/retry metadata and at-least-once replay boundary documented.
+- **Acceptance criteria:** crash recovery for inflight/retry metadata and at-least-once replay boundary documented. Resumable consumer snapshots must restore capability hints without reusing stale transport identities.
 
 ### 11) Federation/bridge control plane minimum
 - **Scalability/federation gap addressed:** Bridge mode exists in docs, no practical multi-broker control plane yet.
