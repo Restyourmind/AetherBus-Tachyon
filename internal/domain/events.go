@@ -21,6 +21,10 @@ type Event struct {
 	// DeliverAt requests that broker dispatch not start before this UTC timestamp.
 	DeliverAt time.Time `json:"deliver_at,omitempty"`
 
+	// Priority requests broker dispatch precedence using a normalized class such as
+	// urgent, high, normal, or low.
+	Priority string `json:"priority,omitempty"`
+
 	// Data is the payload of the event. It can be any structured data.
 	Data interface{}
 
@@ -45,4 +49,6 @@ type Envelope struct {
 	DeliverAt time.Time
 	// NextAttemptAt is broker-managed scheduler state for delayed retries/promotions.
 	NextAttemptAt time.Time
+	// Priority is the broker-normalized direct-delivery class copied from the event.
+	Priority string
 }

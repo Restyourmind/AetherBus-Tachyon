@@ -30,28 +30,32 @@ type fileWAL struct {
 }
 
 type walRecord struct {
-	Type      string `json:"type"`
-	MessageID string `json:"message_id"`
-	Consumer  string `json:"consumer_id,omitempty"`
-	SessionID string `json:"session_id,omitempty"`
-	Topic     string `json:"topic,omitempty"`
-	Payload   string `json:"payload,omitempty"`
-	Attempt   int    `json:"attempt,omitempty"`
+	Type            string `json:"type"`
+	MessageID       string `json:"message_id"`
+	Consumer        string `json:"consumer_id,omitempty"`
+	SessionID       string `json:"session_id,omitempty"`
+	Topic           string `json:"topic,omitempty"`
+	Payload         string `json:"payload,omitempty"`
+	Priority        string `json:"priority,omitempty"`
+	EnqueueSequence uint64 `json:"enqueue_sequence,omitempty"`
+	Attempt         int    `json:"attempt,omitempty"`
 }
 
 type walDispatchedEntry struct {
-	MessageID string
-	Consumer  string
-	SessionID string
-	Topic     string
-	Payload   []byte
-	Attempt   int
+	MessageID       string
+	Consumer        string
+	SessionID       string
+	Topic           string
+	Payload         []byte
+	Priority        string
+	EnqueueSequence uint64
+	Attempt         int
 }
 
 func NewFileWAL(path string) WAL { return &fileWAL{path: path} }
 
 func (w *fileWAL) AppendDispatched(entry walDispatchedEntry) error {
-	return w.appendRecord(walRecord{Type: "dispatched", MessageID: entry.MessageID, Consumer: entry.Consumer, SessionID: entry.SessionID, Topic: entry.Topic, Payload: base64.StdEncoding.EncodeToString(entry.Payload), Attempt: entry.Attempt})
+	return w.appendRecord(walRecord{Type: "dispatched", MessageID: entry.MessageID, Consumer: entry.Consumer, SessionID: entry.SessionID, Topic: entry.Topic, Payload: base64.StdEncoding.EncodeToString(entry.Payload), Priority: entry.Priority, EnqueueSequence: entry.EnqueueSequence, Attempt: entry.Attempt})
 }
 func (w *fileWAL) AppendCommitted(messageID string) error {
 	return w.appendRecord(walRecord{Type: "committed", MessageID: messageID})
@@ -98,7 +102,7 @@ func (w *fileWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 			if err != nil {
 				return nil, fmt.Errorf("decode wal payload: %w", err)
 			}
-			pending[rec.MessageID] = walDispatchedEntry{MessageID: rec.MessageID, Consumer: rec.Consumer, SessionID: rec.SessionID, Topic: rec.Topic, Payload: payload, Attempt: rec.Attempt}
+			pending[rec.MessageID] = walDispatchedEntry{MessageID: rec.MessageID, Consumer: rec.Consumer, SessionID: rec.SessionID, Topic: rec.Topic, Payload: payload, Priority: rec.Priority, EnqueueSequence: rec.EnqueueSequence, Attempt: rec.Attempt}
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -170,9 +174,8 @@ func (w *fileWAL) appendRecord(rec walRecord) error {
 	return f.Sync()
 }
 
-func (w *fileWAL) snapshotPath() string { return w.path + ".sessions" }
+func (w *fileWAL) snapshotPath() string  { return w.path + ".sessions" }
 func (w *fileWAL) scheduledPath() string { return w.path + ".scheduled" }
-
 
 func (w *fileWAL) SaveScheduled(entries []scheduledMessage) error {
 	w.mu.Lock()

@@ -81,3 +81,53 @@ func TestLoadRouteCatalogFromEnv(t *testing.T) {
 		t.Fatalf("unexpected route catalog path: %q", cfg.RouteCatalogPath)
 	}
 }
+
+func TestLoadDirectPriorityDefaults(t *testing.T) {
+	t.Setenv("DIRECT_PRIORITY_CLASSES", "")
+	t.Setenv("DIRECT_PRIORITY_WEIGHTS", "")
+	t.Setenv("DIRECT_PRIORITY_PREEMPTION", "")
+	t.Setenv("DIRECT_PRIORITY_BOOST_THRESHOLD", "")
+	t.Setenv("DIRECT_PRIORITY_BOOST_OFFSET", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected load error: %v", err)
+	}
+	if got := cfg.SupportedPriorityClasses; len(got) != 4 || got[0] != "urgent" || got[2] != "normal" {
+		t.Fatalf("unexpected default priority classes: %#v", got)
+	}
+	if cfg.PriorityClassWeights["urgent"] <= cfg.PriorityClassWeights["normal"] {
+		t.Fatalf("expected urgent to outrank normal: %#v", cfg.PriorityClassWeights)
+	}
+	if !cfg.PriorityPreemption {
+		t.Fatalf("expected preemption enabled by default")
+	}
+	if cfg.PriorityBoostThreshold != 8 || cfg.PriorityBoostOffset != 1000 {
+		t.Fatalf("unexpected boost defaults: threshold=%d offset=%d", cfg.PriorityBoostThreshold, cfg.PriorityBoostOffset)
+	}
+}
+
+func TestLoadDirectPriorityFromEnv(t *testing.T) {
+	t.Setenv("DIRECT_PRIORITY_CLASSES", "critical,bulk,background")
+	t.Setenv("DIRECT_PRIORITY_WEIGHTS", "critical=9,bulk=4,background=1")
+	t.Setenv("DIRECT_PRIORITY_PREEMPTION", "false")
+	t.Setenv("DIRECT_PRIORITY_BOOST_THRESHOLD", "3")
+	t.Setenv("DIRECT_PRIORITY_BOOST_OFFSET", "77")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected load error: %v", err)
+	}
+	if got := cfg.SupportedPriorityClasses; len(got) != 3 || got[0] != "critical" || got[2] != "background" {
+		t.Fatalf("unexpected configured priority classes: %#v", got)
+	}
+	if cfg.PriorityClassWeights["critical"] != 9 || cfg.PriorityClassWeights["background"] != 1 {
+		t.Fatalf("unexpected configured weights: %#v", cfg.PriorityClassWeights)
+	}
+	if cfg.PriorityPreemption {
+		t.Fatalf("expected preemption disabled from env")
+	}
+	if cfg.PriorityBoostThreshold != 3 || cfg.PriorityBoostOffset != 77 {
+		t.Fatalf("unexpected configured boost policy: threshold=%d offset=%d", cfg.PriorityBoostThreshold, cfg.PriorityBoostOffset)
+	}
+}

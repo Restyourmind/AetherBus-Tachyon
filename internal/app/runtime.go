@@ -58,6 +58,13 @@ func NewRuntimeWithCompressor(cfg *config.Config, bootstrapRoutes map[string]str
 	router.SetMaxInflightPerConsumer(cfg.MaxInflightPerConsumer)
 	router.SetQueueBounds(cfg.MaxPerTopicQueue, cfg.MaxQueuedDirect)
 	router.SetGlobalIngressLimit(cfg.MaxGlobalIngress)
+	router.SetPriorityPolicy(
+		cfg.SupportedPriorityClasses,
+		cfg.PriorityClassWeights,
+		cfg.PriorityPreemption,
+		cfg.PriorityBoostThreshold,
+		cfg.PriorityBoostOffset,
+	)
 
 	return &Runtime{
 		RouteStore:   routeStore,

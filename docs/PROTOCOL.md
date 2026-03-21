@@ -109,7 +109,8 @@ The canonical envelope is the logical message structure used inside the broker.
   },
   "timestamp_unix_ms": 1741337000000,
   "deliver_at_unix_ms": 1741337060000,
-  "next_attempt_unix_ms": 1741337090000
+  "next_attempt_unix_ms": 1741337090000,
+  "priority": "normal"
 }
 ```
 
@@ -138,6 +139,7 @@ The following fields are OPTIONAL:
 - attempt
 - deliver_at_unix_ms
 - next_attempt_unix_ms
+- priority
 
 ### 5.4 Field Semantics
 
@@ -186,6 +188,12 @@ Earliest broker delivery timestamp in Unix milliseconds. When present, the broke
 
 Broker-managed retry scheduler timestamp in Unix milliseconds. Producers SHOULD omit this field on ingress. Brokers MAY set it when persisting delayed retries or forwarding an internal scheduled envelope.
 
+#### priority
+
+Normalized direct-delivery priority class. Brokers MUST accept configured class names case-insensitively and normalize them to the canonical configured token before queuing, WAL persistence, retry scheduling, or replay. The default classes are `urgent`, `high`, `normal`, and `low`.
+
+If a producer omits `priority`, the broker MUST normalize the message to the configured default class. The reference implementation defaults to `normal`.
+
 ## 6. Headers
 
 Headers are broker-visible metadata and MUST be a string-keyed object.
@@ -197,7 +205,7 @@ Headers are broker-visible metadata and MUST be a string-keyed object.
 | content_type | string | MIME-style payload content type |
 | codec | string | Serialization codec |
 | compression | string | Compression codec |
-| priority | string | Message priority |
+| priority | string | Normalized direct-delivery class (`urgent`, `high`, `normal`, `low` by default) |
 | ttl_ms | integer | Time-to-live in milliseconds |
 | delivery_mode | string | Direct, fanout, or bridge |
 | reply_expected | boolean | Whether producer expects a reply |
@@ -212,6 +220,14 @@ Unknown headers:
 
 - MUST be preserved if the envelope is forwarded
 - MUST NOT cause protocol failure unless explicitly forbidden by broker policy
+
+### 6.3 Priority Ordering and Replay Rules
+
+For direct delivery, brokers MUST dispatch higher-priority backlog entries before lower-priority backlog entries.
+
+Within the same priority class, ordering MUST be deterministic. The reference implementation uses a stable enqueue sequence and preserves that sequence in WAL-backed replay metadata.
+
+If starvation prevention is enabled, a broker MAY age older backlog entries so lower-priority work eventually becomes dispatch-eligible. Any such aging rule MUST still be deterministic and replayable from persisted metadata.
 
 ## 7. Codecs
 

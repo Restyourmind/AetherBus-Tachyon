@@ -16,6 +16,11 @@ import (
 
 const maxScheduledDeliveryHorizon = 365 * 24 * time.Hour
 
+const (
+	defaultPriorityBoostThreshold = 8
+	defaultPriorityBoostOffset    = 1000
+)
+
 // Router manages the ZMQ ROUTER socket for incoming events.
 type Router struct {
 	bindAddress     string
@@ -37,6 +42,7 @@ type Router struct {
 	completed              map[string]deliveryStatus
 	nextSessionID          uint64
 	nextScheduleSequence   uint64
+	nextQueueSequence      uint64
 	metrics                DeliveryMetrics
 	maxDirectRetries       int
 	maxInflightPerConsumer int
@@ -44,9 +50,15 @@ type Router struct {
 	maxQueuedDirect        int
 	maxGlobalIngress       int
 	sessionSnapshotTTL     time.Duration
-	directQueue            map[string][]queuedDirectMessage
+	directQueue            map[string]*priorityQueue
 	scheduledQueue         []scheduledMessage
 	directSender           func(identity []byte, topic string, payload []byte) error
+	priorityClasses        []string
+	priorityRank           map[string]int
+	priorityWeights        map[string]int
+	priorityBoostThreshold int
+	priorityBoostOffset    int
+	priorityPreemption     bool
 }
 
 type deliveryStatus string
@@ -104,15 +116,23 @@ type inflightMessage struct {
 	SessionID       string
 	Topic           string
 	Payload         []byte
+	Priority        string
 	DeliveryAttempt int
 	Status          deliveryStatus
 	DispatchedAt    time.Time
+	EnqueueSequence uint64
 }
 
 type queuedDirectMessage struct {
-	MessageID string
-	Topic     string
-	Payload   []byte
+	MessageID       string `json:"message_id"`
+	Topic           string `json:"topic"`
+	Payload         []byte `json:"payload"`
+	Priority        string `json:"priority,omitempty"`
+	EnqueueSequence uint64 `json:"enqueue_sequence"`
+}
+
+type priorityQueue struct {
+	Messages []queuedDirectMessage `json:"messages"`
 }
 
 type scheduledMessage struct {
@@ -120,6 +140,8 @@ type scheduledMessage struct {
 	MessageID       string    `json:"message_id"`
 	Topic           string    `json:"topic"`
 	Payload         []byte    `json:"payload"`
+	Priority        string    `json:"priority,omitempty"`
+	EnqueueSequence uint64    `json:"enqueue_sequence,omitempty"`
 	DeliveryAttempt int       `json:"delivery_attempt,omitempty"`
 	DeliverAt       time.Time `json:"deliver_at"`
 	Reason          string    `json:"reason,omitempty"`
@@ -185,7 +207,7 @@ func NewRouterWithDurability(bindAddress, pubAddress string, publisher domain.Ev
 	if deliveryTimeout <= 0 {
 		deliveryTimeout = 30 * time.Second
 	}
-	return &Router{
+	router := &Router{
 		bindAddress:            bindAddress,
 		pubAddress:             pubAddress,
 		publisher:              publisher,
@@ -200,11 +222,16 @@ func NewRouterWithDurability(bindAddress, pubAddress string, publisher domain.Ev
 		maxQueuedDirect:        4096,
 		maxGlobalIngress:       8192,
 		sessionSnapshotTTL:     5 * time.Minute,
-		directQueue:            map[string][]queuedDirectMessage{},
+		directQueue:            map[string]*priorityQueue{},
 		deliveryTimeout:        deliveryTimeout,
 		now:                    func() time.Time { return time.Now().UTC() },
 		wal:                    durability,
+		priorityBoostThreshold: defaultPriorityBoostThreshold,
+		priorityBoostOffset:    defaultPriorityBoostOffset,
+		priorityPreemption:     true,
 	}
+	router.SetPriorityPolicy([]string{"urgent", "high", "normal", "low"}, map[string]int{"urgent": 4, "high": 3, "normal": 2, "low": 1}, true, defaultPriorityBoostThreshold, defaultPriorityBoostOffset)
+	return router
 }
 
 func (r *Router) Start(ctx context.Context) error {
@@ -275,6 +302,50 @@ func (r *Router) SetGlobalIngressLimit(limit int) {
 	r.maxGlobalIngress = limit
 }
 
+func (r *Router) SetPriorityPolicy(classes []string, weights map[string]int, preemption bool, boostThreshold, boostOffset int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(classes) == 0 {
+		classes = []string{"urgent", "high", "normal", "low"}
+	}
+	normalizedClasses := make([]string, 0, len(classes))
+	seen := map[string]struct{}{}
+	for _, class := range classes {
+		class = strings.ToLower(strings.TrimSpace(class))
+		if class == "" {
+			continue
+		}
+		if _, ok := seen[class]; ok {
+			continue
+		}
+		seen[class] = struct{}{}
+		normalizedClasses = append(normalizedClasses, class)
+	}
+	if len(normalizedClasses) == 0 {
+		normalizedClasses = []string{"urgent", "high", "normal", "low"}
+	}
+	r.priorityClasses = normalizedClasses
+	r.priorityRank = make(map[string]int, len(normalizedClasses))
+	r.priorityWeights = make(map[string]int, len(normalizedClasses))
+	for i, class := range normalizedClasses {
+		r.priorityRank[class] = i
+		weight := len(normalizedClasses) - i
+		if weights != nil {
+			if configured, ok := weights[class]; ok && configured > 0 {
+				weight = configured
+			}
+		}
+		r.priorityWeights[class] = weight
+	}
+	r.priorityPreemption = preemption
+	if boostThreshold > 0 {
+		r.priorityBoostThreshold = boostThreshold
+	}
+	if boostOffset > 0 {
+		r.priorityBoostOffset = boostOffset
+	}
+}
+
 func (r *Router) loop(ctx context.Context) {
 	defer r.Stop()
 	poller := zmq4.NewPoller()
@@ -317,12 +388,13 @@ func (r *Router) loop(ctx context.Context) {
 				continue
 			}
 			event.Topic = topic
+			event.Priority = r.normalizePriority(event.Priority)
 			normalizedEvent, err := r.codec.Encode(event)
 			if err != nil {
 				fmt.Printf("failed to re-encode event: %v\n", err)
 				continue
 			}
-			envelope := domain.Envelope{ClientID: clientID, Event: event, DeliverAt: event.DeliverAt}
+			envelope := domain.Envelope{ClientID: clientID, Event: event, DeliverAt: event.DeliverAt, Priority: event.Priority}
 			if err := validateScheduleTimestamp(r.now(), envelope.DeliverAt); err != nil {
 				fmt.Printf("invalid delivery timestamp for %q: %v\n", event.ID, err)
 				r.mu.Lock()
@@ -360,9 +432,9 @@ func (r *Router) loop(ctx context.Context) {
 				fmt.Printf("failed to fan out event on PUB socket: %v\n", err)
 			}
 			if !event.DeliverAt.IsZero() && event.DeliverAt.After(r.now()) {
-				r.scheduleDispatch(topic, event.ID, normalizedEvent, 1, event.DeliverAt, "publish")
+				r.scheduleDispatch(topic, event.ID, normalizedEvent, event.Priority, 0, 1, event.DeliverAt, "publish")
 			} else {
-				r.dispatchDirect(topic, event.ID, normalizedEvent)
+				r.dispatchDirect(topic, event.ID, normalizedEvent, event.Priority)
 			}
 		}
 		if ctx.Err() != nil {
@@ -433,6 +505,9 @@ func (r *Router) loadScheduledQueue() error {
 		if entry.Sequence > r.nextScheduleSequence {
 			r.nextScheduleSequence = entry.Sequence
 		}
+		if entry.EnqueueSequence > r.nextQueueSequence {
+			r.nextQueueSequence = entry.EnqueueSequence
+		}
 	}
 	r.sortScheduledLocked()
 	return nil
@@ -478,7 +553,7 @@ func (r *Router) replayFromWAL(consumerID string) {
 		if attempt <= 0 {
 			attempt = 1
 		}
-		r.inflight[entry.MessageID] = &inflightMessage{MessageID: entry.MessageID, ConsumerID: entry.Consumer, SessionID: session.SessionID, Topic: entry.Topic, Payload: append([]byte(nil), entry.Payload...), DeliveryAttempt: attempt, Status: statusDispatched, DispatchedAt: r.now()}
+		r.inflight[entry.MessageID] = &inflightMessage{MessageID: entry.MessageID, ConsumerID: entry.Consumer, SessionID: session.SessionID, Topic: entry.Topic, Payload: append([]byte(nil), entry.Payload...), Priority: r.normalizePriority(entry.Priority), DeliveryAttempt: attempt, EnqueueSequence: entry.EnqueueSequence, Status: statusDispatched, DispatchedAt: r.now()}
 		session.InflightCount++
 		r.metrics.WALReplayed++
 		deferred = append(deferred, retryDispatch{identity: append([]byte(nil), session.TransportIdentity...), topic: entry.Topic, payload: append([]byte(nil), entry.Payload...)})
@@ -504,19 +579,20 @@ func (r *Router) promoteDeferredForConsumer(consumerID string) {
 		dispatched := false
 		for _, topic := range topics {
 			queue := r.directQueue[topic]
-			if len(queue) == 0 {
+			if queue == nil || len(queue.Messages) == 0 {
 				continue
 			}
-			msg := queue[0]
-			if len(queue) == 1 {
+			msg := queue.Messages[0]
+			if len(queue.Messages) == 1 {
 				delete(r.directQueue, topic)
 			} else {
-				r.directQueue[topic] = queue[1:]
+				queue.Messages = queue.Messages[1:]
+				r.directQueue[topic] = queue
 			}
 			if session.BacklogCount > 0 {
 				session.BacklogCount--
 			}
-			identity, walEntry, needsWAL := r.prepareDispatchLocked(session, msg.Topic, msg.MessageID, msg.Payload, 1)
+			identity, walEntry, needsWAL := r.prepareDispatchLocked(session, msg.Topic, msg.MessageID, msg.Payload, msg.Priority, msg.EnqueueSequence, 1)
 			if needsWAL {
 				if err := r.wal.AppendDispatched(walEntry); err != nil {
 					fmt.Printf("failed to append wal dispatch: %v\n", err)
@@ -554,7 +630,7 @@ func (r *Router) processInflightTimeouts() {
 			}
 			r.metrics.Retried++
 			r.metrics.RetryDueToTimeout++
-			r.scheduleDispatchLocked(record.Topic, record.MessageID, record.Payload, record.DeliveryAttempt, now.Add(r.deliveryTimeout), "timeout_retry")
+			r.scheduleDispatchLocked(record.Topic, record.MessageID, record.Payload, record.Priority, record.EnqueueSequence, record.DeliveryAttempt, now.Add(r.deliveryTimeout), "timeout_retry")
 			continue
 		}
 		if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
@@ -653,12 +729,12 @@ func (r *Router) heartbeatConsumer(consumerID string) {
 	}
 }
 
-func (r *Router) dispatchDirect(topic, messageID string, payload []byte) {
-	retries := r.dispatchDirectAttempt(topic, messageID, payload, 1)
+func (r *Router) dispatchDirect(topic, messageID string, payload []byte, priority string) {
+	retries := r.dispatchDirectAttempt(topic, messageID, payload, priority, 0, 1)
 	r.sendDeferred(retries)
 }
 
-func (r *Router) dispatchDirectAttempt(topic, messageID string, payload []byte, attempt int) []retryDispatch {
+func (r *Router) dispatchDirectAttempt(topic, messageID string, payload []byte, priority string, enqueueSequence uint64, attempt int) []retryDispatch {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.maxGlobalIngress > 0 && r.totalDirectLoadLocked() >= r.maxGlobalIngress {
@@ -669,11 +745,11 @@ func (r *Router) dispatchDirectAttempt(topic, messageID string, payload []byte, 
 	session := r.selectSession(topic)
 	if session == nil {
 		if messageID != "" {
-			r.enqueueDirectLocked(topic, messageID, payload)
+			r.enqueueDirectLocked(topic, messageID, payload, priority, enqueueSequence)
 		}
 		return nil
 	}
-	identity, walEntry, needsWAL := r.prepareDispatchLocked(session, topic, messageID, payload, attempt)
+	identity, walEntry, needsWAL := r.prepareDispatchLocked(session, topic, messageID, payload, priority, enqueueSequence, attempt)
 	if needsWAL {
 		if err := r.wal.AppendDispatched(walEntry); err != nil {
 			fmt.Printf("failed to append wal dispatch: %v\n", err)
@@ -684,17 +760,21 @@ func (r *Router) dispatchDirectAttempt(topic, messageID string, payload []byte, 
 	return []retryDispatch{{identity: identity, topic: topic, payload: payload}}
 }
 
-func (r *Router) scheduleDispatch(topic, messageID string, payload []byte, attempt int, deliverAt time.Time, reason string) {
+func (r *Router) scheduleDispatch(topic, messageID string, payload []byte, priority string, enqueueSequence uint64, attempt int, deliverAt time.Time, reason string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.scheduleDispatchLocked(topic, messageID, payload, attempt, deliverAt, reason)
+	r.scheduleDispatchLocked(topic, messageID, payload, priority, enqueueSequence, attempt, deliverAt, reason)
 }
-func (r *Router) scheduleDispatchLocked(topic, messageID string, payload []byte, attempt int, deliverAt time.Time, reason string) {
+func (r *Router) scheduleDispatchLocked(topic, messageID string, payload []byte, priority string, enqueueSequence uint64, attempt int, deliverAt time.Time, reason string) {
 	if messageID == "" {
 		return
 	}
+	priority = r.normalizePriority(priority)
+	if enqueueSequence == 0 {
+		enqueueSequence = r.nextEnqueueSequenceLocked()
+	}
 	r.nextScheduleSequence++
-	r.scheduledQueue = append(r.scheduledQueue, scheduledMessage{Sequence: r.nextScheduleSequence, MessageID: messageID, Topic: topic, Payload: append([]byte(nil), payload...), DeliveryAttempt: attempt, DeliverAt: deliverAt, Reason: reason})
+	r.scheduledQueue = append(r.scheduledQueue, scheduledMessage{Sequence: r.nextScheduleSequence, MessageID: messageID, Topic: topic, Payload: append([]byte(nil), payload...), Priority: priority, EnqueueSequence: enqueueSequence, DeliveryAttempt: attempt, DeliverAt: deliverAt, Reason: reason})
 	r.sortScheduledLocked()
 	r.metrics.Scheduled++
 	r.persistScheduledLocked()
@@ -717,24 +797,31 @@ func (r *Router) promoteScheduledDue() {
 		r.mu.Lock()
 		r.metrics.ScheduledPromoted++
 		r.mu.Unlock()
-		r.sendDeferred(r.dispatchDirectAttempt(entry.Topic, entry.MessageID, entry.Payload, entry.DeliveryAttempt))
+		r.sendDeferred(r.dispatchDirectAttempt(entry.Topic, entry.MessageID, entry.Payload, entry.Priority, entry.EnqueueSequence, entry.DeliveryAttempt))
 	}
 }
 
-func (r *Router) prepareDispatchLocked(session *consumerSession, topic, messageID string, payload []byte, attempt int) ([]byte, walDispatchedEntry, bool) {
+func (r *Router) prepareDispatchLocked(session *consumerSession, topic, messageID string, payload []byte, priority string, enqueueSequence uint64, attempt int) ([]byte, walDispatchedEntry, bool) {
+	priority = r.normalizePriority(priority)
+	if enqueueSequence == 0 {
+		enqueueSequence = r.nextEnqueueSequenceLocked()
+	}
 	if session.Capabilities.SupportsAck && messageID != "" {
-		r.inflight[messageID] = &inflightMessage{MessageID: messageID, ConsumerID: session.ConsumerID, SessionID: session.SessionID, Topic: topic, Payload: append([]byte(nil), payload...), DeliveryAttempt: attempt, Status: statusDispatched, DispatchedAt: r.now()}
+		r.inflight[messageID] = &inflightMessage{MessageID: messageID, ConsumerID: session.ConsumerID, SessionID: session.SessionID, Topic: topic, Payload: append([]byte(nil), payload...), Priority: priority, DeliveryAttempt: attempt, EnqueueSequence: enqueueSequence, Status: statusDispatched, DispatchedAt: r.now()}
 		session.InflightCount++
 	}
 	r.metrics.Dispatched++
 	identity := append([]byte(nil), session.TransportIdentity...)
-	walEntry := walDispatchedEntry{MessageID: messageID, Consumer: session.ConsumerID, SessionID: session.SessionID, Topic: topic, Payload: append([]byte(nil), payload...), Attempt: attempt}
+	walEntry := walDispatchedEntry{MessageID: messageID, Consumer: session.ConsumerID, SessionID: session.SessionID, Topic: topic, Payload: append([]byte(nil), payload...), Priority: priority, EnqueueSequence: enqueueSequence, Attempt: attempt}
 	needsWAL := r.wal != nil && session.Capabilities.SupportsAck && messageID != ""
 	return identity, walEntry, needsWAL
 }
-func (r *Router) enqueueDirectLocked(topic, messageID string, payload []byte) {
+func (r *Router) enqueueDirectLocked(topic, messageID string, payload []byte, priority string, enqueueSequence uint64) {
 	queue := r.directQueue[topic]
-	if r.maxPerTopicQueue > 0 && len(queue) >= r.maxPerTopicQueue {
+	if queue == nil {
+		queue = &priorityQueue{}
+	}
+	if r.maxPerTopicQueue > 0 && len(queue.Messages) >= r.maxPerTopicQueue {
 		r.metrics.Dropped++
 		fmt.Printf("{\"event\":\"direct_drop\",\"topic\":%q,\"message_id\":%q,\"reason\":\"topic_queue_full\",\"limit\":%d}\n", topic, messageID, r.maxPerTopicQueue)
 		return
@@ -747,7 +834,12 @@ func (r *Router) enqueueDirectLocked(topic, messageID string, payload []byte) {
 	r.metrics.Deferred++
 	r.metrics.Throttled++
 	r.metrics.BacklogQueued++
-	r.directQueue[topic] = append(queue, queuedDirectMessage{MessageID: messageID, Topic: topic, Payload: append([]byte(nil), payload...)})
+	if enqueueSequence == 0 {
+		enqueueSequence = r.nextEnqueueSequenceLocked()
+	}
+	queue.Messages = append(queue.Messages, queuedDirectMessage{MessageID: messageID, Topic: topic, Payload: append([]byte(nil), payload...), Priority: r.normalizePriority(priority), EnqueueSequence: enqueueSequence})
+	r.sortPriorityQueueLocked(queue)
+	r.directQueue[topic] = queue
 	for _, s := range r.directSessions {
 		if _, ok := s.Subscriptions[topic]; ok {
 			s.BacklogCount++
@@ -758,7 +850,9 @@ func (r *Router) enqueueDirectLocked(topic, messageID string, payload []byte) {
 func (r *Router) totalQueuedLocked() int {
 	total := 0
 	for _, queue := range r.directQueue {
-		total += len(queue)
+		if queue != nil {
+			total += len(queue.Messages)
+		}
 	}
 	return total
 }
@@ -851,7 +945,7 @@ func (r *Router) handleNack(messageID, consumerID, sessionID, status string) {
 			s.InflightCount--
 		}
 		r.metrics.Retried++
-		r.scheduleDispatchLocked(record.Topic, record.MessageID, record.Payload, record.DeliveryAttempt, r.now().Add(r.deliveryTimeout), "nack_retry")
+		r.scheduleDispatchLocked(record.Topic, record.MessageID, record.Payload, record.Priority, record.EnqueueSequence, record.DeliveryAttempt, r.now().Add(r.deliveryTimeout), "nack_retry")
 		r.mu.Unlock()
 		return
 	}
@@ -872,24 +966,18 @@ func (r *Router) handleNack(messageID, consumerID, sessionID, status string) {
 	r.sendDeferred(drain)
 }
 func (r *Router) drainDeferredLocked(topic string) []retryDispatch {
-	queue := r.directQueue[topic]
-	if len(queue) == 0 {
+	selectedTopic, msg, ok := r.selectDeferredForDispatchLocked(topic)
+	if !ok {
 		return nil
 	}
-	session := r.selectSession(topic)
+	session := r.selectSession(selectedTopic)
 	if session == nil {
 		return nil
-	}
-	msg := queue[0]
-	if len(queue) == 1 {
-		delete(r.directQueue, topic)
-	} else {
-		r.directQueue[topic] = queue[1:]
 	}
 	if session.BacklogCount > 0 {
 		session.BacklogCount--
 	}
-	identity, walEntry, needsWAL := r.prepareDispatchLocked(session, msg.Topic, msg.MessageID, msg.Payload, 1)
+	identity, walEntry, needsWAL := r.prepareDispatchLocked(session, msg.Topic, msg.MessageID, msg.Payload, msg.Priority, msg.EnqueueSequence, 1)
 	if needsWAL {
 		if err := r.wal.AppendDispatched(walEntry); err != nil {
 			fmt.Printf("failed to append wal dispatch: %v\n", err)
@@ -898,6 +986,117 @@ func (r *Router) drainDeferredLocked(topic string) []retryDispatch {
 		}
 	}
 	return []retryDispatch{{identity: identity, topic: msg.Topic, payload: msg.Payload}}
+}
+
+func (r *Router) selectDeferredForDispatchLocked(preferredTopic string) (string, queuedDirectMessage, bool) {
+	candidates := r.subscribedTopicsLocked(preferredTopic)
+	if len(candidates) == 0 {
+		return "", queuedDirectMessage{}, false
+	}
+	var (
+		bestTopic string
+		bestMsg   queuedDirectMessage
+		found     bool
+		bestScore int
+	)
+	for _, topic := range candidates {
+		queue := r.directQueue[topic]
+		if queue == nil || len(queue.Messages) == 0 {
+			continue
+		}
+		msg := queue.Messages[0]
+		score := r.priorityScoreLocked(msg)
+		if !found || score > bestScore || (score == bestScore && msg.EnqueueSequence < bestMsg.EnqueueSequence) || (score == bestScore && msg.EnqueueSequence == bestMsg.EnqueueSequence && topic < bestTopic) {
+			bestTopic, bestMsg, bestScore, found = topic, msg, score, true
+		}
+	}
+	if !found {
+		return "", queuedDirectMessage{}, false
+	}
+	queue := r.directQueue[bestTopic]
+	if len(queue.Messages) == 1 {
+		delete(r.directQueue, bestTopic)
+	} else {
+		queue.Messages = queue.Messages[1:]
+		r.directQueue[bestTopic] = queue
+	}
+	return bestTopic, bestMsg, true
+}
+
+func (r *Router) subscribedTopicsLocked(preferredTopic string) []string {
+	topicSet := map[string]struct{}{}
+	if preferredTopic != "" {
+		topicSet[preferredTopic] = struct{}{}
+	}
+	for _, session := range r.directSessions {
+		if !isSessionLive(session) || session.InflightCount >= session.MaxInflight {
+			continue
+		}
+		for topic := range session.Subscriptions {
+			topicSet[topic] = struct{}{}
+		}
+	}
+	topics := make([]string, 0, len(topicSet))
+	for topic := range topicSet {
+		topics = append(topics, topic)
+	}
+	sort.Strings(topics)
+	return topics
+}
+
+func (r *Router) nextEnqueueSequenceLocked() uint64 {
+	r.nextQueueSequence++
+	return r.nextQueueSequence
+}
+
+func (r *Router) normalizePriority(priority string) string {
+	return r.normalizePriorityLocked(priority)
+}
+
+func (r *Router) normalizePriorityLocked(priority string) string {
+	priority = strings.ToLower(strings.TrimSpace(priority))
+	if priority != "" {
+		if _, ok := r.priorityRank[priority]; ok {
+			return priority
+		}
+	}
+	if len(r.priorityClasses) == 0 {
+		return "normal"
+	}
+	for _, candidate := range r.priorityClasses {
+		if candidate == "normal" {
+			return candidate
+		}
+	}
+	return r.priorityClasses[len(r.priorityClasses)/2]
+}
+
+func (r *Router) priorityScoreLocked(msg queuedDirectMessage) int {
+	priority := r.normalizePriorityLocked(msg.Priority)
+	score := r.priorityWeights[priority]
+	if !r.priorityPreemption || r.priorityBoostThreshold <= 0 || r.priorityBoostOffset <= 0 {
+		return score
+	}
+	if msg.EnqueueSequence == 0 || r.nextQueueSequence <= msg.EnqueueSequence {
+		return score
+	}
+	age := int((r.nextQueueSequence - msg.EnqueueSequence) / uint64(r.priorityBoostThreshold))
+	return score + (age * r.priorityBoostOffset)
+}
+
+func (r *Router) sortPriorityQueueLocked(queue *priorityQueue) {
+	if queue == nil {
+		return
+	}
+	sort.SliceStable(queue.Messages, func(i, j int) bool {
+		left, right := queue.Messages[i], queue.Messages[j]
+		leftRank := r.priorityRank[r.normalizePriorityLocked(left.Priority)]
+		rightRank := r.priorityRank[r.normalizePriorityLocked(right.Priority)]
+		if leftRank != rightRank {
+			return leftRank < rightRank
+		}
+		return left.EnqueueSequence < right.EnqueueSequence
+	})
 }
 func (r *Router) sendDeferred(retries []retryDispatch) {
 	for _, retry := range retries {

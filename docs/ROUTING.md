@@ -28,6 +28,21 @@ Envelope → Topic → RouteStore lookup → Route resolution → Delivery decis
 The routing subsystem does not define raw transport behavior; transport selection
 belongs to delivery policy and the outbound delivery layer.
 
+### 2.1 Direct-Delivery Priority Policy
+
+Direct delivery MAY apply a normalized priority class after route resolution and before broker dispatch.
+
+The reference broker accepts the configured classes case-insensitively, normalizes them to canonical tokens, and dispatches backlog in this order by default:
+
+1. `urgent`
+2. `high`
+3. `normal`
+4. `low`
+
+Tie-breaks inside the same class MUST be deterministic. The reference implementation uses a monotonically increasing enqueue sequence, then topic name as the final stable tie-break when two queues become otherwise equivalent.
+
+When starvation prevention is enabled, the broker MAY age old backlog entries using deterministic weighting so lower-priority work is eventually selected without breaking replayability.
+
 ## 3. RouteStore Role
 
 The RouteStore is the broker’s route index.
@@ -251,6 +266,8 @@ Delivery policy determines whether the result is:
 - all matching destinations
 - a bridge target
 - a system channel
+
+For direct delivery, destination selection happens first and backlog dispatch policy is applied second. This means route precedence and direct-delivery priority are separate concerns: route precedence selects *where* the event can go, while direct-delivery priority selects *which queued event* is dispatched next for an eligible consumer.
 
 ### 12.1 Direct Route
 

@@ -10,10 +10,10 @@ func TestFileWALAppendReplayAndCommit(t *testing.T) {
 	tmp := t.TempDir()
 	w := NewFileWAL(filepath.Join(tmp, "delivery.wal"))
 
-	if err := w.AppendDispatched(walDispatchedEntry{MessageID: "msg-1", Consumer: "c1", SessionID: "s1", Topic: "orders.created", Payload: []byte("p1"), Attempt: 1}); err != nil {
+	if err := w.AppendDispatched(walDispatchedEntry{MessageID: "msg-1", Consumer: "c1", SessionID: "s1", Topic: "orders.created", Payload: []byte("p1"), Priority: "normal", EnqueueSequence: 1, Attempt: 1}); err != nil {
 		t.Fatalf("append dispatched: %v", err)
 	}
-	if err := w.AppendDispatched(walDispatchedEntry{MessageID: "msg-2", Consumer: "c1", SessionID: "s1", Topic: "orders.created", Payload: []byte("p2"), Attempt: 1}); err != nil {
+	if err := w.AppendDispatched(walDispatchedEntry{MessageID: "msg-2", Consumer: "c1", SessionID: "s1", Topic: "orders.created", Payload: []byte("p2"), Priority: "high", EnqueueSequence: 2, Attempt: 1}); err != nil {
 		t.Fatalf("append dispatched: %v", err)
 	}
 	if err := w.AppendCommitted("msg-1"); err != nil {
@@ -30,13 +30,16 @@ func TestFileWALAppendReplayAndCommit(t *testing.T) {
 	if entries[0].MessageID != "msg-2" {
 		t.Fatalf("expected msg-2 replayed, got %s", entries[0].MessageID)
 	}
+	if entries[0].Priority != "high" || entries[0].EnqueueSequence != 2 {
+		t.Fatalf("expected priority metadata preserved, got %#v", entries[0])
+	}
 }
 
 func TestFileWALReplaySkipsDeadLettered(t *testing.T) {
 	tmp := t.TempDir()
 	w := NewFileWAL(filepath.Join(tmp, "delivery.wal"))
 
-	if err := w.AppendDispatched(walDispatchedEntry{MessageID: "msg-dlq", Consumer: "c1", SessionID: "s1", Topic: "orders.created", Payload: []byte("p1"), Attempt: 2}); err != nil {
+	if err := w.AppendDispatched(walDispatchedEntry{MessageID: "msg-dlq", Consumer: "c1", SessionID: "s1", Topic: "orders.created", Payload: []byte("p1"), Priority: "low", EnqueueSequence: 7, Attempt: 2}); err != nil {
 		t.Fatalf("append dispatched: %v", err)
 	}
 	if err := w.AppendDeadLettered("msg-dlq"); err != nil {
