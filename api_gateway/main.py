@@ -1,3 +1,4 @@
+import asyncio
 from textwrap import dedent
 from typing import Any, Dict, List, Optional
 
@@ -83,9 +84,13 @@ class ManualDeadLetterRequest(AdminMutationMetadata):
     reason: str = Field(default="manual_admin_action", min_length=1)
 
 
-DLQ_PATH = Path(os.getenv("DLQ_STORE_PATH", os.getenv("WAL_PATH", "./data/direct_delivery.wal") + ".dlq"))
-SCHEDULED_PATH = Path(os.getenv("SCHEDULED_STORE_PATH", os.getenv("WAL_PATH", "./data/direct_delivery.wal") + ".scheduled"))
-AUDIT_PATH = Path(os.getenv("AUDIT_STORE_PATH", os.getenv("WAL_PATH", "./data/direct_delivery.wal") + ".audit"))
+WAL_PATH = os.getenv("WAL_PATH", "./data/direct_delivery.wal")
+ROUTE_CATALOG_PATH = Path(os.getenv("ROUTE_CATALOG_PATH", "./data/routes.catalog.json"))
+SESSION_SNAPSHOT_PATH = Path(os.getenv("SESSION_SNAPSHOT_PATH", WAL_PATH + ".sessions"))
+DLQ_PATH = Path(os.getenv("DLQ_STORE_PATH", WAL_PATH + ".dlq"))
+SCHEDULED_PATH = Path(os.getenv("SCHEDULED_STORE_PATH", WAL_PATH + ".scheduled"))
+AUDIT_PATH = Path(os.getenv("AUDIT_STORE_PATH", WAL_PATH + ".audit"))
+WAL_SEGMENTS_PATH = Path(os.getenv("WAL_SEGMENTS_PATH", WAL_PATH + ".segments"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 
@@ -98,6 +103,16 @@ def _load_json(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {}
     return json.loads(path.read_text() or "{}")
+
+
+def _load_json_list(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    raw = path.read_text().strip()
+    if not raw:
+        return []
+    payload = json.loads(raw)
+    return payload if isinstance(payload, list) else []
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -166,6 +181,192 @@ def _query_audit(message_id: Optional[str] = None, actor: Optional[str] = None, 
         filtered.append(event)
     filtered.sort(key=lambda item: (item.get("timestamp", ""), item.get("event_id", "")))
     return filtered
+
+
+def _iso_to_epoch(value: Optional[str]) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _load_route_catalog() -> Dict[str, Any]:
+    if not ROUTE_CATALOG_PATH.exists():
+        return {"version": 1, "routes": []}
+    raw = ROUTE_CATALOG_PATH.read_text().strip()
+    if not raw:
+        return {"version": 1, "routes": []}
+    payload = json.loads(raw)
+    routes = payload.get("routes", [])
+    routes.sort(key=lambda item: (
+        item.get("tenant", ""),
+        item.get("pattern", ""),
+        item.get("destination_id", ""),
+        item.get("route_type", ""),
+    ))
+    return {"version": payload.get("version", 1), "routes": routes}
+
+
+def _load_session_snapshots() -> List[Dict[str, Any]]:
+    snapshots = _load_json(SESSION_SNAPSHOT_PATH)
+    out: List[Dict[str, Any]] = []
+    for consumer_id, snapshot in snapshots.items():
+        item = dict(snapshot)
+        item["consumer_id"] = item.get("consumer_id", consumer_id)
+        last_heartbeat = item.get("last_heartbeat")
+        age_seconds = max(0.0, datetime.now(timezone.utc).timestamp() - _iso_to_epoch(last_heartbeat)) if last_heartbeat else None
+        if item.get("resumable_pending"):
+            health = "resumable_pending"
+        elif age_seconds is None:
+            health = "unknown"
+        elif age_seconds <= 30:
+            health = "healthy"
+        elif age_seconds <= 120:
+            health = "degraded"
+        else:
+            health = "stale"
+        item["heartbeat_age_seconds"] = age_seconds
+        item["health"] = health
+        out.append(item)
+    out.sort(key=lambda item: item.get("consumer_id", ""))
+    return out
+
+
+def _load_scheduled() -> List[Dict[str, Any]]:
+    entries = _load_json_list(SCHEDULED_PATH)
+    for entry in entries:
+        entry["deliver_at_epoch"] = _iso_to_epoch(entry.get("deliver_at"))
+    entries.sort(key=lambda item: (item.get("deliver_at_epoch", 0), item.get("sequence", 0)))
+    return entries
+
+
+def _load_wal_records() -> List[Dict[str, Any]]:
+    if not WAL_SEGMENTS_PATH.exists():
+        return []
+    records: List[Dict[str, Any]] = []
+    segment_files = sorted(path for path in WAL_SEGMENTS_PATH.iterdir() if path.is_file() and not path.name.endswith(".closed"))
+    for segment_path in segment_files:
+        for line_no, line in enumerate(segment_path.read_text().splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            record["_segment"] = segment_path.name
+            record["_line"] = line_no
+            record["_observed_at"] = datetime.fromtimestamp(segment_path.stat().st_mtime, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+            records.append(record)
+    return records
+
+
+def _wal_inflight_snapshot() -> Dict[str, Any]:
+    pending: Dict[str, Dict[str, Any]] = {}
+    for record in _load_wal_records():
+        message_id = record.get("message_id")
+        if not message_id:
+            continue
+        if record.get("type") == "dispatched":
+            pending[message_id] = record
+        elif record.get("type") in {"committed", "dead_lettered"}:
+            pending.pop(message_id, None)
+    by_consumer: Dict[str, int] = {}
+    by_topic: Dict[str, int] = {}
+    for record in pending.values():
+        consumer_id = record.get("consumer_id", "")
+        topic = record.get("topic", "")
+        by_consumer[consumer_id] = by_consumer.get(consumer_id, 0) + 1
+        by_topic[topic] = by_topic.get(topic, 0) + 1
+    return {
+        "count": len(pending),
+        "messages": sorted(pending.values(), key=lambda item: (item.get("consumer_id", ""), item.get("topic", ""), item.get("message_id", ""))),
+        "by_consumer": dict(sorted(by_consumer.items())),
+        "by_topic": dict(sorted(by_topic.items())),
+    }
+
+
+def _backlog_snapshot() -> Dict[str, Any]:
+    inflight = _wal_inflight_snapshot()
+    scheduled = _load_scheduled()
+    dead_letters = _list_dlq()
+    sessions = _load_session_snapshots()
+    oldest_scheduled_at = scheduled[0].get("deliver_at") if scheduled else None
+    backlog_ratio = (
+        (inflight["count"] + len(scheduled) + len(dead_letters)) / max(len(sessions), 1)
+        if (inflight["count"] + len(scheduled) + len(dead_letters)) > 0
+        else 0
+    )
+    return {
+        "direct_inflight": inflight["count"],
+        "deferred_total": len(scheduled),
+        "dead_letter_total": len(dead_letters),
+        "active_sessions": len(sessions),
+        "oldest_deferred_at": oldest_scheduled_at,
+        "backlog_per_session": round(backlog_ratio, 2),
+        "pressure": "high" if len(dead_letters) > 0 or len(scheduled) >= max(10, len(sessions) * 2) else "elevated" if len(scheduled) > 0 or inflight["count"] > len(sessions) else "nominal",
+        "inflight_breakdown": inflight,
+    }
+
+
+def _recent_delivery_transitions(limit: int = 12) -> List[Dict[str, Any]]:
+    transitions: List[Dict[str, Any]] = []
+    for record in _list_dlq():
+        transitions.append({
+            "timestamp": record.get("dead_lettered_at"),
+            "kind": "dead_lettered",
+            "message_id": record.get("message_id"),
+            "consumer_id": record.get("consumer_id"),
+            "topic": record.get("topic"),
+            "reason": record.get("reason"),
+            "detail": "Message moved into dead-letter inventory",
+        })
+    for entry in _load_scheduled():
+        transitions.append({
+            "timestamp": entry.get("deliver_at"),
+            "kind": entry.get("reason", "scheduled"),
+            "message_id": entry.get("message_id"),
+            "consumer_id": entry.get("consumer_id"),
+            "topic": entry.get("topic"),
+            "reason": entry.get("reason"),
+            "detail": "Message queued for deferred delivery or replay",
+        })
+    for event in _load_audit():
+        transitions.append({
+            "timestamp": event.get("timestamp"),
+            "kind": event.get("operation"),
+            "message_id": ",".join(event.get("target_message_ids", [])[:3]),
+            "consumer_id": event.get("actor"),
+            "topic": "",
+            "reason": event.get("requested_reason"),
+            "detail": f"Admin action by {event.get('actor', 'unknown')}",
+        })
+    transitions = [item for item in transitions if item.get("timestamp")]
+    transitions.sort(key=lambda item: (_iso_to_epoch(item.get("timestamp")), item.get("message_id", "")), reverse=True)
+    return transitions[:limit]
+
+
+def _broker_admin_snapshot() -> Dict[str, Any]:
+    route_catalog = _load_route_catalog()
+    sessions = _load_session_snapshots()
+    backlog = _backlog_snapshot()
+    dead_letters = _list_dlq()
+    deferred = _load_scheduled()
+    topology: Dict[str, List[Dict[str, Any]]] = {}
+    for route in route_catalog["routes"]:
+        topology.setdefault(route.get("tenant", "default"), []).append(route)
+    return {
+        "generated_at": _utcnow(),
+        "route_catalog": route_catalog,
+        "route_topology": [{"tenant": tenant, "routes": routes} for tenant, routes in sorted(topology.items())],
+        "consumer_sessions": sessions,
+        "backlog": backlog,
+        "dead_letters": {"count": len(dead_letters), "records": dead_letters},
+        "deferred_queue": {"count": len(deferred), "entries": deferred},
+        "recent_transitions": _recent_delivery_transitions(),
+    }
 
 
 def _list_dlq(consumer_id: Optional[str] = None, topic: Optional[str] = None, reason: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -312,9 +513,270 @@ HOME_PAGE = dedent(
 )
 
 
+BROKER_ADMIN_PAGE = dedent(
+    """
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Tachyon Broker Admin</title>
+        <style>
+          :root {
+            color-scheme: dark;
+            --bg: #071018;
+            --panel: #0d1824;
+            --panel-2: #132233;
+            --border: rgba(111, 163, 255, .18);
+            --text: #e8eef9;
+            --muted: #91a4be;
+            --accent: #7dd3fc;
+            --ok: #34d399;
+            --warn: #f59e0b;
+            --bad: #f87171;
+          }
+          * { box-sizing: border-box; }
+          body { margin: 0; font-family: Inter, system-ui, sans-serif; background: linear-gradient(180deg, #08131e, #050b12); color: var(--text); }
+          main { max-width: 1360px; margin: 0 auto; padding: 24px; display: grid; gap: 18px; }
+          .banner, .card { border: 1px solid var(--border); border-radius: 20px; background: rgba(13, 24, 36, .95); box-shadow: 0 18px 40px rgba(0,0,0,.24); }
+          .banner { padding: 24px; display: grid; gap: 8px; }
+          .banner h1 { margin: 0; font-size: clamp(2rem, 5vw, 3rem); }
+          .subtle { color: var(--muted); }
+          .mono { font-family: ui-monospace, SFMono-Regular, monospace; }
+          .stats, .two-up, .triple { display: grid; gap: 16px; }
+          .stats { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+          .two-up { grid-template-columns: 1.3fr .7fr; }
+          .triple { grid-template-columns: 1fr 1fr 1fr; }
+          .card { padding: 18px; overflow: hidden; }
+          h2, h3 { margin: 0 0 12px; }
+          .metric { font-size: 2rem; font-weight: 700; }
+          .table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+          .table th, .table td { padding: 10px 8px; border-top: 1px solid rgba(255,255,255,.06); text-align: left; vertical-align: top; }
+          .table th { color: var(--muted); font-weight: 600; }
+          .pill { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 4px 10px; font-size: .8rem; background: rgba(125, 211, 252, .12); color: var(--accent); }
+          .health-healthy { color: var(--ok); }
+          .health-degraded, .pressure-elevated { color: var(--warn); }
+          .health-stale, .health-resumable_pending, .pressure-high { color: var(--bad); }
+          .route-list, .transition-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+          .route-list li, .transition-list li { background: var(--panel-2); border-radius: 14px; padding: 12px; border: 1px solid rgba(255,255,255,.05); }
+          form { display: grid; gap: 10px; }
+          input, textarea { width: 100%; border-radius: 10px; border: 1px solid rgba(255,255,255,.12); background: #09111a; color: var(--text); padding: 10px 12px; }
+          button { border: 0; border-radius: 12px; padding: 10px 14px; font-weight: 700; cursor: pointer; background: linear-gradient(90deg, #0891b2, #2563eb); color: white; }
+          button.warn { background: linear-gradient(90deg, #d97706, #dc2626); }
+          .result { min-height: 22px; color: var(--muted); }
+          .split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+          @media (max-width: 960px) { .two-up, .triple, .split { grid-template-columns: 1fr; } }
+        </style>
+      </head>
+      <body>
+        <main>
+          <section class="banner">
+            <span class="pill">Broker-only operational/admin surface</span>
+            <h1>Tachyon broker state</h1>
+            <div class="subtle">Separate from gateway message traffic. Data comes from the route catalog, WAL snapshots, deferred queues, dead-letter inventory, and audit trail.</div>
+          </section>
+
+          <section class="stats" id="stats"></section>
+
+          <section class="two-up">
+            <article class="card">
+              <h2>Route topology</h2>
+              <div id="route-topology"></div>
+            </article>
+            <article class="card">
+              <h2>Direct-session health</h2>
+              <table class="table">
+                <thead><tr><th>Consumer</th><th>Session</th><th>Health</th><th>Heartbeat</th><th>Subscriptions</th></tr></thead>
+                <tbody id="session-rows"></tbody>
+              </table>
+            </article>
+          </section>
+
+          <section class="triple">
+            <article class="card">
+              <h3>Inflight counts</h3>
+              <div id="inflight-breakdown" class="subtle">Loading…</div>
+            </article>
+            <article class="card">
+              <h3>Deferred queue</h3>
+              <table class="table"><thead><tr><th>Message</th><th>Topic</th><th>Deliver at</th></tr></thead><tbody id="deferred-rows"></tbody></table>
+            </article>
+            <article class="card">
+              <h3>Dead-letter inventory</h3>
+              <table class="table"><thead><tr><th>Message</th><th>Consumer</th><th>Reason</th></tr></thead><tbody id="dlq-rows"></tbody></table>
+            </article>
+          </section>
+
+          <section class="two-up">
+            <article class="card">
+              <h2>Recent delivery transitions</h2>
+              <ul class="transition-list" id="transition-list"></ul>
+            </article>
+            <article class="card">
+              <h2>Guarded controls</h2>
+              <div class="subtle">Replay and purge actions stay on the broker-admin API and require the admin token header. Audit entries are appended for every successful mutation.</div>
+              <div class="split" style="margin-top:14px;">
+                <form id="replay-form">
+                  <h3>Replay dead letters</h3>
+                  <input name="token" placeholder="Admin token" />
+                  <input name="actor" placeholder="Actor" value="broker-admin-ui" />
+                  <input name="message_ids" placeholder="Message IDs (comma-separated)" />
+                  <input name="target_consumer_id" placeholder="Target consumer ID" />
+                  <input name="target_topic" placeholder="Target topic" />
+                  <textarea name="requested_reason" placeholder="Reason"></textarea>
+                  <input name="confirm" value="REPLAY" />
+                  <button type="submit">Replay</button>
+                  <div class="result" id="replay-result"></div>
+                </form>
+                <form id="purge-form">
+                  <h3>Purge dead letters</h3>
+                  <input name="token" placeholder="Admin token" />
+                  <input name="actor" placeholder="Actor" value="broker-admin-ui" />
+                  <input name="message_ids" placeholder="Message IDs (comma-separated)" />
+                  <textarea name="requested_reason" placeholder="Reason"></textarea>
+                  <input name="confirm" value="PURGE" />
+                  <button type="submit" class="warn">Purge</button>
+                  <div class="result" id="purge-result"></div>
+                </form>
+              </div>
+            </article>
+          </section>
+        </main>
+        <script>
+          let brokerSocket;
+
+          function setResult(id, payload) {
+            document.getElementById(id).textContent = typeof payload === 'string' ? payload : JSON.stringify(payload);
+          }
+
+          async function postAction(path, form, resultId) {
+            const data = new FormData(form);
+            const token = data.get('token') || '';
+            const messageIDs = String(data.get('message_ids') || '').split(',').map(v => v.trim()).filter(Boolean);
+            const body = {
+              actor: data.get('actor'),
+              requested_reason: data.get('requested_reason'),
+              confirm: data.get('confirm'),
+              message_ids: messageIDs,
+            };
+            if (path.includes('replay')) {
+              body.target_consumer_id = data.get('target_consumer_id');
+              body.target_topic = data.get('target_topic');
+            }
+            const response = await fetch(path, {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json', 'X-Admin-Token': token},
+              body: JSON.stringify(body),
+            });
+            const payload = await response.json();
+            setResult(resultId, payload.detail || payload);
+            if (response.ok) {
+              refreshDashboard();
+            }
+          }
+
+          function renderStats(snapshot) {
+            const backlog = snapshot.backlog;
+            const stats = [
+              ['Routes', snapshot.route_catalog.routes.length],
+              ['Sessions', snapshot.consumer_sessions.length],
+              ['Inflight', backlog.direct_inflight],
+              ['Deferred', backlog.deferred_total],
+              ['Dead letters', backlog.dead_letter_total],
+              ['Pressure', backlog.pressure],
+            ];
+            document.getElementById('stats').innerHTML = stats.map(([label, value]) => `<article class="card"><div class="subtle">${label}</div><div class="metric pressure-${String(value).toLowerCase()}">${value}</div></article>`).join('');
+          }
+
+          function renderTopology(snapshot) {
+            const host = document.getElementById('route-topology');
+            const groups = snapshot.route_topology.length ? snapshot.route_topology : [{tenant: 'default', routes: []}];
+            host.innerHTML = groups.map(group => `
+              <div style="margin-bottom:14px;">
+                <div class="pill">${group.tenant}</div>
+                <ul class="route-list">
+                  ${group.routes.map(route => `<li><strong>${route.pattern}</strong><br/><span class="subtle">→ ${route.destination_id} · ${route.route_type} · enabled=${route.enabled}</span></li>`).join('') || '<li class="subtle">No routes loaded.</li>'}
+                </ul>
+              </div>`).join('');
+          }
+
+          function renderSessions(snapshot) {
+            const rows = snapshot.consumer_sessions.map(item => `
+              <tr>
+                <td>${item.consumer_id}</td>
+                <td class="mono">${item.session_id || '—'}</td>
+                <td class="health-${item.health}">${item.health}</td>
+                <td>${item.last_heartbeat || '—'}</td>
+                <td>${(item.subscriptions || []).join(', ') || '—'}</td>
+              </tr>`).join('');
+            document.getElementById('session-rows').innerHTML = rows || '<tr><td colspan="5" class="subtle">No resumable session snapshots present.</td></tr>';
+          }
+
+          function renderBreakdown(snapshot) {
+            const inflight = snapshot.backlog.inflight_breakdown;
+            const byConsumer = Object.entries(inflight.by_consumer || {}).map(([key, value]) => `${key || 'unassigned'}=${value}`).join(', ');
+            const byTopic = Object.entries(inflight.by_topic || {}).map(([key, value]) => `${key}=${value}`).join(', ');
+            document.getElementById('inflight-breakdown').innerHTML = `
+              <div><strong>Total:</strong> ${inflight.count}</div>
+              <div><strong>By consumer:</strong> ${byConsumer || 'none'}</div>
+              <div><strong>By topic:</strong> ${byTopic || 'none'}</div>
+            `;
+
+            document.getElementById('deferred-rows').innerHTML = snapshot.deferred_queue.entries.slice(0, 8).map(item => `
+              <tr><td class="mono">${item.message_id}</td><td>${item.topic}</td><td>${item.deliver_at || '—'}</td></tr>`).join('') || '<tr><td colspan="3" class="subtle">No deferred messages.</td></tr>';
+
+            document.getElementById('dlq-rows').innerHTML = snapshot.dead_letters.records.slice(0, 8).map(item => `
+              <tr><td class="mono">${item.message_id}</td><td>${item.consumer_id || '—'}</td><td>${item.reason || '—'}</td></tr>`).join('') || '<tr><td colspan="3" class="subtle">No dead-letter inventory.</td></tr>';
+          }
+
+          function renderTransitions(snapshot) {
+            document.getElementById('transition-list').innerHTML = snapshot.recent_transitions.map(item => `
+              <li><strong>${item.kind}</strong> <span class="mono">${item.message_id || '—'}</span><br/><span class="subtle">${item.timestamp} · ${item.detail}${item.reason ? ` · ${item.reason}` : ''}</span></li>`).join('') || '<li class="subtle">No recent transitions.</li>';
+          }
+
+          async function refreshDashboard() {
+            const response = await fetch('/api/broker-admin/overview');
+            const snapshot = await response.json();
+            renderStats(snapshot);
+            renderTopology(snapshot);
+            renderSessions(snapshot);
+            renderBreakdown(snapshot);
+            renderTransitions(snapshot);
+          }
+
+          function connectSocket() {
+            brokerSocket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/broker-admin`);
+            brokerSocket.onmessage = () => refreshDashboard();
+            brokerSocket.onclose = () => setTimeout(connectSocket, 3000);
+          }
+
+          document.getElementById('replay-form').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            await postAction('/api/broker-admin/actions/replay', event.target, 'replay-result');
+          });
+          document.getElementById('purge-form').addEventListener('submit', async (event) => {
+            event.preventDefault();
+            await postAction('/api/broker-admin/actions/purge', event.target, 'purge-result');
+          });
+
+          refreshDashboard();
+          connectSocket();
+          setInterval(refreshDashboard, 10000);
+        </script>
+      </body>
+    </html>
+    """
+)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def root() -> HTMLResponse:
     return HTMLResponse(HOME_PAGE)
+
+
+@app.get("/broker-admin", response_class=HTMLResponse)
+async def broker_admin_home() -> HTMLResponse:
+    return HTMLResponse(BROKER_ADMIN_PAGE)
 
 
 @app.get("/api/system/overview")
@@ -347,6 +809,45 @@ async def load_contract(request: ContractLoadRequest) -> Dict[str, Any]:
 async def publish_alert(alert: SystemAlert) -> Dict[str, str]:
     await bus.emit("SYSTEM_ALERT", alert.model_dump())
     return {"status": "Alert published"}
+
+
+@app.get("/api/broker-admin/overview")
+async def broker_admin_overview() -> Dict[str, Any]:
+    return _broker_admin_snapshot()
+
+
+@app.get("/api/broker-admin/routes")
+async def broker_admin_routes() -> Dict[str, Any]:
+    return _load_route_catalog()
+
+
+@app.get("/api/broker-admin/sessions")
+async def broker_admin_sessions() -> Dict[str, Any]:
+    sessions = _load_session_snapshots()
+    return {"count": len(sessions), "sessions": sessions}
+
+
+@app.get("/api/broker-admin/backlog")
+async def broker_admin_backlog() -> Dict[str, Any]:
+    return _backlog_snapshot()
+
+
+@app.get("/api/broker-admin/transitions")
+async def broker_admin_transitions(limit: int = 12) -> Dict[str, Any]:
+    items = _recent_delivery_transitions(limit=max(1, min(limit, 100)))
+    return {"count": len(items), "transitions": items}
+
+
+@app.get("/api/broker-admin/dead-letters")
+async def broker_admin_dead_letters(consumer_id: Optional[str] = None, topic: Optional[str] = None, reason: Optional[str] = None) -> Dict[str, Any]:
+    records = _list_dlq(consumer_id=consumer_id, topic=topic, reason=reason)
+    return {"count": len(records), "records": records}
+
+
+@app.get("/api/broker-admin/deferred")
+async def broker_admin_deferred() -> Dict[str, Any]:
+    entries = _load_scheduled()
+    return {"count": len(entries), "entries": entries}
 
 
 @app.post("/api/genesis/mint")
@@ -409,6 +910,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         await bus.unsubscribe("CONTRACT_LOADED", contract_handler)
 
 
+@app.websocket("/ws/broker-admin")
+async def broker_admin_websocket(websocket: WebSocket) -> None:
+    await websocket.accept()
+    try:
+        while True:
+            await websocket.send_json({"type": "broker_admin_snapshot", "snapshot": _broker_admin_snapshot()})
+            await asyncio.sleep(5)
+    except WebSocketDisconnect:
+        print("🔌 Broker admin dashboard disconnected from /ws/broker-admin")
+    except Exception:
+        await websocket.close()
+
+
 
 
 @app.get("/api/admin/dlq/records")
@@ -427,6 +941,11 @@ async def inspect_dead_letter(message_id: str, x_admin_token: Optional[str] = He
     record = dict(records[message_id])
     record["message_id"] = message_id
     return record
+
+
+@app.post("/api/broker-admin/actions/replay")
+async def broker_admin_replay_dead_letters(request: DLQReplayRequest, x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    return await replay_dead_letters(request, x_admin_token)
 
 
 @app.post("/api/admin/dlq/replay")
@@ -506,6 +1025,11 @@ async def purge_dead_letters(request: DLQPurgeRequest, x_admin_token: Optional[s
     return result
 
 
+@app.post("/api/broker-admin/actions/purge")
+async def broker_admin_purge_dead_letters(request: DLQPurgeRequest, x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    return await purge_dead_letters(request, x_admin_token)
+
+
 @app.post("/api/admin/dlq/dead-letter")
 async def dead_letter_message(request: ManualDeadLetterRequest, x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
     _admin_guard(x_admin_token)
@@ -536,6 +1060,11 @@ async def list_audit_events(message_id: Optional[str] = None, actor: Optional[st
     _admin_guard(x_admin_token)
     events = _query_audit(message_id=message_id, actor=actor, start=start, end=end)
     return {"count": len(events), "events": events}
+
+
+@app.get("/api/broker-admin/audit/events")
+async def broker_admin_audit_events(message_id: Optional[str] = None, actor: Optional[str] = None, start: Optional[str] = None, end: Optional[str] = None, x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    return await list_audit_events(message_id=message_id, actor=actor, start=start, end=end, x_admin_token=x_admin_token)
 
 
 if __name__ == "__main__":
