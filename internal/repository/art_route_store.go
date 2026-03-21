@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
+
+	"github.com/aetherbus/aetherbus-tachyon/internal/exporter"
 
 	art "github.com/plar/go-adaptive-radix-tree"
 
@@ -13,10 +16,12 @@ import (
 // ART_RouteStore is a thread-safe, high-performance routing table using Adaptive Radix Tree.
 // It implements the domain.RouteStore interface.
 type ART_RouteStore struct {
-	tree    art.Tree
-	routes  map[string]domain.Route
-	catalog *FileRouteCatalog
-	mu      sync.RWMutex
+	tree      art.Tree
+	routes    map[string]domain.Route
+	catalog   *FileRouteCatalog
+	exporter  exporter.Exporter
+	exportSeq uint64
+	mu        sync.RWMutex
 }
 
 // NewART_RouteStore creates a new ART_RouteStore.
@@ -31,6 +36,12 @@ func NewART_RouteStoreWithCatalog(catalog *FileRouteCatalog) *ART_RouteStore {
 		routes:  make(map[string]domain.Route),
 		catalog: catalog,
 	}
+}
+
+func (r *ART_RouteStore) SetExporter(ex exporter.Exporter) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.exporter = ex
 }
 
 // AddRoute adds a new direct route to the table.
@@ -53,7 +64,11 @@ func (r *ART_RouteStore) UpsertRoute(route domain.Route) error {
 	key := routeIdentity(route)
 	r.routes[key] = route
 	r.rebuildTreeLocked()
-	return r.persistLocked()
+	if err := r.persistLocked(); err != nil {
+		return err
+	}
+	r.emitRouteEventLocked("upsert", route)
+	return nil
 }
 
 // RemoveRoute removes an exact route identity from the table.
@@ -73,7 +88,11 @@ func (r *ART_RouteStore) RemoveRoute(key domain.RouteKey, destNodeID string) err
 	}
 
 	r.rebuildTreeLocked()
-	return r.persistLocked()
+	if err := r.persistLocked(); err != nil {
+		return err
+	}
+	r.emitRouteEventLocked("remove", domain.Route{Pattern: key.Topic, DestinationID: destNodeID, RouteType: "direct", Enabled: false, Tenant: key.TenantID})
+	return nil
 }
 
 // Match finds the appropriate destination node ID for a given topic.
@@ -115,6 +134,9 @@ func (r *ART_RouteStore) Restore(snapshot domain.RouteCatalogSnapshot) error {
 		r.routes[routeIdentity(route)] = route
 	}
 	r.rebuildTreeLocked()
+	for _, route := range snapshot.Routes {
+		r.emitRouteEventLocked("replay", route)
+	}
 	return nil
 }
 
@@ -152,4 +174,25 @@ func routeIdentity(route domain.Route) string {
 
 func partitionedTopicKey(tenantID, topic string) string {
 	return fmt.Sprintf("%s\x00%s", tenantID, topic)
+}
+
+func (r *ART_RouteStore) emitRouteEventLocked(action string, route domain.Route) {
+	if r.exporter == nil {
+		return
+	}
+	r.exportSeq++
+	route = route.Normalize()
+	r.exporter.Emit(exporter.Event{
+		Kind:          "route",
+		Action:        action,
+		Source:        "route_store",
+		Cursor:        exporter.Cursor("route_store", r.exportSeq),
+		OccurredAt:    time.Now().UTC(),
+		TenantID:      route.Tenant,
+		Topic:         route.Pattern,
+		RouteKey:      routeIdentity(route),
+		DestinationID: route.DestinationID,
+		Status:        route.RouteType,
+		Labels:        map[string]string{"enabled": fmt.Sprintf("%t", route.Enabled)},
+	})
 }
