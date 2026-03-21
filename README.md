@@ -193,50 +193,23 @@ The harness reports p50/p95/p99 latency, throughput, CPU usage, memory RSS, and 
 
 ```mermaid
 flowchart TD
-    subgraph Runtime[Broker Runtime]
-        CLI[cmd/tachyon<br/>cmd/aetherbus-node]
-        CFG[config.Config<br/>Bind + durability settings]
-        APP[internal/app.Runtime]
-        ZMQ[delivery/zmq.Router<br/>ROUTER + PUB sockets]
-        CODEC[media.JSONCodec]
-        COMP[media.LZ4Compressor]
-        UC[usecase.EventRouter]
-    end
+    Producers[Producers / Clients] --> Broker[Broker Runtime]
+    Broker --> Routes[(routes)]
+    Broker --> Sessions[(consumer_sessions)]
+    Broker --> Inflight[(inflight_deliveries)]
+    Broker --> Scheduled[(scheduled_messages)]
+    Broker --> DLQ[(dead_letters)]
+    Broker --> Audit[(admin_audit)]
+    Audit --> Export[(analytics / export sink)]
 
-    subgraph MemoryDB[Logical Data Store (In-Memory)]
-        ROUTES[(Route Store<br/>ART index)]
-        SESSIONS[(Consumer Sessions<br/>consumer_id -> session)]
-        INFLIGHT[(Inflight Deliveries<br/>message_id -> state)]
-    end
-
-    subgraph DurableDB[Logical Durable Store]
-        WAL[(Delivery WAL<br/>append-only JSONL)]
-    end
-
-    PROD[Producers / DEALER clients]
-    CONS[Consumers / SUB or direct clients]
-
-    CLI --> CFG --> APP
-    APP --> ZMQ
-    APP --> UC
-    APP --> ROUTES
-    APP --> SESSIONS
-    APP --> INFLIGHT
-    APP --> WAL
-    APP --> CODEC
-    APP --> COMP
-
-    PROD -->|multipart frames| ZMQ
-    ZMQ -->|decode + validate| UC
-    UC -->|topic lookup| ROUTES
-    ZMQ -->|register / heartbeat / capability| SESSIONS
-    ZMQ -->|dispatch + ack tracking| INFLIGHT
-    INFLIGHT -->|persist required direct deliveries| WAL
-    WAL -->|replay unfinalized entries| INFLIGHT
-    UC -->|fanout route| ZMQ
-    INFLIGHT -->|eligible direct message| ZMQ
-    ZMQ -->|topic payload / direct frames| CONS
+    Routes --> Inflight
+    Sessions --> Inflight
+    Inflight --> Scheduled
+    Inflight --> DLQ
+    Scheduled --> Audit
+    DLQ --> Audit
 ```
+
 
 ### Runtime composition
 

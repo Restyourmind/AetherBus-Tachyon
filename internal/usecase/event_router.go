@@ -7,8 +7,6 @@ import (
 	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
 )
 
-// EventRouter is a use case that routes events to the appropriate destination.
-// It uses a RouteStore to find the destination node ID for a given topic.
 type EventRouter struct {
 	routeStore domain.RouteStore
 }
@@ -16,20 +14,15 @@ type EventRouter struct {
 var _ domain.EventPublisher = (*EventRouter)(nil)
 var _ domain.EventPublisherWithResult = (*EventRouter)(nil)
 
-// NewEventRouter creates a new EventRouter.
 func NewEventRouter(routeStore domain.RouteStore) *EventRouter {
-	return &EventRouter{
-		routeStore: routeStore,
-	}
+	return &EventRouter{routeStore: routeStore}
 }
 
-// Publish preserves the legacy publisher contract for existing callers.
 func (er *EventRouter) Publish(ctx context.Context, envelope domain.Envelope) error {
 	_, err := er.PublishWithResult(ctx, envelope)
 	return err
 }
 
-// PublishWithResult returns a structured routing outcome for observability and policy layers.
 func (er *EventRouter) PublishWithResult(ctx context.Context, envelope domain.Envelope) (domain.PublishResult, error) {
 	_ = ctx
 	tenantID := envelope.TenantID
@@ -38,18 +31,17 @@ func (er *EventRouter) PublishWithResult(ctx context.Context, envelope domain.En
 	}
 	result := domain.PublishResult{Topic: envelope.Event.Topic, TenantID: tenantID}
 
-	destNodeID := er.routeStore.Match(domain.RouteKey{TenantID: tenantID, Topic: envelope.Event.Topic})
-	if destNodeID == "" {
+	resolved := er.routeStore.Resolve(domain.RouteKey{TenantID: tenantID, Topic: envelope.Event.Topic})
+	if len(resolved) == 0 {
 		result.Status = domain.RouteStatusUnroutable
-		fmt.Printf("Routing unroutable event %s (topic: %s) from client %s\n",
-			envelope.Event.ID, envelope.Event.Topic, string(envelope.ClientID))
+		fmt.Printf("Routing unroutable event %s (topic: %s) from client %s\n", envelope.Event.ID, envelope.Event.Topic, string(envelope.ClientID))
 		return result, nil
 	}
 
 	result.Status = domain.RouteStatusRouted
-	result.DestinationID = destNodeID
-	fmt.Printf("Routing event %s (topic: %s) from client %s to node %s\n",
-		envelope.Event.ID, envelope.Event.Topic, string(envelope.ClientID), destNodeID)
-
+	result.ResolvedDestinations = append([]domain.ResolvedDestination(nil), resolved...)
+	result.DestinationID = resolved[0].DestinationID
+	result.RouteType = resolved[0].RouteType
+	fmt.Printf("Routing event %s (topic: %s) from client %s to destination %s (%s)\n", envelope.Event.ID, envelope.Event.Topic, string(envelope.ClientID), result.DestinationID, result.RouteType)
 	return result, nil
 }

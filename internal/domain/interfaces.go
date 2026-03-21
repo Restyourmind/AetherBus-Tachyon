@@ -10,12 +10,21 @@ const (
 	RouteStatusUnroutable RouteStatus = "unroutable"
 )
 
+type ResolvedDestination struct {
+	Pattern       string
+	RouteType     string
+	DestinationID string
+	Priority      int
+}
+
 // PublishResult captures the outcome of a routing decision.
 type PublishResult struct {
-	Status        RouteStatus
-	DestinationID string
-	TenantID      string
-	Topic         string
+	Status               RouteStatus
+	DestinationID        string
+	RouteType            string
+	ResolvedDestinations []ResolvedDestination
+	TenantID             string
+	Topic                string
 }
 
 // RouteStore defines the interface for a thread-safe, high-performance routing table.
@@ -33,18 +42,17 @@ type RouteStore interface {
 	// Routes returns a stable snapshot of the current route set.
 	Routes() []Route
 
-	// Match finds the appropriate destination node ID for a given topic.
+	// Resolve returns all matching destinations ordered by routing precedence.
+	Resolve(key RouteKey) []ResolvedDestination
+
+	// Match finds the highest-precedence destination node ID for a given topic.
 	Match(key RouteKey) string
 }
 
-// EventPublisher defines the interface for publishing events to the bus.
-// This is the primary entry point for the application logic (usecase) to send data.
 type EventPublisher interface {
 	Publish(ctx context.Context, envelope Envelope) error
 }
 
-// EventPublisherWithResult augments EventPublisher with structured routing outcomes.
-// This keeps EventPublisher backward compatible for existing integrations.
 type EventPublisherWithResult interface {
 	EventPublisher
 	PublishWithResult(ctx context.Context, envelope Envelope) (PublishResult, error)

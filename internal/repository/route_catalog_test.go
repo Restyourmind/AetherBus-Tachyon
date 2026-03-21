@@ -105,3 +105,49 @@ func TestARTStoreIsolatesRoutesAcrossTenants(t *testing.T) {
 		t.Fatalf("expected no cross-tenant route leakage, got %q", got)
 	}
 }
+
+func TestARTStoreResolveWildcardPrecedence(t *testing.T) {
+	store := NewART_RouteStore()
+	routes := []domain.Route{
+		{Pattern: "orders.created", DestinationID: "exact", RouteType: domain.RouteTypeDirect, Priority: 1, Enabled: true, Tenant: "tenant-a"},
+		{Pattern: "orders.*", DestinationID: "single-low", RouteType: domain.RouteTypeDirect, Priority: 1, Enabled: true, Tenant: "tenant-a"},
+		{Pattern: "orders.*", DestinationID: "single-high", RouteType: domain.RouteTypeDirect, Priority: 9, Enabled: true, Tenant: "tenant-a"},
+		{Pattern: "orders.>", DestinationID: "remainder", RouteType: domain.RouteTypeDirect, Priority: 99, Enabled: true, Tenant: "tenant-a"},
+	}
+	for _, route := range routes {
+		if err := store.UpsertRoute(route); err != nil {
+			t.Fatalf("upsert route: %v", err)
+		}
+	}
+	resolved := store.Resolve(domain.RouteKey{TenantID: "tenant-a", Topic: "orders.created"})
+	if len(resolved) != 4 {
+		t.Fatalf("expected 4 matches, got %#v", resolved)
+	}
+	if resolved[0].DestinationID != "exact" || resolved[1].DestinationID != "single-high" || resolved[3].DestinationID != "remainder" {
+		t.Fatalf("unexpected precedence order: %#v", resolved)
+	}
+}
+
+func TestARTStoreResolveWildcardClassesAndTenantIsolation(t *testing.T) {
+	store := NewART_RouteStore()
+	for _, route := range []domain.Route{
+		{Pattern: "system.*.heartbeat", DestinationID: "single", RouteType: domain.RouteTypeDirect, Enabled: true, Tenant: "tenant-a"},
+		{Pattern: "agents.>", DestinationID: "remainder", RouteType: domain.RouteTypeFanout, Enabled: true, Tenant: "tenant-a"},
+		{Pattern: "system.*.heartbeat", DestinationID: "other-tenant", RouteType: domain.RouteTypeDirect, Enabled: true, Tenant: "tenant-b"},
+		{Pattern: "system.node.heartbeat", DestinationID: "disabled", RouteType: domain.RouteTypeDirect, Enabled: false, Tenant: "tenant-a"},
+	} {
+		if err := store.UpsertRoute(route); err != nil {
+			t.Fatalf("upsert route: %v", err)
+		}
+	}
+	if got := store.Match(domain.RouteKey{TenantID: "tenant-a", Topic: "system.node.heartbeat"}); got != "single" {
+		t.Fatalf("expected enabled wildcard route, got %q", got)
+	}
+	resolved := store.Resolve(domain.RouteKey{TenantID: "tenant-a", Topic: "agents.risk.alert"})
+	if len(resolved) != 1 || resolved[0].DestinationID != "remainder" || resolved[0].RouteType != domain.RouteTypeFanout {
+		t.Fatalf("expected fanout remainder match, got %#v", resolved)
+	}
+	if got := store.Match(domain.RouteKey{TenantID: "tenant-b", Topic: "system.node.heartbeat"}); got != "other-tenant" {
+		t.Fatalf("expected tenant-b isolation, got %q", got)
+	}
+}

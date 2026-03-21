@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aetherbus/aetherbus-tachyon/internal/admin/audit"
+	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
 )
 
 type WAL interface {
@@ -64,6 +65,17 @@ type WALOptions struct {
 	SegmentMaxBytes int64
 	DurabilityMode  DurabilityMode
 	ReplicationSink ReplicationSink
+}
+
+const (
+	sessionSnapshotSchemaVersion = 2
+	scheduledSchemaVersion       = 2
+	deadLetterSchemaVersion      = 2
+)
+
+type stateEnvelope[T any] struct {
+	Version int `json:"version"`
+	Data    T   `json:"data"`
 }
 
 type fileWAL struct {
@@ -386,7 +398,7 @@ func (w *fileWAL) ReplayDeadLetters(req DeadLetterReplayRequest) (DeadLetterRepl
 		}
 		priorStates = append(priorStates, deadLetterAuditState(rec, "dead_letter_store"))
 		maxSeq++
-		scheduled = append(scheduled, scheduledMessage{Sequence: maxSeq, MessageID: rec.MessageID, TenantID: rec.TenantID, Topic: rec.Topic, Payload: append([]byte(nil), rec.Payload...), Priority: rec.Priority, EnqueueSequence: rec.EnqueueSequence, DeliveryAttempt: 1, DeliverAt: now, Reason: "dlq_replay"})
+		scheduled = append(scheduled, scheduledMessage{Sequence: maxSeq, MessageID: rec.MessageID, TenantID: rec.TenantID, Topic: rec.Topic, DestinationID: rec.ConsumerID, RouteType: domain.RouteTypeDirect, Payload: append([]byte(nil), rec.Payload...), Priority: rec.Priority, EnqueueSequence: rec.EnqueueSequence, DeliveryAttempt: 1, DeliverAt: now, Reason: "dlq_replay"})
 		rec.ReplayCount++
 		rec.LastReplayAt = now
 		rec.LastReplayTarget = req.TargetConsumerID + ":" + req.TargetTopic
@@ -585,8 +597,11 @@ func (w *fileWAL) loadScheduledLocked() ([]scheduledMessage, error) {
 	if len(data) == 0 {
 		return nil, nil
 	}
+	var envelope stateEnvelope[[]scheduledMessage]
 	var entries []scheduledMessage
-	if err := json.Unmarshal(data, &entries); err != nil {
+	if err := json.Unmarshal(data, &envelope); err == nil && envelope.Version != 0 {
+		entries = envelope.Data
+	} else if err := json.Unmarshal(data, &entries); err != nil {
 		return nil, fmt.Errorf("decode scheduled queue: %w", err)
 	}
 	sort.Slice(entries, func(i, j int) bool {
@@ -595,13 +610,18 @@ func (w *fileWAL) loadScheduledLocked() ([]scheduledMessage, error) {
 		}
 		return entries[i].DeliverAt.Before(entries[j].DeliverAt)
 	})
+	for i := range entries {
+		if entries[i].RouteType == "" {
+			entries[i].RouteType = domain.RouteTypeDirect
+		}
+	}
 	return entries, nil
 }
 func (w *fileWAL) writeScheduledLocked(entries []scheduledMessage) error {
 	if err := os.MkdirAll(filepath.Dir(w.scheduledPath()), 0o755); err != nil {
 		return err
 	}
-	encoded, err := json.MarshalIndent(entries, "", "  ")
+	encoded, err := json.MarshalIndent(stateEnvelope[[]scheduledMessage]{Version: scheduledSchemaVersion, Data: entries}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -623,8 +643,11 @@ func (w *fileWAL) loadSnapshotsLocked() (map[string]sessionSnapshot, error) {
 	if len(data) == 0 {
 		return map[string]sessionSnapshot{}, nil
 	}
-	var snapshots map[string]sessionSnapshot
-	if err := json.Unmarshal(data, &snapshots); err != nil {
+	var envelope stateEnvelope[map[string]sessionSnapshot]
+	snapshots := map[string]sessionSnapshot{}
+	if err := json.Unmarshal(data, &envelope); err == nil && envelope.Version != 0 {
+		snapshots = envelope.Data
+	} else if err := json.Unmarshal(data, &snapshots); err != nil {
 		return nil, fmt.Errorf("decode session snapshots: %w", err)
 	}
 	if snapshots == nil {
@@ -636,7 +659,7 @@ func (w *fileWAL) writeSnapshotsLocked(snapshots map[string]sessionSnapshot) err
 	if err := os.MkdirAll(filepath.Dir(w.snapshotPath()), 0o755); err != nil {
 		return err
 	}
-	encoded, err := json.MarshalIndent(snapshots, "", "  ")
+	encoded, err := json.MarshalIndent(stateEnvelope[map[string]sessionSnapshot]{Version: sessionSnapshotSchemaVersion, Data: snapshots}, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -657,9 +680,12 @@ func (w *fileWAL) loadDeadLettersLocked() (map[string]DeadLetterRecord, error) {
 	if len(data) == 0 {
 		return map[string]DeadLetterRecord{}, nil
 	}
-	var recs map[string]DeadLetterRecord
-	if err := json.Unmarshal(data, &recs); err != nil {
-		return nil, fmt.Errorf("decode dead-letter store: %w", err)
+	var envelope stateEnvelope[map[string]DeadLetterRecord]
+	recs := map[string]DeadLetterRecord{}
+	if err := json.Unmarshal(data, &envelope); err == nil && envelope.Version != 0 {
+		recs = envelope.Data
+	} else if err := json.Unmarshal(data, &recs); err != nil {
+		return nil, fmt.Errorf("decode dead letters: %w", err)
 	}
 	if recs == nil {
 		recs = map[string]DeadLetterRecord{}
@@ -670,7 +696,7 @@ func (w *fileWAL) writeDeadLettersLocked(recs map[string]DeadLetterRecord) error
 	if err := os.MkdirAll(filepath.Dir(w.deadLetterPath()), 0o755); err != nil {
 		return err
 	}
-	encoded, err := json.MarshalIndent(recs, "", "  ")
+	encoded, err := json.MarshalIndent(stateEnvelope[map[string]DeadLetterRecord]{Version: deadLetterSchemaVersion, Data: recs}, "", "  ")
 	if err != nil {
 		return err
 	}

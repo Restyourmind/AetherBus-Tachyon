@@ -4,6 +4,14 @@ import "errors"
 
 const RouteCatalogVersion = 1
 
+const (
+	RouteTypeDirect   = "direct"
+	RouteTypeFanout   = "fanout"
+	RouteTypeBridge   = "bridge"
+	RouteTypeInternal = "internal"
+	RouteTypeSystem   = "system"
+)
+
 var ErrUnsupportedRouteCatalogVersion = errors.New("unsupported route catalog version")
 
 // Route describes a serializable runtime route entry.
@@ -32,7 +40,7 @@ type RouteCatalogSnapshot struct {
 // Normalize applies defaults needed by the runtime and snapshot format.
 func (r Route) Normalize() Route {
 	if r.RouteType == "" {
-		r.RouteType = "direct"
+		r.RouteType = RouteTypeDirect
 	}
 	if !r.Enabled {
 		return r

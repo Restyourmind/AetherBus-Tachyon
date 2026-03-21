@@ -53,6 +53,9 @@ func (s *FileStore) Append(event Event) (Event, error) {
 	if err := f.Sync(); err != nil {
 		return Event{}, err
 	}
+	if err := s.writeHeadLocked(finalized.Hash); err != nil {
+		return Event{}, err
+	}
 	return finalized, nil
 }
 
@@ -69,6 +72,7 @@ func (s *FileStore) Query(filter Query) ([]Event, error) {
 	defer f.Close()
 	var out []Event
 	scanner := bufio.NewScanner(f)
+	prevHash := ""
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -78,6 +82,17 @@ func (s *FileStore) Query(filter Query) ([]Event, error) {
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
 			return nil, fmt.Errorf("decode audit event: %w", err)
 		}
+		if event.PrevHash != prevHash {
+			return nil, fmt.Errorf("audit hash chain mismatch for %s", event.EventID)
+		}
+		finalized, err := FinalizeEvent(Event{EventID: event.EventID, Actor: event.Actor, Timestamp: event.Timestamp, Operation: event.Operation, TargetMessageIDs: event.TargetMessageIDs, RequestedReason: event.RequestedReason, PriorState: event.PriorState, ResultingState: event.ResultingState}, event.PrevHash)
+		if err != nil {
+			return nil, err
+		}
+		if finalized.Hash != event.Hash {
+			return nil, fmt.Errorf("audit hash mismatch for %s", event.EventID)
+		}
+		prevHash = event.Hash
 		if filter.Actor != "" && event.Actor != filter.Actor {
 			continue
 		}
@@ -123,7 +138,16 @@ func containsMessageID(event Event, id string) bool {
 	return false
 }
 
+func (s *FileStore) headPath() string { return s.path + ".head" }
+
 func (s *FileStore) lastHashLocked() (string, error) {
+	data, err := os.ReadFile(s.headPath())
+	if err == nil {
+		return strings.TrimSpace(string(data)), nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
 	f, err := os.Open(s.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -148,5 +172,15 @@ func (s *FileStore) lastHashLocked() (string, error) {
 	if err := scanner.Err(); err != nil {
 		return "", err
 	}
+	if err := s.writeHeadLocked(last); err != nil {
+		return "", err
+	}
 	return last, nil
+}
+
+func (s *FileStore) writeHeadLocked(hash string) error {
+	if err := os.MkdirAll(filepath.Dir(s.headPath()), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(s.headPath(), []byte(strings.TrimSpace(hash)+"\n"), 0o644)
 }

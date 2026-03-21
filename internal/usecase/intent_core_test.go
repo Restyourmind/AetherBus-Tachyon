@@ -47,6 +47,12 @@ func (s stubRouteStore) Routes() []domain.Route {
 	return routes
 }
 
+func (s stubRouteStore) Resolve(key domain.RouteKey) []domain.ResolvedDestination {
+	if dest := s.routes[routeMapKey(key.TenantID, key.Topic)]; dest != "" {
+		return []domain.ResolvedDestination{{DestinationID: dest, RouteType: domain.RouteTypeDirect, Pattern: key.Topic}}
+	}
+	return nil
+}
 func (s stubRouteStore) Match(key domain.RouteKey) string {
 	return s.routes[routeMapKey(key.TenantID, key.Topic)]
 }

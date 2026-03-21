@@ -88,3 +88,18 @@ func TestEventRouterPublishIsTenantAware(t *testing.T) {
 		t.Fatalf("expected tenant-scoped route node-b/tenant-b, got %+v", result)
 	}
 }
+
+func TestEventRouterPublishWithResolvedDestinations(t *testing.T) {
+	routes := stubRouteStore{routes: map[string]string{routeMapKey("tenant-a", "orders.created"): "worker-1"}}
+	router := NewEventRouter(routes)
+	result, err := router.PublishWithResult(context.Background(), domain.Envelope{TenantID: "tenant-a", Event: domain.Event{ID: "evt-5", Topic: "orders.created"}})
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if result.RouteType != domain.RouteTypeDirect {
+		t.Fatalf("expected direct route type, got %q", result.RouteType)
+	}
+	if len(result.ResolvedDestinations) != 1 || result.ResolvedDestinations[0].DestinationID != "worker-1" {
+		t.Fatalf("unexpected resolved destinations: %#v", result.ResolvedDestinations)
+	}
+}

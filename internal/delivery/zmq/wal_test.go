@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aetherbus/aetherbus-tachyon/internal/admin/audit"
+	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
 )
 
 func TestFileWALAppendReplayAndCommit(t *testing.T) {
@@ -252,5 +253,31 @@ func TestFileWALMirrorReplicationSinkMirrorsActiveSegment(t *testing.T) {
 	}
 	if !bytes.Contains(data, []byte(`"message_id":"msg-1"`)) {
 		t.Fatalf("expected mirrored payload to contain msg-1, got %s", string(data))
+	}
+}
+
+func TestFileWALLoadLegacyScheduledAndVersionedSnapshots(t *testing.T) {
+	tmp := t.TempDir()
+	w := NewFileWAL(filepath.Join(tmp, "delivery.wal")).(*fileWAL)
+	legacyScheduled := []byte(`[{"sequence":1,"message_id":"legacy","topic":"orders.created","payload":"bGVnYWN5","deliver_at":"1970-01-01T00:01:40Z"}]`)
+	if err := os.WriteFile(w.scheduledPath(), legacyScheduled, 0o644); err != nil {
+		t.Fatalf("write legacy scheduled: %v", err)
+	}
+	entries, err := w.LoadScheduled()
+	if err != nil {
+		t.Fatalf("load legacy scheduled: %v", err)
+	}
+	if len(entries) != 1 || entries[0].MessageID != "legacy" || entries[0].RouteType != domain.RouteTypeDirect {
+		t.Fatalf("unexpected legacy scheduled load: %#v", entries)
+	}
+	if err := w.SaveScheduled(entries); err != nil {
+		t.Fatalf("save versioned scheduled: %v", err)
+	}
+	stored, err := os.ReadFile(w.scheduledPath())
+	if err != nil {
+		t.Fatalf("read versioned scheduled: %v", err)
+	}
+	if !bytes.Contains(stored, []byte(`"version":2`)) {
+		t.Fatalf("expected versioned envelope, got %s", stored)
 	}
 }
