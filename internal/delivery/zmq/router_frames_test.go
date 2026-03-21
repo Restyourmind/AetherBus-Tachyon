@@ -12,7 +12,7 @@ import (
 type stubWAL struct {
 	dispatched   []walDispatchedEntry
 	committed    []string
-	deadLettered []string
+	deadLettered []DeadLetterRecord
 	replay       []walDispatchedEntry
 	snapshots    map[string]sessionSnapshot
 	scheduled    []scheduledMessage
@@ -28,12 +28,30 @@ func (w *stubWAL) AppendCommitted(messageID string) error {
 	return nil
 }
 
-func (w *stubWAL) AppendDeadLettered(messageID string) error {
-	w.deadLettered = append(w.deadLettered, messageID)
+func (w *stubWAL) AppendDeadLettered(record DeadLetterRecord) error {
+	w.deadLettered = append(w.deadLettered, record)
 	return nil
 }
 func (w *stubWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 	return append([]walDispatchedEntry(nil), w.replay...), nil
+}
+
+func (w *stubWAL) ListDeadLetters(filter DeadLetterFilter) ([]DeadLetterRecord, error) {
+	return append([]DeadLetterRecord(nil), w.deadLettered...), nil
+}
+func (w *stubWAL) GetDeadLetter(messageID string) (DeadLetterRecord, bool, error) {
+	for _, record := range w.deadLettered {
+		if record.MessageID == messageID {
+			return record, true, nil
+		}
+	}
+	return DeadLetterRecord{}, false, nil
+}
+func (w *stubWAL) ReplayDeadLetters(req DeadLetterReplayRequest) (DeadLetterReplayResult, error) {
+	return DeadLetterReplayResult{}, nil
+}
+func (w *stubWAL) PurgeDeadLetters(req DeadLetterPurgeRequest) (DeadLetterPurgeResult, error) {
+	return DeadLetterPurgeResult{}, nil
 }
 
 func (w *stubWAL) SaveSessionSnapshot(snapshot sessionSnapshot) error {

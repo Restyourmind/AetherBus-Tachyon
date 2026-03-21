@@ -1,9 +1,12 @@
 from textwrap import dedent
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
+import base64
 import json
+import os
+from pathlib import Path
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -44,6 +47,63 @@ class ContractLoadRequest(BaseModel):
 class SystemAlert(BaseModel):
     level: str = Field(default="info")
     message: str = Field(..., min_length=1, max_length=500)
+
+
+class DLQReplayRequest(BaseModel):
+    message_ids: List[str] = Field(..., min_length=1)
+    target_consumer_id: str = Field(..., min_length=1)
+    target_topic: str = Field(..., min_length=1)
+    confirm: str = Field(..., min_length=1)
+
+
+class DLQPurgeRequest(BaseModel):
+    message_ids: List[str] = Field(default_factory=list)
+    consumer_id: Optional[str] = None
+    topic: Optional[str] = None
+    reason: Optional[str] = None
+    confirm: str = Field(..., min_length=1)
+
+
+DLQ_PATH = Path(os.getenv("DLQ_STORE_PATH", os.getenv("WAL_PATH", "./data/direct_delivery.wal") + ".dlq"))
+SCHEDULED_PATH = Path(os.getenv("SCHEDULED_STORE_PATH", os.getenv("WAL_PATH", "./data/direct_delivery.wal") + ".scheduled"))
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+
+def _admin_guard(admin_token: Optional[str]) -> None:
+    if ADMIN_TOKEN and admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Admin token required.")
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text() or "{}")
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _list_dlq(consumer_id: Optional[str] = None, topic: Optional[str] = None, reason: Optional[str] = None) -> List[Dict[str, Any]]:
+    records = []
+    for message_id, record in _load_json(DLQ_PATH).items():
+        record = dict(record)
+        record["message_id"] = message_id
+        if consumer_id and record.get("consumer_id") != consumer_id:
+            continue
+        if topic and record.get("topic") != topic:
+            continue
+        if reason and record.get("reason") != reason:
+            continue
+        if "payload" in record:
+            try:
+                record["payload_b64"] = base64.b64encode(bytes(record["payload"])).decode()
+            except Exception:
+                pass
+        records.append(record)
+    records.sort(key=lambda item: (item.get("dead_lettered_at", ""), item["message_id"]))
+    return records
 
 
 HOME_PAGE = dedent(
@@ -266,6 +326,87 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         await bus.unsubscribe("CONTRACT_LOADED", contract_handler)
 
 
+
+
+@app.get("/api/admin/dlq/records")
+async def list_dead_letters(consumer_id: Optional[str] = None, topic: Optional[str] = None, reason: Optional[str] = None, x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _admin_guard(x_admin_token)
+    records = _list_dlq(consumer_id=consumer_id, topic=topic, reason=reason)
+    return {"count": len(records), "records": records}
+
+
+@app.get("/api/admin/dlq/records/{message_id}")
+async def inspect_dead_letter(message_id: str, x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _admin_guard(x_admin_token)
+    records = _load_json(DLQ_PATH)
+    if message_id not in records:
+        raise HTTPException(status_code=404, detail="Dead-letter record not found.")
+    record = dict(records[message_id])
+    record["message_id"] = message_id
+    return record
+
+
+@app.post("/api/admin/dlq/replay")
+async def replay_dead_letters(request: DLQReplayRequest, x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _admin_guard(x_admin_token)
+    if request.confirm != "REPLAY":
+        raise HTTPException(status_code=400, detail="Replay requires confirm=REPLAY.")
+    records = _load_json(DLQ_PATH)
+    scheduled = json.loads(SCHEDULED_PATH.read_text()) if SCHEDULED_PATH.exists() and SCHEDULED_PATH.read_text().strip() else []
+    result = {"requested": len(request.message_ids), "replayed": 0, "failed": 0, "failures": []}
+    next_seq = max([item.get("sequence", 0) for item in scheduled], default=0)
+    for message_id in request.message_ids:
+        record = records.get(message_id)
+        if not record:
+            result["failed"] += 1
+            result["failures"].append({"message_id": message_id, "error": "record not found"})
+            continue
+        if record.get("consumer_id") != request.target_consumer_id:
+            result["failed"] += 1
+            result["failures"].append({"message_id": message_id, "error": "target consumer does not match original consumer"})
+            continue
+        if record.get("topic") != request.target_topic:
+            result["failed"] += 1
+            result["failures"].append({"message_id": message_id, "error": "target topic does not match original topic"})
+            continue
+        next_seq += 1
+        scheduled.append({"sequence": next_seq, "message_id": message_id, "topic": record["topic"], "payload": record.get("payload", []), "priority": record.get("priority", ""), "enqueue_sequence": record.get("enqueue_sequence", 0), "delivery_attempt": 1, "deliver_at": "1970-01-01T00:00:00Z", "reason": "dlq_replay"})
+        records.pop(message_id, None)
+        result["replayed"] += 1
+    _write_json(DLQ_PATH, records)
+    _write_json(SCHEDULED_PATH, scheduled)
+    return result
+
+
+@app.post("/api/admin/dlq/purge")
+async def purge_dead_letters(request: DLQPurgeRequest, x_admin_token: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    _admin_guard(x_admin_token)
+    if request.confirm != "PURGE":
+        raise HTTPException(status_code=400, detail="Purge requires confirm=PURGE.")
+    records = _load_json(DLQ_PATH)
+    result = {"requested": 0, "purged": 0, "failed": 0, "failures": []}
+    if request.message_ids:
+        for message_id in request.message_ids:
+            result["requested"] += 1
+            if message_id not in records:
+                result["failed"] += 1
+                result["failures"].append({"message_id": message_id, "error": "record not found"})
+                continue
+            records.pop(message_id, None)
+            result["purged"] += 1
+    else:
+        for message_id, record in list(records.items()):
+            if request.consumer_id and record.get("consumer_id") != request.consumer_id:
+                continue
+            if request.topic and record.get("topic") != request.topic:
+                continue
+            if request.reason and record.get("reason") != request.reason:
+                continue
+            result["requested"] += 1
+            records.pop(message_id, None)
+            result["purged"] += 1
+    _write_json(DLQ_PATH, records)
+    return result
 if __name__ == "__main__":
     print("🚀 AetherBus Tachyon gateway starting on http://0.0.0.0:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)

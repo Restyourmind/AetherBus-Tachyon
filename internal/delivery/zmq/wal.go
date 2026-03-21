@@ -9,19 +9,25 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 )
 
 type WAL interface {
 	AppendDispatched(entry walDispatchedEntry) error
 	AppendCommitted(messageID string) error
-	AppendDeadLettered(messageID string) error
+	AppendDeadLettered(record DeadLetterRecord) error
 	ReplayUnacked() ([]walDispatchedEntry, error)
 	SaveSessionSnapshot(snapshot sessionSnapshot) error
 	LoadSessionSnapshots() ([]sessionSnapshot, error)
 	DeleteSessionSnapshot(consumerID string) error
 	SaveScheduled(entries []scheduledMessage) error
 	LoadScheduled() ([]scheduledMessage, error)
+	ListDeadLetters(filter DeadLetterFilter) ([]DeadLetterRecord, error)
+	GetDeadLetter(messageID string) (DeadLetterRecord, bool, error)
+	ReplayDeadLetters(req DeadLetterReplayRequest) (DeadLetterReplayResult, error)
+	PurgeDeadLetters(req DeadLetterPurgeRequest) (DeadLetterPurgeResult, error)
 }
 
 type fileWAL struct {
@@ -52,6 +58,62 @@ type walDispatchedEntry struct {
 	Attempt         int
 }
 
+type DeadLetterRecord struct {
+	MessageID        string    `json:"message_id"`
+	ConsumerID       string    `json:"consumer_id,omitempty"`
+	SessionID        string    `json:"session_id,omitempty"`
+	Topic            string    `json:"topic"`
+	Payload          []byte    `json:"payload"`
+	Priority         string    `json:"priority,omitempty"`
+	EnqueueSequence  uint64    `json:"enqueue_sequence,omitempty"`
+	Attempt          int       `json:"attempt,omitempty"`
+	Reason           string    `json:"reason,omitempty"`
+	DeadLetteredAt   time.Time `json:"dead_lettered_at"`
+	ReplayCount      int       `json:"replay_count,omitempty"`
+	LastReplayAt     time.Time `json:"last_replay_at,omitempty"`
+	LastReplayTarget string    `json:"last_replay_target,omitempty"`
+}
+
+type DeadLetterFilter struct {
+	MessageID  string
+	ConsumerID string
+	Topic      string
+	Reason     string
+}
+
+type DeadLetterReplayRequest struct {
+	MessageIDs       []string
+	TargetConsumerID string
+	TargetTopic      string
+	Confirm          string
+	RequestedAt      time.Time
+}
+
+type DeadLetterReplayFailure struct {
+	MessageID string `json:"message_id"`
+	Error     string `json:"error"`
+}
+
+type DeadLetterReplayResult struct {
+	Requested int                       `json:"requested"`
+	Replayed  int                       `json:"replayed"`
+	Failed    int                       `json:"failed"`
+	Failures  []DeadLetterReplayFailure `json:"failures,omitempty"`
+}
+
+type DeadLetterPurgeRequest struct {
+	MessageIDs []string
+	Filter     DeadLetterFilter
+	Confirm    string
+}
+
+type DeadLetterPurgeResult struct {
+	Requested int                       `json:"requested"`
+	Purged    int                       `json:"purged"`
+	Failed    int                       `json:"failed"`
+	Failures  []DeadLetterReplayFailure `json:"failures,omitempty"`
+}
+
 func NewFileWAL(path string) WAL { return &fileWAL{path: path} }
 
 func (w *fileWAL) AppendDispatched(entry walDispatchedEntry) error {
@@ -60,8 +122,21 @@ func (w *fileWAL) AppendDispatched(entry walDispatchedEntry) error {
 func (w *fileWAL) AppendCommitted(messageID string) error {
 	return w.appendRecord(walRecord{Type: "committed", MessageID: messageID})
 }
-func (w *fileWAL) AppendDeadLettered(messageID string) error {
-	return w.appendRecord(walRecord{Type: "dead_lettered", MessageID: messageID})
+func (w *fileWAL) AppendDeadLettered(record DeadLetterRecord) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	store, err := w.loadDeadLettersLocked()
+	if err != nil {
+		return err
+	}
+	if record.MessageID == "" {
+		return errors.New("dead-letter record requires message_id")
+	}
+	if record.DeadLetteredAt.IsZero() {
+		record.DeadLetteredAt = time.Now().UTC()
+	}
+	store[record.MessageID] = record
+	return w.writeDeadLettersLocked(store)
 }
 
 func (w *fileWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
@@ -116,6 +191,157 @@ func (w *fileWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 	return out, nil
 }
 
+func (w *fileWAL) ListDeadLetters(filter DeadLetterFilter) ([]DeadLetterRecord, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	store, err := w.loadDeadLettersLocked()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DeadLetterRecord, 0, len(store))
+	for _, rec := range store {
+		if filter.MessageID != "" && rec.MessageID != filter.MessageID {
+			continue
+		}
+		if filter.ConsumerID != "" && rec.ConsumerID != filter.ConsumerID {
+			continue
+		}
+		if filter.Topic != "" && rec.Topic != filter.Topic {
+			continue
+		}
+		if filter.Reason != "" && rec.Reason != filter.Reason {
+			continue
+		}
+		out = append(out, rec)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].DeadLetteredAt.Equal(out[j].DeadLetteredAt) {
+			return out[i].MessageID < out[j].MessageID
+		}
+		return out[i].DeadLetteredAt.Before(out[j].DeadLetteredAt)
+	})
+	return out, nil
+}
+func (w *fileWAL) GetDeadLetter(messageID string) (DeadLetterRecord, bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	store, err := w.loadDeadLettersLocked()
+	if err != nil {
+		return DeadLetterRecord{}, false, err
+	}
+	rec, ok := store[messageID]
+	return rec, ok, nil
+}
+func (w *fileWAL) ReplayDeadLetters(req DeadLetterReplayRequest) (DeadLetterReplayResult, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if req.Confirm != "REPLAY" {
+		return DeadLetterReplayResult{}, errors.New("replay requires confirm=REPLAY")
+	}
+	if req.TargetConsumerID == "" || req.TargetTopic == "" {
+		return DeadLetterReplayResult{}, errors.New("replay requires explicit target_consumer_id and target_topic")
+	}
+	store, err := w.loadDeadLettersLocked()
+	if err != nil {
+		return DeadLetterReplayResult{}, err
+	}
+	scheduled, err := w.loadScheduledLocked()
+	if err != nil {
+		return DeadLetterReplayResult{}, err
+	}
+	result := DeadLetterReplayResult{Requested: len(req.MessageIDs)}
+	now := req.RequestedAt.UTC()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	idSet := uniqueIDs(req.MessageIDs)
+	var maxSeq uint64
+	for _, entry := range scheduled {
+		if entry.Sequence > maxSeq {
+			maxSeq = entry.Sequence
+		}
+	}
+	for _, id := range idSet {
+		rec, ok := store[id]
+		if !ok {
+			result.Failed++
+			result.Failures = append(result.Failures, DeadLetterReplayFailure{MessageID: id, Error: "record not found"})
+			continue
+		}
+		if rec.ConsumerID != req.TargetConsumerID {
+			result.Failed++
+			result.Failures = append(result.Failures, DeadLetterReplayFailure{MessageID: id, Error: "target consumer does not match original consumer"})
+			continue
+		}
+		if rec.Topic != req.TargetTopic {
+			result.Failed++
+			result.Failures = append(result.Failures, DeadLetterReplayFailure{MessageID: id, Error: "target topic does not match original topic"})
+			continue
+		}
+		maxSeq++
+		scheduled = append(scheduled, scheduledMessage{Sequence: maxSeq, MessageID: rec.MessageID, Topic: rec.Topic, Payload: append([]byte(nil), rec.Payload...), Priority: rec.Priority, EnqueueSequence: rec.EnqueueSequence, DeliveryAttempt: 1, DeliverAt: now, Reason: "dlq_replay"})
+		rec.ReplayCount++
+		rec.LastReplayAt = now
+		rec.LastReplayTarget = req.TargetConsumerID + ":" + req.TargetTopic
+		delete(store, id)
+		result.Replayed++
+	}
+	if err := w.writeScheduledLocked(scheduled); err != nil {
+		return DeadLetterReplayResult{}, err
+	}
+	if err := w.writeDeadLettersLocked(store); err != nil {
+		return DeadLetterReplayResult{}, err
+	}
+	return result, nil
+}
+func (w *fileWAL) PurgeDeadLetters(req DeadLetterPurgeRequest) (DeadLetterPurgeResult, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if req.Confirm != "PURGE" {
+		return DeadLetterPurgeResult{}, errors.New("purge requires confirm=PURGE")
+	}
+	store, err := w.loadDeadLettersLocked()
+	if err != nil {
+		return DeadLetterPurgeResult{}, err
+	}
+	result := DeadLetterPurgeResult{}
+	if len(req.MessageIDs) > 0 {
+		ids := uniqueIDs(req.MessageIDs)
+		result.Requested = len(ids)
+		for _, id := range ids {
+			if _, ok := store[id]; !ok {
+				result.Failed++
+				result.Failures = append(result.Failures, DeadLetterReplayFailure{MessageID: id, Error: "record not found"})
+				continue
+			}
+			delete(store, id)
+			result.Purged++
+		}
+	} else {
+		for id, rec := range store {
+			if req.Filter.ConsumerID != "" && rec.ConsumerID != req.Filter.ConsumerID {
+				continue
+			}
+			if req.Filter.Topic != "" && rec.Topic != req.Filter.Topic {
+				continue
+			}
+			if req.Filter.Reason != "" && rec.Reason != req.Filter.Reason {
+				continue
+			}
+			if req.Filter.MessageID != "" && rec.MessageID != req.Filter.MessageID {
+				continue
+			}
+			result.Requested++
+			delete(store, id)
+			result.Purged++
+		}
+	}
+	if err := w.writeDeadLettersLocked(store); err != nil {
+		return DeadLetterPurgeResult{}, err
+	}
+	return result, nil
+}
+
 func (w *fileWAL) SaveSessionSnapshot(snapshot sessionSnapshot) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -126,7 +352,6 @@ func (w *fileWAL) SaveSessionSnapshot(snapshot sessionSnapshot) error {
 	snapshots[snapshot.ConsumerID] = snapshot
 	return w.writeSnapshotsLocked(snapshots)
 }
-
 func (w *fileWAL) LoadSessionSnapshots() ([]sessionSnapshot, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -141,7 +366,6 @@ func (w *fileWAL) LoadSessionSnapshots() ([]sessionSnapshot, error) {
 	sort.Slice(out, func(i, j int) bool { return out[i].ConsumerID < out[j].ConsumerID })
 	return out, nil
 }
-
 func (w *fileWAL) DeleteSessionSnapshot(consumerID string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -152,7 +376,6 @@ func (w *fileWAL) DeleteSessionSnapshot(consumerID string) error {
 	delete(snapshots, consumerID)
 	return w.writeSnapshotsLocked(snapshots)
 }
-
 func (w *fileWAL) appendRecord(rec walRecord) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -173,30 +396,20 @@ func (w *fileWAL) appendRecord(rec walRecord) error {
 	}
 	return f.Sync()
 }
-
-func (w *fileWAL) snapshotPath() string  { return w.path + ".sessions" }
-func (w *fileWAL) scheduledPath() string { return w.path + ".scheduled" }
-
+func (w *fileWAL) snapshotPath() string   { return w.path + ".sessions" }
+func (w *fileWAL) scheduledPath() string  { return w.path + ".scheduled" }
+func (w *fileWAL) deadLetterPath() string { return w.path + ".dlq" }
 func (w *fileWAL) SaveScheduled(entries []scheduledMessage) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(w.scheduledPath()), 0o755); err != nil {
-		return err
-	}
-	encoded, err := json.MarshalIndent(entries, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := w.scheduledPath() + ".tmp"
-	if err := os.WriteFile(tmp, append(encoded, '\n'), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, w.scheduledPath())
+	return w.writeScheduledLocked(entries)
 }
-
 func (w *fileWAL) LoadScheduled() ([]scheduledMessage, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.loadScheduledLocked()
+}
+func (w *fileWAL) loadScheduledLocked() ([]scheduledMessage, error) {
 	data, err := os.ReadFile(w.scheduledPath())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -219,7 +432,20 @@ func (w *fileWAL) LoadScheduled() ([]scheduledMessage, error) {
 	})
 	return entries, nil
 }
-
+func (w *fileWAL) writeScheduledLocked(entries []scheduledMessage) error {
+	if err := os.MkdirAll(filepath.Dir(w.scheduledPath()), 0o755); err != nil {
+		return err
+	}
+	encoded, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := w.scheduledPath() + ".tmp"
+	if err := os.WriteFile(tmp, append(encoded, '\n'), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, w.scheduledPath())
+}
 func (w *fileWAL) loadSnapshotsLocked() (map[string]sessionSnapshot, error) {
 	path := w.snapshotPath()
 	data, err := os.ReadFile(path)
@@ -241,7 +467,6 @@ func (w *fileWAL) loadSnapshotsLocked() (map[string]sessionSnapshot, error) {
 	}
 	return snapshots, nil
 }
-
 func (w *fileWAL) writeSnapshotsLocked(snapshots map[string]sessionSnapshot) error {
 	if err := os.MkdirAll(filepath.Dir(w.snapshotPath()), 0o755); err != nil {
 		return err
@@ -255,4 +480,55 @@ func (w *fileWAL) writeSnapshotsLocked(snapshots map[string]sessionSnapshot) err
 		return err
 	}
 	return os.Rename(tmp, w.snapshotPath())
+}
+func (w *fileWAL) loadDeadLettersLocked() (map[string]DeadLetterRecord, error) {
+	data, err := os.ReadFile(w.deadLetterPath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return map[string]DeadLetterRecord{}, nil
+		}
+		return nil, err
+	}
+	if len(data) == 0 {
+		return map[string]DeadLetterRecord{}, nil
+	}
+	var recs map[string]DeadLetterRecord
+	if err := json.Unmarshal(data, &recs); err != nil {
+		return nil, fmt.Errorf("decode dead-letter store: %w", err)
+	}
+	if recs == nil {
+		recs = map[string]DeadLetterRecord{}
+	}
+	return recs, nil
+}
+func (w *fileWAL) writeDeadLettersLocked(recs map[string]DeadLetterRecord) error {
+	if err := os.MkdirAll(filepath.Dir(w.deadLetterPath()), 0o755); err != nil {
+		return err
+	}
+	encoded, err := json.MarshalIndent(recs, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := w.deadLetterPath() + ".tmp"
+	if err := os.WriteFile(tmp, append(encoded, '\n'), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, w.deadLetterPath())
+}
+func uniqueIDs(ids []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }

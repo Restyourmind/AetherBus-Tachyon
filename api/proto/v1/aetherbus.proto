@@ -34,6 +34,66 @@ message SubscribeRequest {
 }
 
 // บริการสาธารณะในการเชื่อมต่อเข้ากับโหนด AetherBus
+
+
+message DeadLetterRecord {
+    string message_id = 1;
+    string consumer_id = 2;
+    string topic = 3;
+    bytes payload = 4;
+    string reason = 5;
+    int32 attempt = 6;
+    string dead_lettered_at = 7;
+}
+
+message DeadLetterListRequest {
+    string consumer_id = 1;
+    string topic = 2;
+    string reason = 3;
+}
+
+message DeadLetterListResponse {
+    repeated DeadLetterRecord records = 1;
+}
+
+message DeadLetterInspectRequest {
+    string message_id = 1;
+}
+
+message DeadLetterReplayRequest {
+    repeated string message_ids = 1;
+    string target_consumer_id = 2;
+    string target_topic = 3;
+    string confirm = 4;
+}
+
+message DeadLetterReplayFailure {
+    string message_id = 1;
+    string error = 2;
+}
+
+message DeadLetterReplayResponse {
+    uint32 requested = 1;
+    uint32 replayed = 2;
+    uint32 failed = 3;
+    repeated DeadLetterReplayFailure failures = 4;
+}
+
+message DeadLetterPurgeRequest {
+    repeated string message_ids = 1;
+    string consumer_id = 2;
+    string topic = 3;
+    string reason = 4;
+    string confirm = 5;
+}
+
+message DeadLetterPurgeResponse {
+    uint32 requested = 1;
+    uint32 purged = 2;
+    uint32 failed = 3;
+    repeated DeadLetterReplayFailure failures = 4;
+}
+
 service AetherBusService {
     // Unary RPC: เผยแพร่ข้อมูลเดี่ยว
     rpc PublishEvent(Event) returns (PublishResponse);
@@ -46,4 +106,9 @@ service AetherBusService {
     
     // Duplex Streaming: สตรีมโต้ตอบแบบสองทิศทาง หน่วงเวลาต่ำ
     rpc DuplexConnect(stream Event) returns (stream Event);
+
+    rpc ListDeadLetters(DeadLetterListRequest) returns (DeadLetterListResponse);
+    rpc InspectDeadLetter(DeadLetterInspectRequest) returns (DeadLetterRecord);
+    rpc ReplayDeadLetters(DeadLetterReplayRequest) returns (DeadLetterReplayResponse);
+    rpc PurgeDeadLetters(DeadLetterPurgeRequest) returns (DeadLetterPurgeResponse);
 }

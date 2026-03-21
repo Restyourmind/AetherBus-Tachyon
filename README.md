@@ -54,6 +54,27 @@ Optional direct-delivery durability can be enabled with:
 
 When enabled, direct messages that require ACK are appended to an append-only WAL before dispatch, ACK marks entries committed, terminal outcomes are marked dead-lettered, and remaining unfinalized records are replayed when matching consumers reconnect after restart.
 
+
+Dead-letter records are now materialized in a structured DLQ store at `WAL_PATH.dlq`, while broker-scheduled replays are written to `WAL_PATH.scheduled`. Operators can browse and inspect DLQ entries, then replay or purge them with explicit confirmation and exact target matching so replay cannot silently change the original consumer/topic boundary.
+
+### DLQ operator workflow
+
+```bash
+# Browse dead letters
+go run ./cmd/tachyon dlq list --consumer worker-1
+
+# Inspect a single record
+go run ./cmd/tachyon dlq inspect --id msg-123
+
+# Replay only when the original target is restated exactly
+go run ./cmd/tachyon dlq replay --ids msg-123 --target-consumer worker-1 --target-topic orders.created --confirm REPLAY
+
+# Purge an acknowledged bad record
+go run ./cmd/tachyon dlq purge --ids msg-123 --confirm PURGE
+```
+
+The demo control-surface gateway exposes matching admin endpoints under `/api/admin/dlq/*`. Set `ADMIN_TOKEN` to require the `X-Admin-Token` header for browse, inspect, replay, and purge requests. Replay and purge responses include requested/replayed-or-purged counts plus per-record failure details.
+
 Direct-delivery admission control defaults are intentionally conservative and can be tuned with:
 
 - `MAX_INFLIGHT_PER_CONSUMER` (default `1024`)

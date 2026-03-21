@@ -42,7 +42,7 @@ func TestFileWALReplaySkipsDeadLettered(t *testing.T) {
 	if err := w.AppendDispatched(walDispatchedEntry{MessageID: "msg-dlq", Consumer: "c1", SessionID: "s1", Topic: "orders.created", Payload: []byte("p1"), Priority: "low", EnqueueSequence: 7, Attempt: 2}); err != nil {
 		t.Fatalf("append dispatched: %v", err)
 	}
-	if err := w.AppendDeadLettered("msg-dlq"); err != nil {
+	if err := w.AppendDeadLettered(DeadLetterRecord{MessageID: "msg-dlq", ConsumerID: "c1", Topic: "orders.created", Payload: []byte("p1"), DeadLetteredAt: time.Unix(300, 0).UTC(), Reason: "retry_exhausted"}); err != nil {
 		t.Fatalf("append dead-lettered: %v", err)
 	}
 
@@ -97,5 +97,52 @@ func TestFileWALScheduledRoundTrip(t *testing.T) {
 	}
 	if loaded[0].MessageID != "msg-1" || loaded[1].MessageID != "msg-2" {
 		t.Fatalf("expected scheduled queue sorted by deliver_at then sequence, got %#v", loaded)
+	}
+}
+
+func TestFileWALDeadLetterBrowseReplayAndPurge(t *testing.T) {
+	tmp := t.TempDir()
+	w := NewFileWAL(filepath.Join(tmp, "delivery.wal"))
+	now := time.Unix(500, 0).UTC()
+	if err := w.AppendDeadLettered(DeadLetterRecord{MessageID: "msg-1", ConsumerID: "worker-1", Topic: "orders.created", Payload: []byte("p1"), DeadLetteredAt: now, Reason: "retry_exhausted"}); err != nil {
+		t.Fatalf("append dead-lettered: %v", err)
+	}
+	if err := w.AppendDeadLettered(DeadLetterRecord{MessageID: "msg-2", ConsumerID: "worker-2", Topic: "orders.failed", Payload: []byte("p2"), DeadLetteredAt: now.Add(time.Second), Reason: "terminal_nack"}); err != nil {
+		t.Fatalf("append dead-lettered: %v", err)
+	}
+	records, err := w.ListDeadLetters(DeadLetterFilter{ConsumerID: "worker-1"})
+	if err != nil {
+		t.Fatalf("list dead letters: %v", err)
+	}
+	if len(records) != 1 || records[0].MessageID != "msg-1" {
+		t.Fatalf("unexpected filtered records: %#v", records)
+	}
+	res, err := w.ReplayDeadLetters(DeadLetterReplayRequest{MessageIDs: []string{"msg-1"}, TargetConsumerID: "worker-1", TargetTopic: "orders.created", Confirm: "REPLAY", RequestedAt: now.Add(2 * time.Second)})
+	if err != nil {
+		t.Fatalf("replay dead letters: %v", err)
+	}
+	if res.Replayed != 1 || res.Failed != 0 {
+		t.Fatalf("unexpected replay result: %#v", res)
+	}
+	scheduled, err := w.LoadScheduled()
+	if err != nil {
+		t.Fatalf("load scheduled: %v", err)
+	}
+	if len(scheduled) != 1 || scheduled[0].MessageID != "msg-1" {
+		t.Fatalf("unexpected replayed schedule: %#v", scheduled)
+	}
+	_, ok, err := w.GetDeadLetter("msg-1")
+	if err != nil {
+		t.Fatalf("get dead letter: %v", err)
+	}
+	if ok {
+		t.Fatalf("expected replayed record removed from dlq")
+	}
+	purge, err := w.PurgeDeadLetters(DeadLetterPurgeRequest{MessageIDs: []string{"msg-2"}, Confirm: "PURGE"})
+	if err != nil {
+		t.Fatalf("purge dead letters: %v", err)
+	}
+	if purge.Purged != 1 || purge.Failed != 0 {
+		t.Fatalf("unexpected purge result: %#v", purge)
 	}
 }

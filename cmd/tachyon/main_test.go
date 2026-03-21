@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aetherbus/aetherbus-tachyon/config"
 	transportzmq "github.com/aetherbus/aetherbus-tachyon/internal/delivery/zmq"
 	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
 	"github.com/aetherbus/aetherbus-tachyon/internal/media"
@@ -126,5 +127,21 @@ func TestMainIntegration(t *testing.T) {
 	}
 	if receivedEvent.Topic != expectedTopic {
 		t.Fatalf("Expected topic %q in event, got %q", expectedTopic, receivedEvent.Topic)
+	}
+}
+
+func TestDLQCLIReplayRequiresExplicitTarget(t *testing.T) {
+	t.Setenv("WAL_ENABLED", "true")
+	t.Setenv("WAL_PATH", t.TempDir()+"/delivery.wal")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	wal := transportzmq.NewFileWAL(cfg.WALPath)
+	if err := wal.AppendDeadLettered(transportzmq.DeadLetterRecord{MessageID: "msg-1", ConsumerID: "worker-1", Topic: "orders.created", Payload: []byte("p1"), DeadLetteredAt: time.Now().UTC(), Reason: "retry_exhausted"}); err != nil {
+		t.Fatalf("append dead letter: %v", err)
+	}
+	if err := runDLQCLI(cfg, []string{"replay", "--ids", "msg-1", "--confirm", "REPLAY"}); err == nil {
+		t.Fatalf("expected replay to require explicit target")
 	}
 }
