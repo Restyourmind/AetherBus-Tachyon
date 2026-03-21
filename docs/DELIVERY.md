@@ -292,33 +292,65 @@ If an ACK is received for a missing or expired session:
 
 ## 10.3 WAL Durability (Optional)
 
-For direct delivery with acknowledgments, the broker MAY enable an append-only Write-Ahead Log (WAL).
+For direct delivery with acknowledgments, the broker MAY enable a segment-oriented Write-Ahead Log (WAL) instead of a single append-only file.
 
 When enabled:
 
-- before direct dispatch, the broker appends a `dispatched` record to WAL
+- before direct dispatch, the broker appends a `dispatched` record to the active WAL segment and fsyncs it locally
+- when the active segment reaches the configured size threshold, the broker rolls to a new segment and marks the prior segment closed
 - on ACK, the broker appends a `committed` record
 - on terminal failure or retry exhaustion, the broker appends a `dead_lettered` record
-- on restart, the broker replays unfinalized direct messages when the target consumer session is re-established
+- on restart, the broker scans all available segments in lexical order and replays unfinalized direct messages when the target consumer session is re-established
+- snapshots for resumable sessions, scheduled retries, dead-letter records, and admin audit state remain sidecar durability artifacts next to the WAL root
 
 Operational counters exposed by broker metrics include:
 
 - `wal_written`: number of direct-dispatch WAL append operations
 - `wal_replayed`: number of unacked WAL entries replayed after restart
 
-### 10.4 WAL Guarantees and Limitations
+### 10.4 Replication Semantics
+
+The segment WAL supports optional replication sinks for standby broker shipping and object-store style uploads. A sink receives the current segment bytes plus a closed/open marker and acknowledges when the remote copy is complete enough for the selected durability mode.
+
+The runtime defines three durability modes:
+
+- `local_fsync`: dispatch is considered durable once the local append has been fsynced
+- `replicated`: dispatch is considered durable only after the replication sink acknowledges the segment image
+- `local_and_replicated`: dispatch is considered durable only after both the local fsync and replication acknowledgment succeed
+
+If a replicated durability mode is selected without an active replication sink, the dispatch append MUST fail rather than silently degrading to local-only durability.
+
+### 10.5 WAL Guarantees, Replay, and Corruption Handling
 
 Guarantees when WAL is enabled:
 
-- direct messages requiring ACK are durable before first dispatch attempt
-- replay preserves `message_id`, target `consumer_id`, payload, topic, and delivery attempt metadata
+- direct messages requiring ACK are durable before first dispatch attempt according to the configured durability mode
+- replay preserves `message_id`, target `consumer_id`, payload, topic, priority, enqueue sequence, and delivery attempt metadata
 - finalized records (`committed` / `dead_lettered`) are excluded from replay
+- replay is segment-ordered, so later finalization records in newer segments suppress earlier dispatch records
 
-Limitations in this first version:
+Corruption and partial-segment handling:
 
-- local file durability only (no distributed consensus, replication, or quorum writes)
+- an open segment may end with a partial final record after crash or power loss; startup SHOULD ignore the unterminated tail and recover all prior complete records
+- a closed segment is expected to be complete; if it cannot be decoded, startup SHOULD quarantine it as corrupt and fail recovery so an operator can restore from a replicated copy
+- replay is consumer-session driven; messages without a matching re-registered direct consumer remain pending after recovery
+
+### 10.6 Recovery Procedure
+
+Recommended operator recovery flow:
+
+1. stop direct delivery on the failed node
+2. restore the WAL segment directory plus sidecar snapshot files from the surviving mirror, standby broker, or object-store copy
+3. verify that all closed segments are present and that the newest open segment, if any, is the only segment allowed to have a truncated tail
+4. restart the broker; startup replay scans segments, reloads scheduled retries/session snapshots, and reconstructs the unacked set
+5. allow resumable consumers to re-register; replay dispatch resumes only when a live consumer session is available
+6. if startup reports a corrupt closed segment, replace it from a replicated copy before retrying startup
+
+Limitations in this version:
+
+- replication is sink-acknowledged but not quorum-based; there is no distributed consensus for direct delivery commits
 - no WAL compaction or retention policy yet
-- replay is consumer-session driven; messages without a matching re-registered direct consumer remain pending
+- consistency is at-least-once; a crash after durable append but before client-visible ACK handling may still produce duplicate replay
 
 ## 11. NACK Handling
 

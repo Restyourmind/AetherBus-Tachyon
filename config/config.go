@@ -31,6 +31,9 @@ type Config struct {
 	ZmqBindAddress           string
 	ZmqPubAddress            string
 	DeliveryTimeoutMS        int
+	WALSegmentMaxBytes       int
+	WALDurabilityMode        string
+	WALReplicationMirrorDir  string
 	MaxInflightPerConsumer   int
 	MaxPerTopicQueue         int
 	MaxQueuedDirect          int
@@ -57,6 +60,9 @@ func Load() (*Config, error) {
 		ZmqBindAddress:           getenvOrDefault("ZMQ_BIND_ADDRESS", "tcp://127.0.0.1:5555"),
 		ZmqPubAddress:            getenvOrDefault("ZMQ_PUB_ADDRESS", "tcp://127.0.0.1:5556"),
 		DeliveryTimeoutMS:        getenvIntOrDefault("DELIVERY_TIMEOUT_MS", 30000),
+		WALSegmentMaxBytes:       getenvIntOrDefault("WAL_SEGMENT_MAX_BYTES", 4*1024*1024),
+		WALDurabilityMode:        getenvOrDefault("WAL_DURABILITY_MODE", "local_fsync"),
+		WALReplicationMirrorDir:  getenvOrDefault("WAL_REPLICATION_MIRROR_DIR", ""),
 		MaxInflightPerConsumer:   getenvIntOrDefault("MAX_INFLIGHT_PER_CONSUMER", 1024),
 		MaxPerTopicQueue:         getenvIntOrDefault("MAX_PER_TOPIC_QUEUE", 256),
 		MaxQueuedDirect:          getenvIntOrDefault("MAX_QUEUED_DIRECT", 4096),

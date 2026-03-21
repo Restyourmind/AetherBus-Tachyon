@@ -181,11 +181,23 @@ Assume:
 
 Resilience methods:
 
-- WAL + replay
+- segmented WAL + replay
+- standby/object-store segment replication with explicit durability acks
 - erasure-coded storage
 - shard-level BFT only where needed
 - idempotent execution receipts
 - compensating transactions for cross-shard failure
+
+### 3.5.1 Direct-Delivery Durability Tier
+
+For regional coordination cells, direct-delivery recovery should not depend on a single node-local file. Each ingress broker should persist direct-delivery state as ordered WAL segments, roll segments at bounded sizes, and ship segment images to a standby broker or object store.
+
+Recommended guarantees:
+
+- local durability is satisfied by fsync of the active segment
+- cell-survivable durability is satisfied by acknowledged remote replication of that segment
+- startup recovery replays all intact segments, ignores a truncated tail only on the newest open segment, and treats corruption in closed segments as a restore-from-replica event
+- dead-letter, scheduled retry, and resumable-session snapshots should be restored alongside WAL segments so replay preserves operational intent rather than only raw payload bytes
 
 ## 3.6 Interoperability
 

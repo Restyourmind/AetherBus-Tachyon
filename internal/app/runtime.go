@@ -42,7 +42,11 @@ func NewRuntimeWithCompressor(cfg *config.Config, bootstrapRoutes map[string]str
 	eventRouter := usecase.NewEventRouter(routeStore)
 	var durability zmq.WAL
 	if cfg.WALEnabled {
-		durability = zmq.NewFileWAL(cfg.WALPath)
+		durability = zmq.NewFileWALWithOptions(cfg.WALPath, zmq.WALOptions{
+			SegmentMaxBytes: int64(cfg.WALSegmentMaxBytes),
+			DurabilityMode:  zmq.DurabilityMode(cfg.WALDurabilityMode),
+			ReplicationSink: zmq.NewMirrorReplicationSink(cfg.WALReplicationMirrorDir),
+		})
 	}
 
 	router := zmq.NewRouterWithDurability(

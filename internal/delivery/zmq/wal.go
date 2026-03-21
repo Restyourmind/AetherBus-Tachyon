@@ -2,13 +2,17 @@ package zmq
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,10 +39,39 @@ type WAL interface {
 	AppendAuditEvent(event audit.Event) (audit.Event, error)
 }
 
+type DurabilityMode string
+
+const (
+	DurabilityLocalFsync         DurabilityMode = "local_fsync"
+	DurabilityReplicated         DurabilityMode = "replicated"
+	DurabilityLocalAndReplicated DurabilityMode = "local_and_replicated"
+
+	defaultSegmentMaxBytes int64 = 4 * 1024 * 1024
+)
+
+type ReplicationSink interface {
+	Replicate(ctx context.Context, replica SegmentReplica) error
+}
+
+type SegmentReplica struct {
+	SegmentID   string
+	Bytes       []byte
+	Closed      bool
+	GeneratedAt time.Time
+}
+
+type WALOptions struct {
+	SegmentMaxBytes int64
+	DurabilityMode  DurabilityMode
+	ReplicationSink ReplicationSink
+}
+
 type fileWAL struct {
 	mu         sync.Mutex
 	path       string
 	auditStore audit.Store
+	options    WALOptions
+	segments   *segmentLog
 }
 
 type walRecord struct {
@@ -135,8 +168,68 @@ type DeadLetterPurgeResult struct {
 	Failures  []DeadLetterReplayFailure `json:"failures,omitempty"`
 }
 
+type segmentLog struct {
+	root         string
+	maxBytes     int64
+	durability   DurabilityMode
+	replication  ReplicationSink
+	activeID     string
+	activeFile   *os.File
+	activeSize   int64
+	nextSequence uint64
+}
+
+type segmentDescriptor struct {
+	id     string
+	path   string
+	closed bool
+}
+
+type MirrorReplicationSink struct {
+	Dir string
+}
+
+func NewMirrorReplicationSink(dir string) ReplicationSink {
+	if strings.TrimSpace(dir) == "" {
+		return nil
+	}
+	return &MirrorReplicationSink{Dir: dir}
+}
+
+func (m *MirrorReplicationSink) Replicate(_ context.Context, replica SegmentReplica) error {
+	if m == nil || strings.TrimSpace(m.Dir) == "" {
+		return nil
+	}
+	if err := os.MkdirAll(m.Dir, 0o755); err != nil {
+		return err
+	}
+	target := filepath.Join(m.Dir, replica.SegmentID)
+	if err := os.WriteFile(target+".tmp", replica.Bytes, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(target+".tmp", target); err != nil {
+		return err
+	}
+	if replica.Closed {
+		return os.WriteFile(target+".closed", []byte(replica.GeneratedAt.UTC().Format(time.RFC3339Nano)+"\n"), 0o644)
+	}
+	return nil
+}
+
 func NewFileWAL(path string) WAL {
-	return &fileWAL{path: path, auditStore: audit.NewFileStore(path + ".audit")}
+	return NewFileWALWithOptions(path, WALOptions{})
+}
+
+func NewFileWALWithOptions(path string, opts WALOptions) WAL {
+	if opts.SegmentMaxBytes <= 0 {
+		opts.SegmentMaxBytes = defaultSegmentMaxBytes
+	}
+	if opts.DurabilityMode == "" {
+		opts.DurabilityMode = DurabilityLocalFsync
+	}
+	w := &fileWAL{path: path, auditStore: audit.NewFileStore(path + ".audit"), options: opts}
+	w.segments = &segmentLog{root: w.segmentRoot(), maxBytes: opts.SegmentMaxBytes, durability: opts.DurabilityMode, replication: opts.ReplicationSink}
+	return w
 }
 
 func (w *fileWAL) AppendDispatched(entry walDispatchedEntry) error {
@@ -146,6 +239,9 @@ func (w *fileWAL) AppendCommitted(messageID string) error {
 	return w.appendRecord(walRecord{Type: "committed", MessageID: messageID})
 }
 func (w *fileWAL) AppendDeadLettered(record DeadLetterRecord) error {
+	if err := w.appendRecord(walRecord{Type: "dead_lettered", MessageID: record.MessageID}); err != nil {
+		return err
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	store, err := w.loadDeadLettersLocked()
@@ -165,26 +261,13 @@ func (w *fileWAL) AppendDeadLettered(record DeadLetterRecord) error {
 func (w *fileWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	f, err := os.Open(w.path)
+	records, err := w.segments.readAllLocked()
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
 		return nil, err
 	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
 	finalized := map[string]struct{}{}
 	pending := map[string]walDispatchedEntry{}
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var rec walRecord
-		if err := json.Unmarshal(line, &rec); err != nil {
-			return nil, fmt.Errorf("decode wal line: %w", err)
-		}
+	for _, rec := range records {
 		switch rec.Type {
 		case "committed", "dead_lettered":
 			finalized[rec.MessageID] = struct{}{}
@@ -198,13 +281,10 @@ func (w *fileWAL) ReplayUnacked() ([]walDispatchedEntry, error) {
 			}
 			payload, err := base64.StdEncoding.DecodeString(rec.Payload)
 			if err != nil {
-				return nil, fmt.Errorf("decode wal payload: %w", err)
+				return nil, fmt.Errorf("decode wal payload for %s: %w", rec.MessageID, err)
 			}
 			pending[rec.MessageID] = walDispatchedEntry{MessageID: rec.MessageID, Consumer: rec.Consumer, SessionID: rec.SessionID, TenantID: rec.TenantID, Topic: rec.Topic, Payload: payload, Priority: rec.Priority, EnqueueSequence: rec.EnqueueSequence, Attempt: rec.Attempt}
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
 	}
 	out := make([]walDispatchedEntry, 0, len(pending))
 	for _, entry := range pending {
@@ -258,6 +338,7 @@ func (w *fileWAL) GetDeadLetter(messageID string) (DeadLetterRecord, bool, error
 func (w *fileWAL) ReplayDeadLetters(req DeadLetterReplayRequest) (DeadLetterReplayResult, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
 	if req.Confirm != "REPLAY" {
 		return DeadLetterReplayResult{}, errors.New("replay requires confirm=REPLAY")
 	}
@@ -477,26 +558,12 @@ func (w *fileWAL) DeleteSessionSnapshot(consumerID string) error {
 func (w *fileWAL) appendRecord(rec walRecord) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(w.path), 0o755); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	encoded, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(append(encoded, '\n')); err != nil {
-		return err
-	}
-	return f.Sync()
+	return w.segments.appendLocked(rec)
 }
 func (w *fileWAL) snapshotPath() string   { return w.path + ".sessions" }
 func (w *fileWAL) scheduledPath() string  { return w.path + ".scheduled" }
 func (w *fileWAL) deadLetterPath() string { return w.path + ".dlq" }
+func (w *fileWAL) segmentRoot() string    { return w.path + ".segments" }
 func (w *fileWAL) SaveScheduled(entries []scheduledMessage) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -613,6 +680,230 @@ func (w *fileWAL) writeDeadLettersLocked(recs map[string]DeadLetterRecord) error
 	}
 	return os.Rename(tmp, w.deadLetterPath())
 }
+
+func (s *segmentLog) appendLocked(rec walRecord) error {
+	if err := os.MkdirAll(s.root, 0o755); err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+	if err := s.ensureActiveLocked(); err != nil {
+		return err
+	}
+	if s.activeSize > 0 && s.activeSize+int64(len(encoded)) > s.maxBytes {
+		if err := s.rollLocked(); err != nil {
+			return err
+		}
+		if err := s.ensureActiveLocked(); err != nil {
+			return err
+		}
+	}
+	if _, err := s.activeFile.Write(encoded); err != nil {
+		return err
+	}
+	if err := s.activeFile.Sync(); err != nil {
+		return err
+	}
+	s.activeSize += int64(len(encoded))
+	return s.replicateLocked(false)
+}
+
+func (s *segmentLog) ensureActiveLocked() error {
+	if s.activeFile != nil {
+		return nil
+	}
+	files, err := s.listSegmentsLocked()
+	if err != nil {
+		return err
+	}
+	for i := len(files) - 1; i >= 0; i-- {
+		if files[i].closed {
+			continue
+		}
+		f, err := os.OpenFile(files[i].path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return err
+		}
+		info, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return err
+		}
+		s.activeID = files[i].id
+		s.activeFile = f
+		s.activeSize = info.Size()
+		s.nextSequence = nextSequenceFromSegmentID(files[i].id) + 1
+		return nil
+	}
+	return s.createActiveLocked()
+}
+
+func (s *segmentLog) createActiveLocked() error {
+	id := formatSegmentID(s.nextSequence)
+	if id == "" {
+		id = formatSegmentID(1)
+	}
+	path := filepath.Join(s.root, id)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	s.activeID = id
+	if next := nextSequenceFromSegmentID(id) + 1; next > s.nextSequence {
+		s.nextSequence = next
+	}
+	s.activeFile = f
+	s.activeSize = 0
+	return nil
+}
+
+func (s *segmentLog) rollLocked() error {
+	if s.activeFile == nil {
+		return nil
+	}
+	if err := s.activeFile.Sync(); err != nil {
+		return err
+	}
+	if err := s.replicateLocked(true); err != nil {
+		return err
+	}
+	closedPath := filepath.Join(s.root, s.activeID+".closed")
+	if err := os.WriteFile(closedPath, []byte(time.Now().UTC().Format(time.RFC3339Nano)+"\n"), 0o644); err != nil {
+		return err
+	}
+	if err := s.activeFile.Close(); err != nil {
+		return err
+	}
+	s.activeFile = nil
+	s.activeID = ""
+	s.activeSize = 0
+	return nil
+}
+
+func (s *segmentLog) replicateLocked(closed bool) error {
+	if s.replication == nil {
+		if s.durability == DurabilityReplicated || s.durability == DurabilityLocalAndReplicated {
+			return errors.New("replication durability requested without replication sink")
+		}
+		return nil
+	}
+	if s.durability != DurabilityReplicated && s.durability != DurabilityLocalAndReplicated && !closed {
+		return nil
+	}
+	path := filepath.Join(s.root, s.activeID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return s.replication.Replicate(context.Background(), SegmentReplica{SegmentID: s.activeID, Bytes: data, Closed: closed, GeneratedAt: time.Now().UTC()})
+}
+
+func (s *segmentLog) readAllLocked() ([]walRecord, error) {
+	segments, err := s.listSegmentsLocked()
+	if err != nil {
+		return nil, err
+	}
+	var out []walRecord
+	for _, seg := range segments {
+		records, err := readSegmentRecords(seg.path, seg.closed)
+		if err != nil {
+			corruptPath := seg.path + ".corrupt"
+			_ = os.Rename(seg.path, corruptPath)
+			if seg.closed {
+				return nil, fmt.Errorf("corrupt closed wal segment %s moved to %s: %w", seg.path, corruptPath, err)
+			}
+			continue
+		}
+		out = append(out, records...)
+	}
+	return out, nil
+}
+
+func (s *segmentLog) listSegmentsLocked() ([]segmentDescriptor, error) {
+	if err := os.MkdirAll(s.root, 0o755); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return nil, err
+	}
+	closedSet := map[string]struct{}{}
+	segments := make([]segmentDescriptor, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasSuffix(name, ".closed") {
+			closedSet[strings.TrimSuffix(name, ".closed")] = struct{}{}
+		}
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".wal") || strings.HasSuffix(name, ".corrupt") {
+			continue
+		}
+		_, closed := closedSet[name]
+		segments = append(segments, segmentDescriptor{id: name, path: filepath.Join(s.root, name), closed: closed})
+		if seq := nextSequenceFromSegmentID(name) + 1; seq > s.nextSequence {
+			s.nextSequence = seq
+		}
+	}
+	sort.Slice(segments, func(i, j int) bool { return segments[i].id < segments[j].id })
+	return segments, nil
+}
+
+func readSegmentRecords(path string, closed bool) ([]walRecord, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	reader := bufio.NewReader(f)
+	var out []walRecord
+	for {
+		line, err := reader.ReadBytes('\n')
+		if errors.Is(err, io.EOF) {
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) == 0 {
+				return out, nil
+			}
+			if !closed {
+				return out, nil
+			}
+			return nil, io.ErrUnexpectedEOF
+		}
+		if err != nil {
+			return nil, err
+		}
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) == 0 {
+			continue
+		}
+		var rec walRecord
+		if err := json.Unmarshal(trimmed, &rec); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+}
+
+func formatSegmentID(seq uint64) string {
+	if seq == 0 {
+		seq = 1
+	}
+	return "segment-" + fmt.Sprintf("%020d", seq) + ".wal"
+}
+
+func nextSequenceFromSegmentID(id string) uint64 {
+	base := strings.TrimSuffix(strings.TrimPrefix(id, "segment-"), ".wal")
+	seq, _ := strconv.ParseUint(base, 10, 64)
+	return seq
+}
+
 func uniqueIDs(ids []string) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, len(ids))

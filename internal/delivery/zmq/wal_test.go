@@ -1,6 +1,8 @@
 package zmq
 
 import (
+	"bytes"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -176,5 +178,79 @@ func TestFileWALAdminAuditTrailRoundTrip(t *testing.T) {
 	}
 	if events[1].PrevHash != events[0].Hash {
 		t.Fatalf("expected chained hashes, got prev=%q hash=%q", events[1].PrevHash, events[0].Hash)
+	}
+}
+
+func TestFileWALReplaysAcrossSegments(t *testing.T) {
+	tmp := t.TempDir()
+	w := NewFileWALWithOptions(filepath.Join(tmp, "delivery.wal"), WALOptions{SegmentMaxBytes: 120})
+
+	if err := w.AppendDispatched(walDispatchedEntry{MessageID: "msg-1", Consumer: "c1", SessionID: "s1", Topic: "orders.created", Payload: []byte("payload-1"), Attempt: 1}); err != nil {
+		t.Fatalf("append dispatched: %v", err)
+	}
+	if err := w.AppendCommitted("msg-1"); err != nil {
+		t.Fatalf("append committed: %v", err)
+	}
+	if err := w.AppendDispatched(walDispatchedEntry{MessageID: "msg-2", Consumer: "c1", SessionID: "s1", Topic: "orders.created", Payload: []byte("payload-2"), Attempt: 2}); err != nil {
+		t.Fatalf("append dispatched: %v", err)
+	}
+
+	entries, err := w.ReplayUnacked()
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(entries) != 1 || entries[0].MessageID != "msg-2" {
+		t.Fatalf("unexpected replay entries: %#v", entries)
+	}
+	segments, err := filepath.Glob(filepath.Join(tmp, "delivery.wal.segments", "segment-*.wal"))
+	if err != nil {
+		t.Fatalf("glob segments: %v", err)
+	}
+	if len(segments) < 2 {
+		t.Fatalf("expected rollover to create multiple segments, got %v", segments)
+	}
+}
+
+func TestFileWALIgnoresPartialActiveSegmentTail(t *testing.T) {
+	tmp := t.TempDir()
+	walPath := filepath.Join(tmp, "delivery.wal")
+	w := NewFileWALWithOptions(walPath, WALOptions{SegmentMaxBytes: 256})
+	if err := w.AppendDispatched(walDispatchedEntry{MessageID: "msg-ok", Consumer: "c1", SessionID: "s1", Topic: "orders.created", Payload: []byte("p1"), Attempt: 1}); err != nil {
+		t.Fatalf("append dispatched: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "delivery.wal.segments", "segment-00000000000000000001.wal"), []byte(`{"type":"dispatched","message_id":"msg-ok","payload":"cDE="}`+"\n"+`{"type":"dispatched","message_id":"msg-partial"`), 0o644); err != nil {
+		t.Fatalf("write partial segment: %v", err)
+	}
+
+	entries, err := w.ReplayUnacked()
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(entries) != 1 || entries[0].MessageID != "msg-ok" {
+		t.Fatalf("expected only intact record replayed, got %#v", entries)
+	}
+}
+
+func TestFileWALReplicatedDurabilityRequiresAckedSink(t *testing.T) {
+	tmp := t.TempDir()
+	w := NewFileWALWithOptions(filepath.Join(tmp, "delivery.wal"), WALOptions{DurabilityMode: DurabilityLocalAndReplicated})
+	if err := w.AppendDispatched(walDispatchedEntry{MessageID: "msg-1", Consumer: "c1", SessionID: "s1", Topic: "orders.created", Payload: []byte("p1"), Attempt: 1}); err == nil {
+		t.Fatalf("expected replication durability without sink to fail")
+	}
+}
+
+func TestFileWALMirrorReplicationSinkMirrorsActiveSegment(t *testing.T) {
+	tmp := t.TempDir()
+	mirror := filepath.Join(tmp, "mirror")
+	w := NewFileWALWithOptions(filepath.Join(tmp, "delivery.wal"), WALOptions{DurabilityMode: DurabilityLocalAndReplicated, ReplicationSink: NewMirrorReplicationSink(mirror), SegmentMaxBytes: 256})
+	if err := w.AppendDispatched(walDispatchedEntry{MessageID: "msg-1", Consumer: "c1", SessionID: "s1", Topic: "orders.created", Payload: []byte("p1"), Attempt: 1}); err != nil {
+		t.Fatalf("append dispatched: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(mirror, "segment-00000000000000000001.wal"))
+	if err != nil {
+		t.Fatalf("read mirrored segment: %v", err)
+	}
+	if !bytes.Contains(data, []byte(`"message_id":"msg-1"`)) {
+		t.Fatalf("expected mirrored payload to contain msg-1, got %s", string(data))
 	}
 }
