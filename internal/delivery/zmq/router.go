@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -49,19 +50,77 @@ type Router struct {
 	maxPerTopicQueue       int
 	maxQueuedDirect        int
 	maxGlobalIngress       int
-	sessionSnapshotTTL     time.Duration
-	directQueue            map[string]*priorityQueue
-	scheduledQueue         []scheduledMessage
-	directSender           func(identity []byte, topic string, payload []byte) error
-	priorityClasses        []string
-	priorityRank           map[string]int
-	priorityWeights        map[string]int
-	priorityBoostThreshold int
-	priorityBoostOffset    int
-	priorityPreemption     bool
-	tenantMetrics          map[string]*TenantDeliveryMetrics
-	tenantQuotas           map[string]TenantQuota
-	defaultTenantQuota     TenantQuota
+
+	targetMaxInflightPerConsumer int
+	targetMaxPerTopicQueue       int
+	policy                       QueueLimitPolicy
+	policyState                  QueueLimitPolicyState
+	policyLastSampleAt           time.Time
+	policyLastRetried            uint64
+	policyLastDeferred           uint64
+	sessionSnapshotTTL           time.Duration
+	directQueue                  map[string]*priorityQueue
+	scheduledQueue               []scheduledMessage
+	directSender                 func(identity []byte, topic string, payload []byte) error
+	priorityClasses              []string
+	priorityRank                 map[string]int
+	priorityWeights              map[string]int
+	priorityBoostThreshold       int
+	priorityBoostOffset          int
+	priorityPreemption           bool
+	tenantMetrics                map[string]*TenantDeliveryMetrics
+	tenantQuotas                 map[string]TenantQuota
+	defaultTenantQuota           TenantQuota
+}
+
+type QueueLimitPolicy struct {
+	Enabled                     bool
+	EvaluationInterval          time.Duration
+	MinHoldTime                 time.Duration
+	MemoryLimitBytes            uint64
+	RetryRateHighWatermark      float64
+	QueueGrowthHighWatermark    float64
+	ConsumerLagHighWatermark    int
+	MemoryPressureHighWatermark float64
+	InflightStep                int
+	QueueStep                   int
+	MinInflightPerConsumer      int
+	MaxInflightPerConsumer      int
+	MinPerTopicQueue            int
+	MaxPerTopicQueue            int
+}
+
+type QueueLimitPolicyInputs struct {
+	ObservedAt      time.Time `json:"observed_at"`
+	ConsumerLag     int       `json:"consumer_lag"`
+	RetryRate       float64   `json:"retry_rate_per_sec"`
+	QueueGrowthRate float64   `json:"queue_growth_rate_per_sec"`
+	MemoryPressure  float64   `json:"memory_pressure"`
+	Inflight        int       `json:"inflight"`
+	Deferred        int       `json:"deferred"`
+}
+
+type QueueLimitPolicyAdjustment struct {
+	AppliedAt           time.Time `json:"applied_at"`
+	Reason              string    `json:"reason"`
+	InflightBefore      int       `json:"inflight_before"`
+	InflightAfter       int       `json:"inflight_after"`
+	PerTopicQueueBefore int       `json:"per_topic_queue_before"`
+	PerTopicQueueAfter  int       `json:"per_topic_queue_after"`
+}
+
+type QueueLimitPolicyState struct {
+	Enabled            bool                         `json:"enabled"`
+	LastEvaluation     time.Time                    `json:"last_evaluation"`
+	LastAppliedAt      time.Time                    `json:"last_applied_at"`
+	CurrentMaxInflight int                          `json:"current_max_inflight_per_consumer"`
+	CurrentMaxDeferred int                          `json:"current_max_per_topic_queue"`
+	DesiredMaxInflight int                          `json:"desired_max_inflight_per_consumer"`
+	DesiredMaxDeferred int                          `json:"desired_max_per_topic_queue"`
+	HoldUntil          time.Time                    `json:"hold_until"`
+	LastReason         string                       `json:"last_reason"`
+	LastInputs         QueueLimitPolicyInputs       `json:"last_inputs"`
+	RecentAdjustments  []QueueLimitPolicyAdjustment `json:"recent_adjustments"`
 }
 
 type deliveryStatus string
@@ -174,6 +233,8 @@ type DeliveryMetrics struct {
 	Dropped           uint64
 	Scheduled         uint64
 	ScheduledPromoted uint64
+	PolicyEvaluations uint64
+	PolicyAdjustments uint64
 }
 
 type TenantDeliveryMetrics struct {
@@ -226,31 +287,34 @@ func NewRouterWithDurability(bindAddress, pubAddress string, publisher domain.Ev
 		deliveryTimeout = 30 * time.Second
 	}
 	router := &Router{
-		bindAddress:            bindAddress,
-		pubAddress:             pubAddress,
-		publisher:              publisher,
-		codec:                  codec,
-		compressor:             compressor,
-		directSessions:         map[string]*consumerSession{},
-		inflight:               map[string]*inflightMessage{},
-		completed:              map[string]deliveryStatus{},
-		maxDirectRetries:       maxDirectRetries,
-		maxInflightPerConsumer: 1024,
-		maxPerTopicQueue:       256,
-		maxQueuedDirect:        4096,
-		maxGlobalIngress:       8192,
-		sessionSnapshotTTL:     5 * time.Minute,
-		directQueue:            map[string]*priorityQueue{},
-		deliveryTimeout:        deliveryTimeout,
-		now:                    func() time.Time { return time.Now().UTC() },
-		wal:                    durability,
-		priorityBoostThreshold: defaultPriorityBoostThreshold,
-		priorityBoostOffset:    defaultPriorityBoostOffset,
-		priorityPreemption:     true,
-		tenantMetrics:          map[string]*TenantDeliveryMetrics{},
-		tenantQuotas:           map[string]TenantQuota{},
+		bindAddress:                  bindAddress,
+		pubAddress:                   pubAddress,
+		publisher:                    publisher,
+		codec:                        codec,
+		compressor:                   compressor,
+		directSessions:               map[string]*consumerSession{},
+		inflight:                     map[string]*inflightMessage{},
+		completed:                    map[string]deliveryStatus{},
+		maxDirectRetries:             maxDirectRetries,
+		maxInflightPerConsumer:       1024,
+		targetMaxInflightPerConsumer: 1024,
+		maxPerTopicQueue:             256,
+		targetMaxPerTopicQueue:       256,
+		maxQueuedDirect:              4096,
+		maxGlobalIngress:             8192,
+		sessionSnapshotTTL:           5 * time.Minute,
+		directQueue:                  map[string]*priorityQueue{},
+		deliveryTimeout:              deliveryTimeout,
+		now:                          func() time.Time { return time.Now().UTC() },
+		wal:                          durability,
+		priorityBoostThreshold:       defaultPriorityBoostThreshold,
+		priorityBoostOffset:          defaultPriorityBoostOffset,
+		priorityPreemption:           true,
+		tenantMetrics:                map[string]*TenantDeliveryMetrics{},
+		tenantQuotas:                 map[string]TenantQuota{},
 	}
 	router.defaultTenantQuota = TenantQuota{MaxInflight: router.maxInflightPerConsumer, MaxQueued: router.maxQueuedDirect, MaxIngress: router.maxGlobalIngress}
+	router.policyState = QueueLimitPolicyState{CurrentMaxInflight: router.maxInflightPerConsumer, DesiredMaxInflight: router.maxInflightPerConsumer, CurrentMaxDeferred: router.maxPerTopicQueue, DesiredMaxDeferred: router.maxPerTopicQueue}
 	router.SetPriorityPolicy([]string{"urgent", "high", "normal", "low"}, map[string]int{"urgent": 4, "high": 3, "normal": 2, "low": 1}, true, defaultPriorityBoostThreshold, defaultPriorityBoostOffset)
 	return router
 }
@@ -303,19 +367,174 @@ func (r *Router) SetMaxInflightPerConsumer(limit int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.maxInflightPerConsumer = limit
+	r.targetMaxInflightPerConsumer = limit
 	r.defaultTenantQuota.MaxInflight = limit
+	r.policyState.CurrentMaxInflight = limit
+	r.policyState.DesiredMaxInflight = limit
 }
 func (r *Router) SetQueueBounds(maxPerTopicQueue, maxQueuedDirect int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if maxPerTopicQueue > 0 {
 		r.maxPerTopicQueue = maxPerTopicQueue
+		r.targetMaxPerTopicQueue = maxPerTopicQueue
+		r.policyState.CurrentMaxDeferred = maxPerTopicQueue
+		r.policyState.DesiredMaxDeferred = maxPerTopicQueue
 	}
 	if maxQueuedDirect > 0 {
 		r.maxQueuedDirect = maxQueuedDirect
 		r.defaultTenantQuota.MaxQueued = maxQueuedDirect
 	}
 }
+
+func (r *Router) SetQueueLimitPolicy(policy QueueLimitPolicy) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.policy = policy
+	r.policyState.Enabled = policy.Enabled
+	if policy.Enabled {
+		if policy.EvaluationInterval <= 0 {
+			r.policy.EvaluationInterval = 2 * time.Second
+		}
+		if policy.MinHoldTime <= 0 {
+			r.policy.MinHoldTime = 5 * time.Second
+		}
+		if policy.InflightStep <= 0 {
+			r.policy.InflightStep = 32
+		}
+		if policy.QueueStep <= 0 {
+			r.policy.QueueStep = 32
+		}
+	}
+}
+
+func (r *Router) evaluateQueueLimitPolicy() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.policy.Enabled {
+		return
+	}
+	now := r.now()
+	if !r.policyLastSampleAt.IsZero() && now.Sub(r.policyLastSampleAt) < r.policy.EvaluationInterval {
+		return
+	}
+	deferred := r.totalQueuedLocked()
+	retried := r.metrics.Retried
+	inputs := QueueLimitPolicyInputs{ObservedAt: now, ConsumerLag: deferred, Inflight: len(r.inflight), Deferred: deferred}
+	if !r.policyLastSampleAt.IsZero() {
+		elapsed := now.Sub(r.policyLastSampleAt).Seconds()
+		if elapsed > 0 {
+			inputs.RetryRate = float64(retried-r.policyLastRetried) / elapsed
+			inputs.QueueGrowthRate = float64(int64(deferred)-int64(r.policyLastDeferred)) / elapsed
+		}
+	}
+	inputs.MemoryPressure = readMemoryPressure(r.policy.MemoryLimitBytes)
+	r.policyLastSampleAt = now
+	r.metrics.PolicyEvaluations++
+	r.policyLastRetried = retried
+	r.policyLastDeferred = uint64(deferred)
+	r.policyState.LastEvaluation = now
+	r.policyState.LastInputs = inputs
+	desiredInflight := r.targetMaxInflightPerConsumer
+	desiredQueue := r.targetMaxPerTopicQueue
+	reason := "steady"
+	pressure := (r.policy.ConsumerLagHighWatermark > 0 && inputs.ConsumerLag >= r.policy.ConsumerLagHighWatermark) || (r.policy.RetryRateHighWatermark > 0 && inputs.RetryRate >= r.policy.RetryRateHighWatermark) || (r.policy.QueueGrowthHighWatermark > 0 && inputs.QueueGrowthRate >= r.policy.QueueGrowthHighWatermark) || (r.policy.MemoryPressureHighWatermark > 0 && inputs.MemoryPressure >= r.policy.MemoryPressureHighWatermark)
+	if pressure {
+		desiredInflight = maxInt(policyFloor(r.policy.MinInflightPerConsumer, 1), r.targetMaxInflightPerConsumer-r.policy.InflightStep)
+		desiredQueue = maxInt(policyFloor(r.policy.MinPerTopicQueue, 1), r.targetMaxPerTopicQueue-r.policy.QueueStep)
+		reason = "pressure_relief"
+	} else if deferred == 0 && inputs.RetryRate == 0 && (r.policy.MemoryPressureHighWatermark <= 0 || inputs.MemoryPressure < r.policy.MemoryPressureHighWatermark*0.5) {
+		desiredInflight = minInt(policyCeil(r.policy.MaxInflightPerConsumer, r.targetMaxInflightPerConsumer), r.targetMaxInflightPerConsumer+r.policy.InflightStep)
+		desiredQueue = minInt(policyCeil(r.policy.MaxPerTopicQueue, r.targetMaxPerTopicQueue), r.targetMaxPerTopicQueue+r.policy.QueueStep)
+		reason = "capacity_recovery"
+	}
+	r.policyState.DesiredMaxInflight = desiredInflight
+	r.policyState.DesiredMaxDeferred = desiredQueue
+	if now.Before(r.policyState.HoldUntil) {
+		r.policyState.LastReason = reason + "_holding"
+		return
+	}
+	if desiredInflight == r.maxInflightPerConsumer && desiredQueue == r.maxPerTopicQueue {
+		r.policyState.LastReason = reason + "_unchanged"
+		return
+	}
+	beforeInflight, beforeQueue := r.maxInflightPerConsumer, r.maxPerTopicQueue
+	r.applyPolicyLimitsLocked(desiredInflight, desiredQueue)
+	r.metrics.PolicyAdjustments++
+	r.policyState.LastAppliedAt = now
+	r.policyState.HoldUntil = now.Add(r.policy.MinHoldTime)
+	r.policyState.LastReason = reason
+	adj := QueueLimitPolicyAdjustment{AppliedAt: now, Reason: reason, InflightBefore: beforeInflight, InflightAfter: r.maxInflightPerConsumer, PerTopicQueueBefore: beforeQueue, PerTopicQueueAfter: r.maxPerTopicQueue}
+	r.policyState.RecentAdjustments = append([]QueueLimitPolicyAdjustment{adj}, r.policyState.RecentAdjustments...)
+	if len(r.policyState.RecentAdjustments) > 8 {
+		r.policyState.RecentAdjustments = r.policyState.RecentAdjustments[:8]
+	}
+}
+
+func (r *Router) applyPolicyLimitsLocked(inflightLimit, perTopicQueueLimit int) {
+	if inflightLimit > 0 {
+		r.maxInflightPerConsumer = inflightLimit
+		r.defaultTenantQuota.MaxInflight = inflightLimit
+		for _, session := range r.directSessions {
+			if session == nil {
+				continue
+			}
+			limit := inflightLimit
+			if session.InflightCount > limit {
+				limit = session.InflightCount
+			}
+			session.MaxInflight = limit
+		}
+		r.policyState.CurrentMaxInflight = inflightLimit
+	}
+	if perTopicQueueLimit > 0 {
+		r.maxPerTopicQueue = perTopicQueueLimit
+		r.policyState.CurrentMaxDeferred = perTopicQueueLimit
+	}
+}
+
+func readMemoryPressure(limitBytes uint64) float64 {
+	if limitBytes == 0 {
+		return 0
+	}
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	return float64(stats.Alloc) / float64(limitBytes)
+}
+
+func policyFloor(value, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
+func policyCeil(value, fallback int) int {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func (r *Router) QueueLimitPolicySnapshot() QueueLimitPolicyState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := r.policyState
+	state.RecentAdjustments = append([]QueueLimitPolicyAdjustment(nil), r.policyState.RecentAdjustments...)
+	return state
+}
+
 func (r *Router) SetGlobalIngressLimit(limit int) {
 	if limit <= 0 {
 		return
@@ -390,6 +609,7 @@ func (r *Router) loop(ctx context.Context) {
 		}
 		r.processInflightTimeouts()
 		r.promoteScheduledDue()
+		r.evaluateQueueLimitPolicy()
 		if len(sockets) > 0 {
 			msg, err := r.routerSocket.RecvMessageBytes(0)
 			if err != nil {

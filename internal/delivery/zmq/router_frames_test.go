@@ -1011,3 +1011,87 @@ func TestTenantQuotaDropsMessagesWithinTenantPartition(t *testing.T) {
 		t.Fatalf("expected one deferred message within tenant queue, got %d", got)
 	}
 }
+
+func TestQueuePolicyRelievesPressureWithHoldTime(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	now := time.Unix(100, 0).UTC()
+	r.now = func() time.Time { return now }
+	r.SetMaxInflightPerConsumer(10)
+	r.SetQueueBounds(8, 32)
+	r.SetQueueLimitPolicy(QueueLimitPolicy{
+		Enabled:                     true,
+		EvaluationInterval:          time.Second,
+		MinHoldTime:                 5 * time.Second,
+		ConsumerLagHighWatermark:    1,
+		RetryRateHighWatermark:      100,
+		QueueGrowthHighWatermark:    100,
+		MemoryPressureHighWatermark: 1,
+		InflightStep:                2,
+		QueueStep:                   2,
+		MinInflightPerConsumer:      4,
+		MaxInflightPerConsumer:      10,
+		MinPerTopicQueue:            4,
+		MaxPerTopicQueue:            8,
+	})
+	r.directQueue[tenantTopicKey("", "orders.created")] = &priorityQueue{Messages: []queuedDirectMessage{{MessageID: "m1", Topic: "orders.created"}, {MessageID: "m2", Topic: "orders.created"}}}
+
+	r.evaluateQueueLimitPolicy()
+	state := r.QueueLimitPolicySnapshot()
+	if state.CurrentMaxInflight != 8 || state.CurrentMaxDeferred != 6 {
+		t.Fatalf("expected reduced limits 8/6, got %d/%d", state.CurrentMaxInflight, state.CurrentMaxDeferred)
+	}
+	if len(state.RecentAdjustments) != 1 || state.RecentAdjustments[0].Reason != "pressure_relief" {
+		t.Fatalf("expected pressure_relief adjustment, got %#v", state.RecentAdjustments)
+	}
+
+	now = now.Add(2 * time.Second)
+	r.evaluateQueueLimitPolicy()
+	state = r.QueueLimitPolicySnapshot()
+	if state.CurrentMaxInflight != 8 || state.LastReason != "pressure_relief_holding" {
+		t.Fatalf("expected hold to preserve inflight=8, got state=%#v", state)
+	}
+}
+
+func TestQueuePolicyRecoveryRespectsSessionInflight(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	now := time.Unix(200, 0).UTC()
+	r.now = func() time.Time { return now }
+	r.directSessions["worker-1"] = &consumerSession{ConsumerID: "worker-1", SessionID: "sess_1", TransportIdentity: []byte("cid1"), MaxInflight: 5, InflightCount: 5, Capabilities: capabilityHints{SupportsAck: true}, Subscriptions: map[string]struct{}{"orders.created": {}}}
+	r.SetMaxInflightPerConsumer(5)
+	r.SetQueueBounds(4, 32)
+	r.SetQueueLimitPolicy(QueueLimitPolicy{Enabled: true, EvaluationInterval: time.Second, MinHoldTime: time.Second, ConsumerLagHighWatermark: 10, RetryRateHighWatermark: 10, QueueGrowthHighWatermark: 10, MemoryPressureHighWatermark: 1, InflightStep: 2, QueueStep: 1, MinInflightPerConsumer: 2, MaxInflightPerConsumer: 9, MinPerTopicQueue: 2, MaxPerTopicQueue: 6})
+
+	r.evaluateQueueLimitPolicy()
+	state := r.QueueLimitPolicySnapshot()
+	if state.CurrentMaxInflight != 7 || state.CurrentMaxDeferred != 5 {
+		t.Fatalf("expected recovered limits 7/5, got %d/%d", state.CurrentMaxInflight, state.CurrentMaxDeferred)
+	}
+	if got := r.directSessions["worker-1"].MaxInflight; got != 7 {
+		t.Fatalf("expected session max inflight raised to 7, got %d", got)
+	}
+
+	r.maxInflightPerConsumer = 4
+	r.applyPolicyLimitsLocked(3, 5)
+	if got := r.directSessions["worker-1"].MaxInflight; got != 5 {
+		t.Fatalf("expected live inflight count to protect ordering-safe floor, got %d", got)
+	}
+}
+
+func TestQueuePolicySnapshotExposesInputsAndCounters(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	now := time.Unix(300, 0).UTC()
+	r.now = func() time.Time { return now }
+	r.SetQueueLimitPolicy(QueueLimitPolicy{Enabled: true, EvaluationInterval: time.Second, MinHoldTime: time.Second, ConsumerLagHighWatermark: 100, RetryRateHighWatermark: 100, QueueGrowthHighWatermark: 100, MemoryPressureHighWatermark: 1, InflightStep: 1, QueueStep: 1, MinInflightPerConsumer: 1, MaxInflightPerConsumer: 1024, MinPerTopicQueue: 1, MaxPerTopicQueue: 256})
+	r.metrics.Retried = 3
+	r.directQueue[tenantTopicKey("tenant-a", "orders.created")] = &priorityQueue{Messages: []queuedDirectMessage{{MessageID: "m1", TenantID: "tenant-a", Topic: "orders.created"}}}
+
+	r.evaluateQueueLimitPolicy()
+	metrics := r.MetricsSnapshot()
+	if metrics.PolicyEvaluations != 1 {
+		t.Fatalf("expected one policy evaluation, got %d", metrics.PolicyEvaluations)
+	}
+	state := r.QueueLimitPolicySnapshot()
+	if !state.Enabled || state.LastInputs.ConsumerLag != 1 || state.LastInputs.Deferred != 1 {
+		t.Fatalf("expected snapshot inputs to include lag/deferred, got %#v", state.LastInputs)
+	}
+}

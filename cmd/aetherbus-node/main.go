@@ -55,6 +55,33 @@ func main() {
 		durability,
 	)
 
+	zmqRouter.SetMaxInflightPerConsumer(cfg.MaxInflightPerConsumer)
+	zmqRouter.SetQueueBounds(cfg.MaxPerTopicQueue, cfg.MaxQueuedDirect)
+	zmqRouter.SetGlobalIngressLimit(cfg.MaxGlobalIngress)
+	zmqRouter.SetPriorityPolicy(
+		cfg.SupportedPriorityClasses,
+		cfg.PriorityClassWeights,
+		cfg.PriorityPreemption,
+		cfg.PriorityBoostThreshold,
+		cfg.PriorityBoostOffset,
+	)
+	zmqRouter.SetQueueLimitPolicy(zmq.QueueLimitPolicy{
+		Enabled:                     cfg.QueueLimitPolicy.Enabled,
+		EvaluationInterval:          time.Duration(cfg.QueueLimitPolicy.EvaluationIntervalMS) * time.Millisecond,
+		MinHoldTime:                 time.Duration(cfg.QueueLimitPolicy.MinHoldTimeMS) * time.Millisecond,
+		MemoryLimitBytes:            cfg.QueueLimitPolicy.MemoryLimitBytes,
+		RetryRateHighWatermark:      cfg.QueueLimitPolicy.RetryRateHighWatermark,
+		QueueGrowthHighWatermark:    cfg.QueueLimitPolicy.QueueGrowthHighWatermark,
+		ConsumerLagHighWatermark:    cfg.QueueLimitPolicy.ConsumerLagHighWatermark,
+		MemoryPressureHighWatermark: cfg.QueueLimitPolicy.MemoryPressureHighWatermark,
+		InflightStep:                cfg.QueueLimitPolicy.InflightStep,
+		QueueStep:                   cfg.QueueLimitPolicy.QueueStep,
+		MinInflightPerConsumer:      cfg.QueueLimitPolicy.MinInflightPerConsumer,
+		MaxInflightPerConsumer:      cfg.QueueLimitPolicy.MaxInflightPerConsumer,
+		MinPerTopicQueue:            cfg.QueueLimitPolicy.MinPerTopicQueue,
+		MaxPerTopicQueue:            cfg.QueueLimitPolicy.MaxPerTopicQueue,
+	})
+
 	if err := zmqRouter.Start(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start ZMQ Router: %v\n", err)
 		os.Exit(1)

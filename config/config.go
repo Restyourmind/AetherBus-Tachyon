@@ -9,6 +9,24 @@ import (
 
 // Config holds the application configuration.
 // Values are populated from environment variables.
+type QueueLimitPolicyConfig struct {
+	Enabled                     bool
+	EvaluationIntervalMS        int
+	MinHoldTimeMS               int
+	MemoryLimitBytes            uint64
+	RetryRateHighWatermark      float64
+	QueueGrowthHighWatermark    float64
+	ConsumerLagHighWatermark    int
+	MemoryPressureHighWatermark float64
+	InflightStep                int
+	QueueStep                   int
+	MinInflightPerConsumer      int
+	MaxInflightPerConsumer      int
+	MinPerTopicQueue            int
+	MaxPerTopicQueue            int
+}
+
+// Config holds the application configuration.
 type Config struct {
 	ZmqBindAddress           string
 	ZmqPubAddress            string
@@ -30,6 +48,7 @@ type Config struct {
 	PriorityPreemption       bool
 	PriorityBoostThreshold   int
 	PriorityBoostOffset      int
+	QueueLimitPolicy         QueueLimitPolicyConfig
 }
 
 // Load reads configuration from environment variables and returns a new Config struct.
@@ -56,6 +75,22 @@ func Load() (*Config, error) {
 		PriorityBoostOffset:      getenvIntOrDefault("DIRECT_PRIORITY_BOOST_OFFSET", 1000),
 	}
 	cfg.PriorityClassWeights = getenvPriorityWeightsOrDefault("DIRECT_PRIORITY_WEIGHTS", cfg.SupportedPriorityClasses)
+	cfg.QueueLimitPolicy = QueueLimitPolicyConfig{
+		Enabled:                     getenvBoolOrDefault("QUEUE_POLICY_ENABLED", false),
+		EvaluationIntervalMS:        getenvIntOrDefault("QUEUE_POLICY_EVALUATION_INTERVAL_MS", 2000),
+		MinHoldTimeMS:               getenvIntOrDefault("QUEUE_POLICY_MIN_HOLD_MS", 5000),
+		MemoryLimitBytes:            getenvUint64OrDefault("QUEUE_POLICY_MEMORY_LIMIT_BYTES", 512*1024*1024),
+		RetryRateHighWatermark:      getenvFloatOrDefault("QUEUE_POLICY_RETRY_RATE_HIGH_WATERMARK", 4.0),
+		QueueGrowthHighWatermark:    getenvFloatOrDefault("QUEUE_POLICY_QUEUE_GROWTH_HIGH_WATERMARK", 32.0),
+		ConsumerLagHighWatermark:    getenvIntOrDefault("QUEUE_POLICY_CONSUMER_LAG_HIGH_WATERMARK", 256),
+		MemoryPressureHighWatermark: getenvFloatOrDefault("QUEUE_POLICY_MEMORY_PRESSURE_HIGH_WATERMARK", 0.85),
+		InflightStep:                getenvIntOrDefault("QUEUE_POLICY_INFLIGHT_STEP", 32),
+		QueueStep:                   getenvIntOrDefault("QUEUE_POLICY_QUEUE_STEP", 32),
+		MinInflightPerConsumer:      getenvIntOrDefault("QUEUE_POLICY_MIN_INFLIGHT_PER_CONSUMER", 128),
+		MaxInflightPerConsumer:      getenvIntOrDefault("QUEUE_POLICY_MAX_INFLIGHT_PER_CONSUMER", cfg.MaxInflightPerConsumer),
+		MinPerTopicQueue:            getenvIntOrDefault("QUEUE_POLICY_MIN_PER_TOPIC_QUEUE", 64),
+		MaxPerTopicQueue:            getenvIntOrDefault("QUEUE_POLICY_MAX_PER_TOPIC_QUEUE", cfg.MaxPerTopicQueue),
+	}
 
 	return cfg, nil
 }
@@ -159,4 +194,28 @@ func getenvPriorityWeightsOrDefault(key string, classes []string) map[string]int
 		normalized[class] = weights[class]
 	}
 	return normalized
+}
+
+func getenvUint64OrDefault(key string, defaultValue uint64) uint64 {
+	value, ok := os.LookupEnv(key)
+	if !ok || value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || parsed == 0 {
+		return defaultValue
+	}
+	return parsed
+}
+
+func getenvFloatOrDefault(key string, defaultValue float64) float64 {
+	value, ok := os.LookupEnv(key)
+	if !ok || value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil || parsed <= 0 {
+		return defaultValue
+	}
+	return parsed
 }

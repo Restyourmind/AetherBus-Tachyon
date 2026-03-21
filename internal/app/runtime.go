@@ -65,6 +65,22 @@ func NewRuntimeWithCompressor(cfg *config.Config, bootstrapRoutes map[string]str
 		cfg.PriorityBoostThreshold,
 		cfg.PriorityBoostOffset,
 	)
+	router.SetQueueLimitPolicy(zmq.QueueLimitPolicy{
+		Enabled:                     cfg.QueueLimitPolicy.Enabled,
+		EvaluationInterval:          time.Duration(cfg.QueueLimitPolicy.EvaluationIntervalMS) * time.Millisecond,
+		MinHoldTime:                 time.Duration(cfg.QueueLimitPolicy.MinHoldTimeMS) * time.Millisecond,
+		MemoryLimitBytes:            cfg.QueueLimitPolicy.MemoryLimitBytes,
+		RetryRateHighWatermark:      cfg.QueueLimitPolicy.RetryRateHighWatermark,
+		QueueGrowthHighWatermark:    cfg.QueueLimitPolicy.QueueGrowthHighWatermark,
+		ConsumerLagHighWatermark:    cfg.QueueLimitPolicy.ConsumerLagHighWatermark,
+		MemoryPressureHighWatermark: cfg.QueueLimitPolicy.MemoryPressureHighWatermark,
+		InflightStep:                cfg.QueueLimitPolicy.InflightStep,
+		QueueStep:                   cfg.QueueLimitPolicy.QueueStep,
+		MinInflightPerConsumer:      cfg.QueueLimitPolicy.MinInflightPerConsumer,
+		MaxInflightPerConsumer:      cfg.QueueLimitPolicy.MaxInflightPerConsumer,
+		MinPerTopicQueue:            cfg.QueueLimitPolicy.MinPerTopicQueue,
+		MaxPerTopicQueue:            cfg.QueueLimitPolicy.MaxPerTopicQueue,
+	})
 
 	return &Runtime{
 		RouteStore:   routeStore,

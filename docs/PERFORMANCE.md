@@ -135,6 +135,20 @@ Health metrics:
 - `inflight_messages`
 - `retry_queue_depth`
 - `dlq_depth`
+- `queue_policy_evaluations_total` / `queue_policy_adjustments_total`
+- queue-policy health inputs: `consumer_lag`, retry rate, queue growth rate, and memory pressure
+
+## 6.1 Runtime queue-limit controller
+
+Direct delivery queue limits can now be managed by a policy controller instead of remaining fixed for the life of the process.
+
+Recommended operating notes:
+
+- Enable with `QUEUE_POLICY_ENABLED=true` when a workload has bursty consumer lag or fluctuating memory pressure.
+- Use `QUEUE_POLICY_CONSUMER_LAG_HIGH_WATERMARK`, `QUEUE_POLICY_RETRY_RATE_HIGH_WATERMARK`, `QUEUE_POLICY_QUEUE_GROWTH_HIGH_WATERMARK`, and `QUEUE_POLICY_MEMORY_PRESSURE_HIGH_WATERMARK` to define pressure signals.
+- Keep `QUEUE_POLICY_INFLIGHT_STEP` and `QUEUE_POLICY_QUEUE_STEP` modest so each recalculation changes capacity gradually.
+- Use `QUEUE_POLICY_MIN_HOLD_MS` to avoid oscillation; the router will not apply another limit change until the hold window expires.
+- The controller only changes capacity ceilings. Queue ordering still follows priority + enqueue sequence, and inflight reductions never evict already-dispatched messages.
 
 ## 7) Initial Target Template
 

@@ -607,6 +607,10 @@ Current broker runtime behavior (`internal/delivery/zmq.Router`) includes:
   - any other status is treated as terminal and finalized as dead-lettered
 - direct delivery counters for dispatched, acked, nacked, retried, and dead-lettered messages
 - per-consumer direct backpressure guard via `max_inflight_per_consumer` (hard cap for direct session inflight windows)
+- optional queue-limit policy controller that samples broker health (`consumer_lag`, retry rate, queue growth, and process memory pressure) and periodically tunes direct inflight / deferred limits at runtime
+  - adjustments are bounded by configured `*_STEP` values and held for at least `QUEUE_POLICY_MIN_HOLD_MS` before another change is applied
+  - limit reductions never revoke already-issued inflight slots; active sessions keep enough headroom to preserve deterministic per-topic ordering while new dispatches observe the lower cap
+  - current controller state and recent adjustments are available through `QueueLimitPolicySnapshot()` alongside the standard delivery metrics
 - direct dispatch pause/backlog counters when a matching consumer is saturated
 - bounded deferred direct queues with explicit overload drop behavior:
   - per-topic deferred queue bound (`max_per_topic_queue`, default `256`)
