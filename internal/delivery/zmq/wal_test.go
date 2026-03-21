@@ -77,3 +77,22 @@ func TestFileWALSessionSnapshotsRoundTrip(t *testing.T) {
 		t.Fatalf("expected snapshots empty after delete, got %#v", snapshots)
 	}
 }
+
+func TestFileWALScheduledRoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	w := NewFileWAL(filepath.Join(tmp, "delivery.wal"))
+	entries := []scheduledMessage{{Sequence: 2, MessageID: "msg-2", Topic: "orders.created", Payload: []byte("later"), DeliverAt: time.Unix(200, 0).UTC()}, {Sequence: 1, MessageID: "msg-1", Topic: "orders.created", Payload: []byte("first"), DeliverAt: time.Unix(100, 0).UTC()}}
+	if err := w.SaveScheduled(entries); err != nil {
+		t.Fatalf("save scheduled: %v", err)
+	}
+	loaded, err := w.LoadScheduled()
+	if err != nil {
+		t.Fatalf("load scheduled: %v", err)
+	}
+	if len(loaded) != 2 {
+		t.Fatalf("expected 2 scheduled entries, got %d", len(loaded))
+	}
+	if loaded[0].MessageID != "msg-1" || loaded[1].MessageID != "msg-2" {
+		t.Fatalf("expected scheduled queue sorted by deliver_at then sequence, got %#v", loaded)
+	}
+}

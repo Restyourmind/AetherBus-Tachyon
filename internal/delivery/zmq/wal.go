@@ -20,6 +20,8 @@ type WAL interface {
 	SaveSessionSnapshot(snapshot sessionSnapshot) error
 	LoadSessionSnapshots() ([]sessionSnapshot, error)
 	DeleteSessionSnapshot(consumerID string) error
+	SaveScheduled(entries []scheduledMessage) error
+	LoadScheduled() ([]scheduledMessage, error)
 }
 
 type fileWAL struct {
@@ -169,6 +171,51 @@ func (w *fileWAL) appendRecord(rec walRecord) error {
 }
 
 func (w *fileWAL) snapshotPath() string { return w.path + ".sessions" }
+func (w *fileWAL) scheduledPath() string { return w.path + ".scheduled" }
+
+
+func (w *fileWAL) SaveScheduled(entries []scheduledMessage) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(w.scheduledPath()), 0o755); err != nil {
+		return err
+	}
+	encoded, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := w.scheduledPath() + ".tmp"
+	if err := os.WriteFile(tmp, append(encoded, '\n'), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, w.scheduledPath())
+}
+
+func (w *fileWAL) LoadScheduled() ([]scheduledMessage, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	data, err := os.ReadFile(w.scheduledPath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var entries []scheduledMessage
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("decode scheduled queue: %w", err)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].DeliverAt.Equal(entries[j].DeliverAt) {
+			return entries[i].Sequence < entries[j].Sequence
+		}
+		return entries[i].DeliverAt.Before(entries[j].DeliverAt)
+	})
+	return entries, nil
+}
 
 func (w *fileWAL) loadSnapshotsLocked() (map[string]sessionSnapshot, error) {
 	path := w.snapshotPath()

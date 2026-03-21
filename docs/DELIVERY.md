@@ -43,6 +43,17 @@ Before delivery execution, the routing layer returns a structured decision:
 
 For `unroutable`, the broker SHOULD increment unroutable counters and MUST avoid dispatching to direct/fanout transports for that event.
 
+
+## 2.2 Scheduled Delivery Contract
+
+The broker MAY accept a target delivery timestamp on ingress.
+
+- `deliver_at_unix_ms` requests that direct dispatch does not begin before that time
+- the broker MUST validate that the timestamp is not in the past
+- the broker SHOULD reject timestamps beyond its configured scheduling horizon
+- retry scheduling MAY be represented internally as `next_attempt_unix_ms`
+- delayed entries SHOULD survive broker restart when durability is enabled
+
 ## 3. Transport Model
 
 AetherBus-Tachyon is built on ZeroMQ transport patterns.
@@ -319,6 +330,7 @@ If the status indicates a recoverable failure:
 
 - the broker MAY schedule a retry
 - the broker SHOULD increment delivery attempt count
+- the retry queue SHOULD persist the next-attempt timestamp when durability is enabled
 - the broker SHOULD preserve the original message identity
 
 ### 11.2 Non-Retryable NACK
@@ -580,6 +592,10 @@ The delivery subsystem SHOULD expose metrics such as:
 ## 24A. Current Runtime Implementation Notes
 
 Current broker runtime behavior (`internal/delivery/zmq.Router`) includes:
+
+- scheduled direct publishes are held until `deliver_at_unix_ms` becomes due
+- retryable NACKs and ACK timeouts are persisted in a delayed queue with a next-attempt timestamp
+- delayed queue entries are promoted into normal direct dispatch flow once due, including after restart recovery
 
 - direct consumer session registration via control messages on `_control`
 - direct inflight registry keyed by `message_id`

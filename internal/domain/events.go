@@ -16,7 +16,10 @@ type Event struct {
 	Source string
 
 	// Timestamp is the time the event was created, in UTC.
-	Timestamp time.Time
+	Timestamp time.Time `json:"timestamp"`
+
+	// DeliverAt requests that broker dispatch not start before this UTC timestamp.
+	DeliverAt time.Time `json:"deliver_at,omitempty"`
 
 	// Data is the payload of the event. It can be any structured data.
 	Data interface{}
@@ -38,4 +41,8 @@ type Envelope struct {
 	ClientID []byte
 	// Event is the event itself.
 	Event Event
+	// DeliverAt requests that broker dispatch does not begin before this UTC timestamp.
+	DeliverAt time.Time
+	// NextAttemptAt is broker-managed scheduler state for delayed retries/promotions.
+	NextAttemptAt time.Time
 }

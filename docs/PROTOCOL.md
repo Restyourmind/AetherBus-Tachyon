@@ -107,7 +107,9 @@ The canonical envelope is the logical message structure used inside the broker.
     "customer_id": "cust_42",
     "amount": 199.95
   },
-  "timestamp_unix_ms": 1741337000000
+  "timestamp_unix_ms": 1741337000000,
+  "deliver_at_unix_ms": 1741337060000,
+  "next_attempt_unix_ms": 1741337090000
 }
 ```
 
@@ -134,6 +136,8 @@ The following fields are OPTIONAL:
 - auth
 - deadline_unix_ms
 - attempt
+- deliver_at_unix_ms
+- next_attempt_unix_ms
 
 ### 5.4 Field Semantics
 
@@ -173,6 +177,14 @@ Application-defined message body.
 #### timestamp_unix_ms
 
 Message creation timestamp in Unix milliseconds.
+
+#### deliver_at_unix_ms
+
+Earliest broker delivery timestamp in Unix milliseconds. When present, the broker MUST hold the message until this time before first dispatch. Past values MUST be rejected, and values beyond the broker scheduling horizon SHOULD be rejected.
+
+#### next_attempt_unix_ms
+
+Broker-managed retry scheduler timestamp in Unix milliseconds. Producers SHOULD omit this field on ingress. Brokers MAY set it when persisting delayed retries or forwarding an internal scheduled envelope.
 
 ## 6. Headers
 
@@ -578,7 +590,9 @@ An implementation is minimally compliant with abtp/1 if it:
   "payload": {
     "id": "123"
   },
-  "timestamp_unix_ms": 1741337000000
+  "timestamp_unix_ms": 1741337000000,
+  "deliver_at_unix_ms": 1741337060000,
+  "next_attempt_unix_ms": 1741337090000
 }
 ```
 
@@ -606,6 +620,8 @@ An implementation is minimally compliant with abtp/1 if it:
     "order_id": "ord_1001",
     "customer_id": "cust_42"
   },
-  "timestamp_unix_ms": 1741337000000
+  "timestamp_unix_ms": 1741337000000,
+  "deliver_at_unix_ms": 1741337060000,
+  "next_attempt_unix_ms": 1741337090000
 }
 ```

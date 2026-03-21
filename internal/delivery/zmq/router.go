@@ -14,6 +14,8 @@ import (
 	"github.com/pebbe/zmq4"
 )
 
+const maxScheduledDeliveryHorizon = 365 * 24 * time.Hour
+
 // Router manages the ZMQ ROUTER socket for incoming events.
 type Router struct {
 	bindAddress     string
@@ -34,6 +36,7 @@ type Router struct {
 	inflight               map[string]*inflightMessage
 	completed              map[string]deliveryStatus
 	nextSessionID          uint64
+	nextScheduleSequence   uint64
 	metrics                DeliveryMetrics
 	maxDirectRetries       int
 	maxInflightPerConsumer int
@@ -42,6 +45,7 @@ type Router struct {
 	maxGlobalIngress       int
 	sessionSnapshotTTL     time.Duration
 	directQueue            map[string][]queuedDirectMessage
+	scheduledQueue         []scheduledMessage
 	directSender           func(identity []byte, topic string, payload []byte) error
 }
 
@@ -111,6 +115,16 @@ type queuedDirectMessage struct {
 	Payload   []byte
 }
 
+type scheduledMessage struct {
+	Sequence        uint64    `json:"sequence"`
+	MessageID       string    `json:"message_id"`
+	Topic           string    `json:"topic"`
+	Payload         []byte    `json:"payload"`
+	DeliveryAttempt int       `json:"delivery_attempt,omitempty"`
+	DeliverAt       time.Time `json:"deliver_at"`
+	Reason          string    `json:"reason,omitempty"`
+}
+
 // DeliveryMetrics captures direct-delivery lifecycle counters.
 type DeliveryMetrics struct {
 	Ingress           uint64
@@ -130,6 +144,8 @@ type DeliveryMetrics struct {
 	Deferred          uint64
 	Throttled         uint64
 	Dropped           uint64
+	Scheduled         uint64
+	ScheduledPromoted uint64
 }
 
 // ConsumerBacklogMetrics captures per-consumer direct dispatch pressure.
@@ -156,17 +172,12 @@ type controlMessage struct {
 	} `json:"capabilities"`
 }
 
-// NewRouter creates a new ZMQ Router.
 func NewRouter(bindAddress, pubAddress string, publisher domain.EventPublisher, codec domain.Codec, compressor domain.Compressor) *Router {
 	return NewRouterWithOptions(bindAddress, pubAddress, publisher, codec, compressor, 3, 30*time.Second)
 }
-
-// NewRouterWithOptions creates a router with configurable retry and timeout behavior.
 func NewRouterWithOptions(bindAddress, pubAddress string, publisher domain.EventPublisher, codec domain.Codec, compressor domain.Compressor, maxDirectRetries int, deliveryTimeout time.Duration) *Router {
 	return NewRouterWithDurability(bindAddress, pubAddress, publisher, codec, compressor, maxDirectRetries, deliveryTimeout, nil)
 }
-
-// NewRouterWithDurability creates a router with configurable retry/timeout behavior and optional WAL durability.
 func NewRouterWithDurability(bindAddress, pubAddress string, publisher domain.EventPublisher, codec domain.Codec, compressor domain.Compressor, maxDirectRetries int, deliveryTimeout time.Duration, durability WAL) *Router {
 	if maxDirectRetries <= 0 {
 		maxDirectRetries = 3
@@ -174,7 +185,6 @@ func NewRouterWithDurability(bindAddress, pubAddress string, publisher domain.Ev
 	if deliveryTimeout <= 0 {
 		deliveryTimeout = 30 * time.Second
 	}
-
 	return &Router{
 		bindAddress:            bindAddress,
 		pubAddress:             pubAddress,
@@ -201,38 +211,34 @@ func (r *Router) Start(ctx context.Context) error {
 	if err := r.loadSessionSnapshots(); err != nil {
 		return fmt.Errorf("failed to load session snapshots: %w", err)
 	}
-
+	if err := r.loadScheduledQueue(); err != nil {
+		return fmt.Errorf("failed to load delayed queue: %w", err)
+	}
 	routerSocket, err := zmq4.NewSocket(zmq4.ROUTER)
 	if err != nil {
 		return fmt.Errorf("failed to create router socket: %w", err)
 	}
 	r.routerSocket = routerSocket
-
 	pubSocket, err := zmq4.NewSocket(zmq4.PUB)
 	if err != nil {
 		return fmt.Errorf("failed to create pub socket: %w", err)
 	}
 	r.pubSocket = pubSocket
-
 	if err := r.routerSocket.Bind(r.bindAddress); err != nil {
 		return fmt.Errorf("failed to bind router socket: %w", err)
 	}
 	if err := r.pubSocket.Bind(r.pubAddress); err != nil {
 		return fmt.Errorf("failed to bind pub socket: %w", err)
 	}
-
 	fmt.Println("ZMQ Router started")
-
 	r.directSender = func(identity []byte, topic string, payload []byte) error {
 		_, err := r.routerSocket.SendMessage(identity, "", topic, payload)
 		return err
 	}
-
 	go r.loop(ctx)
 	return nil
 }
 
-// Stop gracefully closes the ZMQ sockets.
 func (r *Router) Stop() {
 	if r.routerSocket != nil {
 		_ = r.routerSocket.Close()
@@ -242,8 +248,6 @@ func (r *Router) Stop() {
 	}
 	fmt.Println("ZMQ Router stopped")
 }
-
-// SetMaxInflightPerConsumer configures the hard upper bound for a direct consumer inflight window.
 func (r *Router) SetMaxInflightPerConsumer(limit int) {
 	if limit <= 0 {
 		return
@@ -252,8 +256,6 @@ func (r *Router) SetMaxInflightPerConsumer(limit int) {
 	defer r.mu.Unlock()
 	r.maxInflightPerConsumer = limit
 }
-
-// SetQueueBounds configures per-topic and global queued direct-message limits.
 func (r *Router) SetQueueBounds(maxPerTopicQueue, maxQueuedDirect int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -264,8 +266,6 @@ func (r *Router) SetQueueBounds(maxPerTopicQueue, maxQueuedDirect int) {
 		r.maxQueuedDirect = maxQueuedDirect
 	}
 }
-
-// SetGlobalIngressLimit configures a hard cap for inflight+queued direct messages.
 func (r *Router) SetGlobalIngressLimit(limit int) {
 	if limit <= 0 {
 		return
@@ -277,10 +277,8 @@ func (r *Router) SetGlobalIngressLimit(limit int) {
 
 func (r *Router) loop(ctx context.Context) {
 	defer r.Stop()
-
 	poller := zmq4.NewPoller()
 	poller.Add(r.routerSocket, zmq4.POLLIN)
-
 	for {
 		sockets, err := poller.Poll(250 * time.Millisecond)
 		if err != nil {
@@ -289,15 +287,13 @@ func (r *Router) loop(ctx context.Context) {
 			}
 			continue
 		}
-
 		r.processInflightTimeouts()
-
+		r.promoteScheduledDue()
 		if len(sockets) > 0 {
 			msg, err := r.routerSocket.RecvMessageBytes(0)
 			if err != nil {
 				continue
 			}
-
 			clientID, topic, rawEvent, err := parseFrames(msg)
 			if err != nil {
 				continue
@@ -315,16 +311,23 @@ func (r *Router) loop(ctx context.Context) {
 				r.handleControl(clientID, decompressedEvent)
 				continue
 			}
-
 			var event domain.Event
 			if err := r.codec.Decode(decompressedEvent, &event); err != nil {
 				fmt.Printf("failed to decode event: %v\n", err)
 				continue
 			}
 			event.Topic = topic
-			envelope := domain.Envelope{ClientID: clientID, Event: event}
-
+			envelope := domain.Envelope{ClientID: clientID, Event: event, DeliverAt: event.DeliverAt}
+			if err := validateScheduleTimestamp(r.now(), envelope.DeliverAt); err != nil {
+				fmt.Printf("invalid delivery timestamp for %q: %v\n", event.ID, err)
+				r.mu.Lock()
+				r.metrics.Dropped++
+				r.mu.Unlock()
+				continue
+			}
+			r.mu.Lock()
 			r.metrics.Ingress++
+			r.mu.Unlock()
 			publishResult := domain.PublishResult{Status: domain.RouteStatusRouted, Topic: event.Topic}
 			if publisherWithResult, ok := r.publisher.(domain.EventPublisherWithResult); ok {
 				resolved, err := publisherWithResult.PublishWithResult(ctx, envelope)
@@ -339,22 +342,41 @@ func (r *Router) loop(ctx context.Context) {
 					continue
 				}
 			}
-
 			if publishResult.Status == domain.RouteStatusUnroutable {
+				r.mu.Lock()
 				r.metrics.Unroutable++
+				r.mu.Unlock()
 				continue
 			}
+			r.mu.Lock()
 			r.metrics.Routed++
-
+			r.mu.Unlock()
 			if _, err := r.pubSocket.SendMessage(event.Topic, decompressedEvent); err != nil {
 				fmt.Printf("failed to fan out event on PUB socket: %v\n", err)
 			}
-			r.dispatchDirect(event.Topic, event.ID, decompressedEvent)
+			if !event.DeliverAt.IsZero() && event.DeliverAt.After(r.now()) {
+				r.scheduleDispatch(topic, event.ID, decompressedEvent, 1, event.DeliverAt, "publish")
+			} else {
+				r.dispatchDirect(topic, event.ID, decompressedEvent)
+			}
 		}
 		if ctx.Err() != nil {
 			break
 		}
 	}
+}
+
+func validateScheduleTimestamp(now, deliverAt time.Time) error {
+	if deliverAt.IsZero() {
+		return nil
+	}
+	if deliverAt.Before(now) {
+		return fmt.Errorf("delivery timestamp %s is in the past", deliverAt.UTC().Format(time.RFC3339Nano))
+	}
+	if deliverAt.Sub(now) > maxScheduledDeliveryHorizon {
+		return fmt.Errorf("delivery timestamp exceeds %s horizon", maxScheduledDeliveryHorizon)
+	}
+	return nil
 }
 
 func (r *Router) loadSessionSnapshots() error {
@@ -391,6 +413,37 @@ func (r *Router) loadSessionSnapshots() error {
 	return nil
 }
 
+func (r *Router) loadScheduledQueue() error {
+	if r.wal == nil {
+		return nil
+	}
+	entries, err := r.wal.LoadScheduled()
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.scheduledQueue = append([]scheduledMessage(nil), entries...)
+	for _, entry := range entries {
+		if entry.Sequence > r.nextScheduleSequence {
+			r.nextScheduleSequence = entry.Sequence
+		}
+	}
+	r.sortScheduledLocked()
+	return nil
+}
+
+func (r *Router) persistScheduledLocked() {
+	if r.wal == nil {
+		return
+	}
+	entries := make([]scheduledMessage, len(r.scheduledQueue))
+	copy(entries, r.scheduledQueue)
+	if err := r.wal.SaveScheduled(entries); err != nil {
+		fmt.Printf("failed to persist delayed queue: %v\n", err)
+	}
+}
+
 func (r *Router) replayFromWAL(consumerID string) {
 	if r.wal == nil {
 		return
@@ -400,7 +453,6 @@ func (r *Router) replayFromWAL(consumerID string) {
 		fmt.Printf("failed to replay wal: %v\n", err)
 		return
 	}
-
 	r.mu.Lock()
 	deferred := make([]retryDispatch, 0, len(entries))
 	for _, entry := range entries {
@@ -442,7 +494,6 @@ func (r *Router) promoteDeferredForConsumer(consumerID string) {
 		topics = append(topics, topic)
 	}
 	sort.Strings(topics)
-
 	deferred := make([]retryDispatch, 0)
 	for session.InflightCount < session.MaxInflight {
 		dispatched := false
@@ -482,7 +533,6 @@ func (r *Router) promoteDeferredForConsumer(consumerID string) {
 
 func (r *Router) processInflightTimeouts() {
 	r.mu.Lock()
-	deferredRetries := make([]retryDispatch, 0)
 	deadLetteredIDs := make([]string, 0)
 	now := r.now()
 	for messageID, record := range r.inflight {
@@ -491,17 +541,15 @@ func (r *Router) processInflightTimeouts() {
 		}
 		r.metrics.DeliveryTimeout++
 		if record.DeliveryAttempt < r.maxDirectRetries {
-			session, ok := r.directSessions[record.ConsumerID]
-			if !ok || !isSessionLive(session) {
-				continue
-			}
 			record.DeliveryAttempt++
 			record.Status = statusRetry
-			record.DispatchedAt = now
+			delete(r.inflight, messageID)
+			if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
+				s.InflightCount--
+			}
 			r.metrics.Retried++
 			r.metrics.RetryDueToTimeout++
-			r.metrics.Dispatched++
-			deferredRetries = append(deferredRetries, retryDispatch{identity: append([]byte(nil), session.TransportIdentity...), topic: record.Topic, payload: append([]byte(nil), record.Payload...)})
+			r.scheduleDispatchLocked(record.Topic, record.MessageID, record.Payload, record.DeliveryAttempt, now.Add(r.deliveryTimeout), "timeout_retry")
 			continue
 		}
 		if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
@@ -520,7 +568,6 @@ func (r *Router) processInflightTimeouts() {
 			fmt.Printf("failed to append wal dead-letter: %v\n", err)
 		}
 	}
-	r.sendDeferred(deferredRetries)
 }
 
 type retryDispatch struct {
@@ -546,7 +593,6 @@ func (r *Router) handleControl(clientID []byte, raw []byte) {
 		r.handleNack(msg.MessageID, msg.ConsumerID, msg.SessionID, msg.Status)
 	}
 }
-
 func (r *Router) registerConsumerSession(clientID []byte, msg controlMessage) {
 	if msg.Mode != "direct" || msg.ConsumerID == "" {
 		return
@@ -560,8 +606,8 @@ func (r *Router) registerConsumerSession(clientID []byte, msg controlMessage) {
 	}
 	r.replayFromWAL(msg.ConsumerID)
 	r.promoteDeferredForConsumer(msg.ConsumerID)
+	r.promoteScheduledDue()
 }
-
 func (r *Router) upsertSessionLocked(clientID []byte, msg controlMessage, now time.Time) *consumerSession {
 	existing, ok := r.directSessions[msg.ConsumerID]
 	if !ok || existing.SessionID == "" {
@@ -587,7 +633,6 @@ func (r *Router) upsertSessionLocked(clientID []byte, msg controlMessage, now ti
 	existing.ResumablePending = existing.Capabilities.Resumable
 	return cloneSession(existing)
 }
-
 func (r *Router) heartbeatConsumer(consumerID string) {
 	r.mu.Lock()
 	var snapshot *consumerSession
@@ -604,33 +649,71 @@ func (r *Router) heartbeatConsumer(consumerID string) {
 }
 
 func (r *Router) dispatchDirect(topic, messageID string, payload []byte) {
+	retries := r.dispatchDirectAttempt(topic, messageID, payload, 1)
+	r.sendDeferred(retries)
+}
+
+func (r *Router) dispatchDirectAttempt(topic, messageID string, payload []byte, attempt int) []retryDispatch {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.maxGlobalIngress > 0 && r.totalDirectLoadLocked() >= r.maxGlobalIngress {
 		r.metrics.Dropped++
 		fmt.Printf("{\"event\":\"ingress_drop\",\"topic\":%q,\"message_id\":%q,\"reason\":\"global_ingress_limit\",\"limit\":%d}\n", topic, messageID, r.maxGlobalIngress)
-		r.mu.Unlock()
-		return
+		return nil
 	}
 	session := r.selectSession(topic)
 	if session == nil {
 		if messageID != "" {
 			r.enqueueDirectLocked(topic, messageID, payload)
 		}
-		r.mu.Unlock()
-		return
+		return nil
 	}
-	identity, walEntry, needsWAL := r.prepareDispatchLocked(session, topic, messageID, payload, 1)
-	r.mu.Unlock()
+	identity, walEntry, needsWAL := r.prepareDispatchLocked(session, topic, messageID, payload, attempt)
 	if needsWAL {
 		if err := r.wal.AppendDispatched(walEntry); err != nil {
 			fmt.Printf("failed to append wal dispatch: %v\n", err)
 		} else {
-			r.mu.Lock()
 			r.metrics.WALWritten++
-			r.mu.Unlock()
 		}
 	}
-	r.sendDeferred([]retryDispatch{{identity: identity, topic: topic, payload: payload}})
+	return []retryDispatch{{identity: identity, topic: topic, payload: payload}}
+}
+
+func (r *Router) scheduleDispatch(topic, messageID string, payload []byte, attempt int, deliverAt time.Time, reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.scheduleDispatchLocked(topic, messageID, payload, attempt, deliverAt, reason)
+}
+func (r *Router) scheduleDispatchLocked(topic, messageID string, payload []byte, attempt int, deliverAt time.Time, reason string) {
+	if messageID == "" {
+		return
+	}
+	r.nextScheduleSequence++
+	r.scheduledQueue = append(r.scheduledQueue, scheduledMessage{Sequence: r.nextScheduleSequence, MessageID: messageID, Topic: topic, Payload: append([]byte(nil), payload...), DeliveryAttempt: attempt, DeliverAt: deliverAt, Reason: reason})
+	r.sortScheduledLocked()
+	r.metrics.Scheduled++
+	r.persistScheduledLocked()
+}
+func (r *Router) promoteScheduledDue() {
+	var due []scheduledMessage
+	r.mu.Lock()
+	now := r.now()
+	idx := 0
+	for idx < len(r.scheduledQueue) && !r.scheduledQueue[idx].DeliverAt.After(now) {
+		idx++
+	}
+	if idx > 0 {
+		due = append([]scheduledMessage(nil), r.scheduledQueue[:idx]...)
+		r.scheduledQueue = append([]scheduledMessage(nil), r.scheduledQueue[idx:]...)
+		r.persistScheduledLocked()
+	}
+	r.mu.Unlock()
+	for _, entry := range due {
+		r.mu.Lock()
+		r.metrics.ScheduledPromoted++
+		r.mu.Unlock()
+		r.sendDeferred(r.dispatchDirectAttempt(entry.Topic, entry.MessageID, entry.Payload, entry.DeliveryAttempt))
+	}
 }
 
 func (r *Router) prepareDispatchLocked(session *consumerSession, topic, messageID string, payload []byte, attempt int) ([]byte, walDispatchedEntry, bool) {
@@ -644,7 +727,6 @@ func (r *Router) prepareDispatchLocked(session *consumerSession, topic, messageI
 	needsWAL := r.wal != nil && session.Capabilities.SupportsAck && messageID != ""
 	return identity, walEntry, needsWAL
 }
-
 func (r *Router) enqueueDirectLocked(topic, messageID string, payload []byte) {
 	queue := r.directQueue[topic]
 	if r.maxPerTopicQueue > 0 && len(queue) >= r.maxPerTopicQueue {
@@ -668,7 +750,6 @@ func (r *Router) enqueueDirectLocked(topic, messageID string, payload []byte) {
 	}
 	fmt.Printf("{\"event\":\"direct_deferred\",\"topic\":%q,\"message_id\":%q}\n", topic, messageID)
 }
-
 func (r *Router) totalQueuedLocked() int {
 	total := 0
 	for _, queue := range r.directQueue {
@@ -676,9 +757,7 @@ func (r *Router) totalQueuedLocked() int {
 	}
 	return total
 }
-
 func (r *Router) totalDirectLoadLocked() int { return len(r.inflight) + r.totalQueuedLocked() }
-
 func (r *Router) selectSession(topic string) *consumerSession {
 	if len(r.directSessions) == 0 {
 		return nil
@@ -704,8 +783,6 @@ func (r *Router) selectSession(topic string) *consumerSession {
 	}
 	return nil
 }
-
-// ConsumerBacklogSnapshot returns per-consumer inflight and backlog counters.
 func (r *Router) ConsumerBacklogSnapshot() map[string]ConsumerBacklogMetrics {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -748,7 +825,6 @@ func (r *Router) handleAck(messageID, consumerID, sessionID string) {
 	}
 	r.sendDeferred(drain)
 }
-
 func (r *Router) handleNack(messageID, consumerID, sessionID, status string) {
 	r.mu.Lock()
 	record, ok := r.inflight[messageID]
@@ -763,21 +839,15 @@ func (r *Router) handleNack(messageID, consumerID, sessionID, status string) {
 	r.metrics.Nacked++
 	isRetryable := status == "retryable_error" || status == "retryable"
 	if isRetryable && record.DeliveryAttempt < r.maxDirectRetries {
-		session, ok := r.directSessions[record.ConsumerID]
-		if !ok || !isSessionLive(session) {
-			r.mu.Unlock()
-			return
-		}
 		record.DeliveryAttempt++
 		record.Status = statusRetry
-		record.DispatchedAt = r.now()
+		delete(r.inflight, messageID)
+		if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
+			s.InflightCount--
+		}
 		r.metrics.Retried++
-		r.metrics.Dispatched++
-		identity := append([]byte(nil), session.TransportIdentity...)
-		topic := record.Topic
-		payload := append([]byte(nil), record.Payload...)
+		r.scheduleDispatchLocked(record.Topic, record.MessageID, record.Payload, record.DeliveryAttempt, r.now().Add(r.deliveryTimeout), "nack_retry")
 		r.mu.Unlock()
-		r.sendDeferred([]retryDispatch{{identity: identity, topic: topic, payload: payload}})
 		return
 	}
 	if s, ok := r.directSessions[record.ConsumerID]; ok && s.InflightCount > 0 {
@@ -796,7 +866,6 @@ func (r *Router) handleNack(messageID, consumerID, sessionID, status string) {
 	}
 	r.sendDeferred(drain)
 }
-
 func (r *Router) drainDeferredLocked(topic string) []retryDispatch {
 	queue := r.directQueue[topic]
 	if len(queue) == 0 {
@@ -825,7 +894,6 @@ func (r *Router) drainDeferredLocked(topic string) []retryDispatch {
 	}
 	return []retryDispatch{{identity: identity, topic: msg.Topic, payload: msg.Payload}}
 }
-
 func (r *Router) sendDeferred(retries []retryDispatch) {
 	for _, retry := range retries {
 		if r.directSender == nil || len(retry.identity) == 0 {
@@ -836,7 +904,6 @@ func (r *Router) sendDeferred(retries []retryDispatch) {
 		}
 	}
 }
-
 func isSessionLive(session *consumerSession) bool {
 	if session == nil || len(session.TransportIdentity) == 0 {
 		return false
@@ -846,14 +913,12 @@ func isSessionLive(session *consumerSession) bool {
 	}
 	return !session.ResumablePending
 }
-
 func (r *Router) persistSessionSnapshot(session *consumerSession) error {
 	if r.wal == nil || session == nil || !session.Capabilities.Resumable {
 		return nil
 	}
 	return r.wal.SaveSessionSnapshot(snapshotFromSession(session))
 }
-
 func snapshotFromSession(session *consumerSession) sessionSnapshot {
 	subscriptions := make([]string, 0, len(session.Subscriptions))
 	for topic := range session.Subscriptions {
@@ -862,7 +927,6 @@ func snapshotFromSession(session *consumerSession) sessionSnapshot {
 	sort.Strings(subscriptions)
 	return sessionSnapshot{SessionID: session.SessionID, ConsumerID: session.ConsumerID, Subscriptions: subscriptions, ConnectedAt: session.ConnectedAt, LastHeartbeat: session.LastHeartbeat, MaxInflight: session.MaxInflight, SupportsAck: session.Capabilities.SupportsAck, SupportsCompression: cloneStrings(session.Capabilities.SupportsCompression), SupportsCodec: cloneStrings(session.Capabilities.SupportsCodec), Resumable: session.Capabilities.Resumable, Live: session.Live, ResumablePending: session.ResumablePending}
 }
-
 func sessionFromSnapshot(snapshot sessionSnapshot) *consumerSession {
 	subs := make(map[string]struct{}, len(snapshot.Subscriptions))
 	for _, topic := range snapshot.Subscriptions {
@@ -870,7 +934,6 @@ func sessionFromSnapshot(snapshot sessionSnapshot) *consumerSession {
 	}
 	return &consumerSession{SessionID: snapshot.SessionID, ConsumerID: snapshot.ConsumerID, Subscriptions: subs, Capabilities: capabilityHints{SupportsAck: snapshot.SupportsAck, SupportsCompression: cloneStrings(snapshot.SupportsCompression), SupportsCodec: cloneStrings(snapshot.SupportsCodec), Resumable: snapshot.Resumable}, MaxInflight: snapshot.MaxInflight, ConnectedAt: snapshot.ConnectedAt, LastHeartbeat: snapshot.LastHeartbeat, Live: false, ResumablePending: snapshot.Resumable}
 }
-
 func cloneSession(session *consumerSession) *consumerSession {
 	if session == nil {
 		return nil
@@ -884,7 +947,6 @@ func cloneSession(session *consumerSession) *consumerSession {
 	}
 	return &copy
 }
-
 func cloneStrings(in []string) []string {
 	if len(in) == 0 {
 		return nil
@@ -893,11 +955,18 @@ func cloneStrings(in []string) []string {
 	sort.Strings(out)
 	return out
 }
-
 func parseSessionOrdinal(sessionID string) uint64 {
 	var n uint64
 	_, _ = fmt.Sscanf(sessionID, "sess_%d", &n)
 	return n
+}
+func (r *Router) sortScheduledLocked() {
+	sort.SliceStable(r.scheduledQueue, func(i, j int) bool {
+		if r.scheduledQueue[i].DeliverAt.Equal(r.scheduledQueue[j].DeliverAt) {
+			return r.scheduledQueue[i].Sequence < r.scheduledQueue[j].Sequence
+		}
+		return r.scheduledQueue[i].DeliverAt.Before(r.scheduledQueue[j].DeliverAt)
+	})
 }
 
 // MetricsSnapshot returns a thread-safe copy of delivery counters.
@@ -906,7 +975,6 @@ func (r *Router) MetricsSnapshot() DeliveryMetrics {
 	defer r.mu.Unlock()
 	return r.metrics
 }
-
 func parseFrames(msg [][]byte) ([]byte, string, []byte, error) {
 	switch {
 	case len(msg) == 3:
@@ -917,7 +985,6 @@ func parseFrames(msg [][]byte) ([]byte, string, []byte, error) {
 		return nil, "", nil, fmt.Errorf("malformed message: expected 3 frames or 4 frames with delimiter, got %d", len(msg))
 	}
 }
-
 func validateTopic(topic string) error {
 	if topic == "" {
 		return fmt.Errorf("topic must not be empty")

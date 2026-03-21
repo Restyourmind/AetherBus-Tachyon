@@ -13,6 +13,7 @@ type stubWAL struct {
 	deadLettered []string
 	replay       []walDispatchedEntry
 	snapshots    map[string]sessionSnapshot
+	scheduled    []scheduledMessage
 }
 
 func (w *stubWAL) AppendDispatched(entry walDispatchedEntry) error {
@@ -52,6 +53,15 @@ func (w *stubWAL) LoadSessionSnapshots() ([]sessionSnapshot, error) {
 func (w *stubWAL) DeleteSessionSnapshot(consumerID string) error {
 	delete(w.snapshots, consumerID)
 	return nil
+}
+
+func (w *stubWAL) SaveScheduled(entries []scheduledMessage) error {
+	w.scheduled = append([]scheduledMessage(nil), entries...)
+	return nil
+}
+
+func (w *stubWAL) LoadScheduled() ([]scheduledMessage, error) {
+	return append([]scheduledMessage(nil), w.scheduled...), nil
 }
 
 func TestParseFrames(t *testing.T) {
@@ -204,11 +214,14 @@ func TestRetryableNackRetried(t *testing.T) {
 	if got := r.metrics.DeadLettered; got != 0 {
 		t.Fatalf("expected deadlettered=0, got %d", got)
 	}
-	if got := r.metrics.Dispatched; got != 2 {
-		t.Fatalf("expected dispatched=2 (initial+retry), got %d", got)
+	if got := r.metrics.Dispatched; got != 1 {
+		t.Fatalf("expected dispatched=1 before scheduled retry promotion, got %d", got)
 	}
-	if sendCount != 2 {
-		t.Fatalf("expected direct sender called twice, got %d", sendCount)
+	if sendCount != 1 {
+		t.Fatalf("expected direct sender called once before scheduled retry promotion, got %d", sendCount)
+	}
+	if len(r.scheduledQueue) != 1 {
+		t.Fatalf("expected scheduled retry queued, got %d", len(r.scheduledQueue))
 	}
 }
 
@@ -276,11 +289,14 @@ func TestTimeoutRetry(t *testing.T) {
 	if got := r.metrics.Retried; got != 1 {
 		t.Fatalf("expected retried=1, got %d", got)
 	}
-	if got := r.metrics.Dispatched; got != 2 {
-		t.Fatalf("expected dispatched=2 (initial+retry), got %d", got)
+	if got := r.metrics.Dispatched; got != 1 {
+		t.Fatalf("expected dispatched=1 before scheduled retry promotion, got %d", got)
 	}
-	if sendCount != 2 {
-		t.Fatalf("expected direct sender called twice, got %d", sendCount)
+	if sendCount != 1 {
+		t.Fatalf("expected direct sender called once before scheduled retry promotion, got %d", sendCount)
+	}
+	if len(r.scheduledQueue) != 1 {
+		t.Fatalf("expected scheduled retry queued, got %d", len(r.scheduledQueue))
 	}
 }
 
@@ -764,5 +780,74 @@ func TestLoadSessionSnapshotsDiscardsStaleSessions(t *testing.T) {
 	}
 	if _, ok := w.snapshots["worker-1"]; ok {
 		t.Fatalf("expected stale snapshot deleted from durability store")
+	}
+}
+
+func TestScheduledPublishPromotesWhenDue(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	r.directSessions["worker-1"] = &consumerSession{SessionID: "sess_000001", ConsumerID: "worker-1", TransportIdentity: []byte("cid1"), Capabilities: capabilityHints{SupportsAck: true, Resumable: true}, MaxInflight: 10, Subscriptions: map[string]struct{}{"orders.created": {}}}
+	now := time.Unix(1000, 0).UTC()
+	r.now = func() time.Time { return now }
+	sends := 0
+	r.directSender = func(identity []byte, topic string, payload []byte) error { sends++; return nil }
+
+	r.scheduleDispatch("orders.created", "msg-scheduled", []byte(`{"id":"msg-scheduled"}`), 1, now.Add(time.Second), "publish")
+	if sends != 0 {
+		t.Fatalf("expected no immediate send for scheduled publish")
+	}
+	now = now.Add(time.Second)
+	r.promoteScheduledDue()
+	if sends != 1 {
+		t.Fatalf("expected scheduled publish promoted once, got %d", sends)
+	}
+	if got := r.metrics.ScheduledPromoted; got != 1 {
+		t.Fatalf("expected scheduled_promoted=1, got %d", got)
+	}
+}
+
+func TestScheduledRetryPromotionPreservesOrdering(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	r.directSessions["worker-1"] = &consumerSession{SessionID: "sess_000001", ConsumerID: "worker-1", TransportIdentity: []byte("cid1"), Capabilities: capabilityHints{SupportsAck: true, Resumable: true}, MaxInflight: 10, Subscriptions: map[string]struct{}{"orders.created": {}}}
+	now := time.Unix(1000, 0).UTC()
+	r.now = func() time.Time { return now }
+	order := make([]string, 0, 2)
+	r.directSender = func(identity []byte, topic string, payload []byte) error {
+		order = append(order, string(payload))
+		return nil
+	}
+
+	r.scheduleDispatch("orders.created", "msg-2", []byte("second"), 1, now.Add(2*time.Second), "retry")
+	r.scheduleDispatch("orders.created", "msg-1", []byte("first"), 1, now.Add(time.Second), "retry")
+	now = now.Add(3 * time.Second)
+	r.promoteScheduledDue()
+	if len(order) != 2 || order[0] != "first" || order[1] != "second" {
+		t.Fatalf("expected due messages promoted in delivery order, got %#v", order)
+	}
+}
+
+func TestLoadScheduledQueueRecoversDelayedEntries(t *testing.T) {
+	w := &stubWAL{scheduled: []scheduledMessage{{Sequence: 2, MessageID: "msg-late", Topic: "orders.created", Payload: []byte("late"), DeliverAt: time.Unix(1020, 0).UTC()}, {Sequence: 1, MessageID: "msg-early", Topic: "orders.created", Payload: []byte("early"), DeliverAt: time.Unix(1010, 0).UTC()}}}
+	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 3, time.Second, w)
+	if err := r.loadScheduledQueue(); err != nil {
+		t.Fatalf("load scheduled queue: %v", err)
+	}
+	if len(r.scheduledQueue) != 2 {
+		t.Fatalf("expected two recovered scheduled entries, got %d", len(r.scheduledQueue))
+	}
+	if r.scheduledQueue[0].MessageID != "msg-early" {
+		t.Fatalf("expected earliest entry first after recovery, got %q", r.scheduledQueue[0].MessageID)
+	}
+}
+
+func TestValidateScheduleTimestampRejectsPastAndFarFuture(t *testing.T) {
+	now := time.Unix(1000, 0).UTC()
+	if err := validateScheduleTimestamp(now, now.Add(-time.Second)); err == nil {
+		t.Fatalf("expected past timestamp rejection")
+	}
+	if err := validateScheduleTimestamp(now, now.Add(maxScheduledDeliveryHorizon+time.Second)); err == nil {
+		t.Fatalf("expected far-future timestamp rejection")
+	}
+	if err := validateScheduleTimestamp(now, now.Add(time.Hour)); err != nil {
+		t.Fatalf("expected near-future timestamp accepted, got %v", err)
 	}
 }
