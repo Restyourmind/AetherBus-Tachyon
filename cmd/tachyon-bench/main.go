@@ -549,7 +549,7 @@ func runBenchmark(cfg benchConfig) (*benchResult, error) {
 
 func startLocalBroker(ctx context.Context, cfg benchConfig) error {
 	routeStore := repository.NewART_RouteStore()
-	routeStore.AddRoute(cfg.Topic, "node-1")
+	_ = routeStore.AddRoute(cfg.Topic, "node-1")
 
 	codec := media.NewJSONCodec()
 	eventRouter := usecase.NewEventRouter(routeStore)

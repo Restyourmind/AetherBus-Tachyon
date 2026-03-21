@@ -26,9 +26,16 @@ func NewRuntime(cfg *config.Config, bootstrapRoutes map[string]string) *Runtime 
 
 // NewRuntimeWithCompressor wires the core Tachyon runtime with an explicit compressor.
 func NewRuntimeWithCompressor(cfg *config.Config, bootstrapRoutes map[string]string, compressor domain.Compressor) *Runtime {
-	routeStore := repository.NewART_RouteStore()
-	for topic, nodeID := range bootstrapRoutes {
-		routeStore.AddRoute(topic, nodeID)
+	catalog := repository.NewFileRouteCatalog(cfg.RouteCatalogPath)
+	routeStore := repository.NewART_RouteStoreWithCatalog(catalog)
+
+	loadedSnapshot, err := catalog.Load()
+	if err == nil && len(loadedSnapshot.Routes) > 0 {
+		_ = routeStore.Restore(loadedSnapshot)
+	} else {
+		for topic, nodeID := range bootstrapRoutes {
+			_ = routeStore.AddRoute(topic, nodeID)
+		}
 	}
 
 	codec := media.NewJSONCodec()

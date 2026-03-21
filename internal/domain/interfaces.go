@@ -20,8 +20,17 @@ type PublishResult struct {
 // RouteStore defines the interface for a thread-safe, high-performance routing table.
 // It's responsible for mapping topics to destination nodes.
 type RouteStore interface {
-	// AddRoute adds a new route to the table.
-	AddRoute(topic string, destNodeID string)
+	// AddRoute adds a new direct route to the table.
+	AddRoute(topic string, destNodeID string) error
+
+	// UpsertRoute inserts or updates a serializable route entry.
+	UpsertRoute(route Route) error
+
+	// RemoveRoute removes an exact route identity from the table.
+	RemoveRoute(pattern string, destNodeID string) error
+
+	// Routes returns a stable snapshot of the current route set.
+	Routes() []Route
 
 	// Match finds the appropriate destination node ID for a given topic.
 	Match(topic string) string

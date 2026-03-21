@@ -545,6 +545,39 @@ Example:
 }
 ```
 
+## 29.1 Route Catalog Snapshot Persistence
+
+The reference implementation persists route state as a versioned JSON snapshot so broker restarts can restore runtime routes without replaying `bootstrapRoutes`.
+
+Recommended snapshot shape:
+
+```json
+{
+  "version": 1,
+  "routes": [
+    {
+      "pattern": "orders.created",
+      "destination_id": "worker.orders.1",
+      "route_type": "direct",
+      "priority": 10,
+      "enabled": true,
+      "tenant": "tenant_a",
+      "metadata": {
+        "source": "runtime"
+      }
+    }
+  ]
+}
+```
+
+Persistence requirements:
+
+- startup SHOULD restore the snapshot before considering bootstrap routes
+- startup MAY fall back to bootstrap routes when the snapshot is absent or corrupted
+- every route mutation SHOULD rewrite the snapshot atomically
+- snapshot `version` MUST gate decoding so future metadata additions remain backward-compatible by explicit migration
+- duplicate logical route identities SHOULD collapse to a single stored entry during restore
+
 ## 30. Recommended Tests
 
 A compliant routing implementation SHOULD test:

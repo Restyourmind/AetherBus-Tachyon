@@ -28,9 +28,9 @@ func main() {
 	routeStore := repository.NewART_RouteStore()
 	fmt.Println("Initialized Adaptive Radix Tree Route Store.")
 
-	routeStore.AddRoute("telemetry.sensor.alpha", "node-alpha-1")
-	routeStore.AddRoute("telemetry.sensor.beta", "node-beta-1")
-	routeStore.AddRoute("logs.system", "node-logger-1")
+	_ = routeStore.AddRoute("telemetry.sensor.alpha", "node-alpha-1")
+	_ = routeStore.AddRoute("telemetry.sensor.beta", "node-beta-1")
+	_ = routeStore.AddRoute("logs.system", "node-logger-1")
 	fmt.Println("Populated dummy routes.")
 
 	codec := media.NewJSONCodec()

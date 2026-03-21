@@ -15,6 +15,7 @@ type Config struct {
 	MaxGlobalIngress       int
 	WALEnabled             bool
 	WALPath                string
+	RouteCatalogPath       string
 	FastpathSidecarEnabled bool
 	FastpathSocketPath     string
 	FastpathCutoverBytes   int
@@ -34,6 +35,7 @@ func Load() (*Config, error) {
 		MaxGlobalIngress:       getenvIntOrDefault("MAX_GLOBAL_INGRESS", 8192),
 		WALEnabled:             getenvBoolOrDefault("WAL_ENABLED", false),
 		WALPath:                getenvOrDefault("WAL_PATH", "./data/direct_delivery.wal"),
+		RouteCatalogPath:       getenvOrDefault("ROUTE_CATALOG_PATH", "./data/routes.catalog.json"),
 		FastpathSidecarEnabled: getenvBoolOrDefault("FASTPATH_SIDECAR_ENABLED", false),
 		FastpathSocketPath:     getenvOrDefault("FASTPATH_SOCKET_PATH", "/tmp/tachyon-fastpath.sock"),
 		FastpathCutoverBytes:   getenvIntOrDefault("FASTPATH_CUTOVER_BYTES", 256*1024),

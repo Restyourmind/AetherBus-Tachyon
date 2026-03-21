@@ -11,8 +11,27 @@ type stubRouteStore struct {
 	routes map[string]string
 }
 
-func (s stubRouteStore) AddRoute(topic string, destNodeID string) {
+func (s stubRouteStore) AddRoute(topic string, destNodeID string) error {
 	s.routes[topic] = destNodeID
+	return nil
+}
+
+func (s stubRouteStore) UpsertRoute(route domain.Route) error {
+	s.routes[route.Pattern] = route.DestinationID
+	return nil
+}
+
+func (s stubRouteStore) RemoveRoute(pattern string, destNodeID string) error {
+	delete(s.routes, pattern)
+	return nil
+}
+
+func (s stubRouteStore) Routes() []domain.Route {
+	routes := make([]domain.Route, 0, len(s.routes))
+	for pattern, dest := range s.routes {
+		routes = append(routes, domain.Route{Pattern: pattern, DestinationID: dest, RouteType: "direct", Enabled: true})
+	}
+	return routes
 }
 
 func (s stubRouteStore) Match(topic string) string {

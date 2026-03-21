@@ -57,3 +57,27 @@ func TestLoadFastpathFromEnv(t *testing.T) {
 		t.Fatalf("expected fastpath fallback=false from env")
 	}
 }
+
+func TestLoadRouteCatalogDefaults(t *testing.T) {
+	t.Setenv("ROUTE_CATALOG_PATH", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected load error: %v", err)
+	}
+	if cfg.RouteCatalogPath != "./data/routes.catalog.json" {
+		t.Fatalf("unexpected default route catalog path: %q", cfg.RouteCatalogPath)
+	}
+}
+
+func TestLoadRouteCatalogFromEnv(t *testing.T) {
+	t.Setenv("ROUTE_CATALOG_PATH", "/tmp/routes.snapshot.json")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected load error: %v", err)
+	}
+	if cfg.RouteCatalogPath != "/tmp/routes.snapshot.json" {
+		t.Fatalf("unexpected route catalog path: %q", cfg.RouteCatalogPath)
+	}
+}
