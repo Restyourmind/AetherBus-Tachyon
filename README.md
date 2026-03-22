@@ -183,34 +183,58 @@ The harness reports p50/p95/p99 latency, throughput, CPU usage, memory RSS, and 
 ## 🏗️ System Architecture Diagram
 
 ```mermaid
-flowchart TD
-    Producers[Producers / Clients] --> Broker[Broker Runtime]
+flowchart LR
+    Producers[Producers / Admin Clients] --> Runtime[Broker Runtime
+internal/app + delivery/zmq.Router]
+    Consumers[Consumers / Workers] <--> Runtime
 
-    subgraph Persisted_State[Persisted state stores]
-        Routes[(routes.json / route catalog)]
-        Segments[(delivery.wal.segments / direct WAL)]
-        Sessions[(delivery.wal.sessions / resumable sessions)]
-        Scheduled[(delivery.wal.scheduled / delayed + retry queue)]
-        DLQ[(delivery.wal.dlq / dead letters)]
-        Audit[(delivery.wal.audit / admin audit)]
-        AuditHead[(delivery.wal.audit.head / audit head sidecar)]
+    subgraph Memory[In-memory operational state]
+        RouteIndex[ART route index
+key = tenant_id + topic]
+        SessionTable[Direct session table
+key = consumer_id]
+        Inflight[Inflight registry
+key = message_id]
+        Deferred[Deferred direct queues
+key = tenant_id + topic]
+        ScheduledMem[Scheduled queue
+ordered by deliver_at + sequence]
     end
 
-    Broker --> Routes
-    Broker --> Segments
-    Broker --> Sessions
-    Broker --> Scheduled
-    Broker --> DLQ
-    Broker --> Audit
-    AuditHead --> Audit
+    subgraph Files[Durability files under WAL_PATH / ROUTE_CATALOG_PATH]
+        RouteCatalog[(routes.catalog.json
+RouteCatalogSnapshot)]
+        Segments[(segments/segment-*.wal
+dispatched / committed / dead_lettered)]
+        SessionSnap[(WAL_PATH.sessions
+session snapshots)]
+        ScheduledFile[(WAL_PATH.scheduled
+scheduled replay queue)]
+        DLQ[(WAL_PATH.dlq
+DeadLetterRecord map)]
+        Audit[(WAL_PATH.audit
+append-only audit chain)]
+    end
 
-    Routes --> Broker
-    Sessions --> Broker
-    Segments --> Broker
-    Scheduled --> Broker
-    DLQ --> Audit
-    Scheduled --> Audit
-    Audit --> Export[(analytics / export sink)]
+    Runtime --> RouteIndex
+    Runtime --> SessionTable
+    Runtime --> Inflight
+    Runtime --> Deferred
+    Runtime --> ScheduledMem
+
+    Runtime --> RouteCatalog
+    Runtime --> Segments
+    Runtime --> SessionSnap
+    Runtime --> ScheduledFile
+    Runtime --> DLQ
+    Runtime --> Audit
+
+    RouteCatalog --> RouteIndex
+    SessionSnap --> SessionTable
+    Segments --> Inflight
+    ScheduledFile --> ScheduledMem
+    DLQ --> Runtime
+    Audit --> AdminExport[Audit / analytics export pipeline]
 ```
 
 
@@ -222,7 +246,7 @@ flowchart TD
 - **Transport layer:** `internal/delivery/zmq.Router` owns the ZeroMQ ROUTER/PUB sockets, parses frames, handles consumer registration/heartbeats, and emits direct/fanout deliveries.
 - **Media layer:** `internal/media.JSONCodec` and `internal/media.LZ4Compressor` handle event encoding and payload compression.
 - **Application layer:** `internal/usecase.EventRouter` resolves fanout routes and coordinates routing decisions with broker state.
-- **Logical data layer:** the runtime operates over four logical data structures — ART route index, consumer session table, inflight delivery table, and append-only WAL.
+- **Logical data layer:** the runtime operates over a hybrid state model — ART route index, consumer session table, inflight registry, deferred/scheduled queues, WAL segments, DLQ store, and append-only audit chain.
 
 ### Message + state flow
 
@@ -231,8 +255,9 @@ flowchart TD
 3. **`usecase.EventRouter`** resolves topic matches through the **route store (ART)** for fanout delivery.
 4. **Consumer registration and heartbeat traffic** updates the **consumer session table**, which tracks active direct-delivery capability.
 5. **Direct deliveries** create or update **inflight delivery records** so ACK/NACK, retry, timeout, and dead-letter behavior can be evaluated.
-6. When ACK durability is required, the broker appends dispatch state to the **delivery WAL**, finalizes records on terminal outcomes, and replays unfinalized entries after restart.
-7. The transport layer emits the final topic payload or direct-delivery frame back to **subscribers / workers**.
+6. When ACK durability is required, the broker appends dispatch state to **segmented WAL files**, snapshots resumable sessions, and persists scheduled retries for restart recovery.
+7. Terminal failures are materialized into the **DLQ store**, while replay/purge/manual dead-letter mutations are chained into the **admin audit log** for forensic review.
+8. The transport layer emits the final topic payload or direct-delivery frame back to **subscribers / workers**.
 
 This version of the diagram is aligned with the current logical storage model described below, so the architecture view now reflects both the runtime components and the broker-managed data structures.
 
@@ -322,8 +347,6 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 ### English
 
 - **Priority-aware Delivery Classes:** Introduce weighted priority classes so operator commands, retries, and bulk sync traffic can coexist with predictable fairness.
-- **Dead-letter Inspection API + Replay Console:** Add a safe API/UI for browsing dead-lettered items, replaying subsets, and annotating operator decisions.
-- **Replay Audit Trail:** Persist operator-triggered replay actions and delivery state transitions for compliance and post-incident analysis.
 - **Tenant-aware Quotas and Isolation:** Extend route namespaces with per-tenant queue budgets, metrics, and admission-control policy.
 - **Geo-redundant Durability:** Replicate WAL, route catalog, and delayed queue state to a standby node or object storage target.
 - **Analytics Export Pipeline:** Stream route, inflight, backlog, and WAL transitions into PostgreSQL, ClickHouse, or warehouse tooling.
@@ -333,8 +356,6 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 ### ภาษาไทย
 
 - **Priority-aware Delivery Classes:** เพิ่มระดับความสำคัญของการส่งแบบถ่วงน้ำหนัก เพื่อให้คำสั่งของผู้ปฏิบัติงาน งาน retry และทราฟฟิกปริมาณมากอยู่ร่วมกันได้อย่างเป็นธรรม
-- **Dead-letter Inspection API + Replay Console:** เพิ่ม API/UI สำหรับดูรายการ dead-letter, replay เป็นชุดย่อย และบันทึกเหตุผลของผู้ปฏิบัติงานอย่างปลอดภัย
-- **Replay Audit Trail:** บันทึกประวัติการ replay ที่ผู้ปฏิบัติงานสั่ง รวมถึง state transition ของการส่ง เพื่อรองรับ compliance และ post-incident analysis
 - **Tenant-aware Quotas and Isolation:** ขยาย route namespace ให้รองรับ quota, metrics และ admission-control policy แยกตาม tenant
 - **Geo-redundant Durability:** ทำสำเนา WAL, route catalog และสถานะ delayed queue ไปยัง standby node หรือ object storage
 - **Analytics Export Pipeline:** ส่งการเปลี่ยนแปลงของ route, inflight, backlog และ WAL ไปยัง PostgreSQL, ClickHouse หรือ warehouse tooling
