@@ -183,60 +183,60 @@ The harness reports p50/p95/p99 latency, throughput, CPU usage, memory RSS, and 
 ## 🏗️ System Architecture Diagram
 
 ```mermaid
-flowchart LR
+flowchart TB
     Producers[Producers / Admin Clients] --> Runtime[Broker Runtime
-internal/app + delivery/zmq.Router]
+internal/app.Runtime + delivery/zmq.Router]
     Consumers[Consumers / Workers] <--> Runtime
 
-    subgraph Memory[In-memory operational state]
-        RouteIndex[ART route index
-key = tenant_id + topic]
-        SessionTable[Direct session table
-key = consumer_id]
-        Inflight[Inflight registry
-key = message_id]
-        Deferred[Deferred direct queues
-key = tenant_id + topic]
-        ScheduledMem[Scheduled queue
-ordered by deliver_at + sequence]
-    end
-
-    subgraph Files[Durability files under WAL_PATH / ROUTE_CATALOG_PATH]
-        RouteCatalog[(routes.catalog.json
-RouteCatalogSnapshot)]
-        Segments[(segments/segment-*.wal
+    subgraph Authoritative[Authoritative persisted state]
+        RouteCatalog[(ROUTE_CATALOG_PATH
+route catalog
+version + routes[])]
+        WalSegments[(WAL_PATH segments
 dispatched / committed / dead_lettered)]
-        SessionSnap[(WAL_PATH.sessions
-session snapshots)]
-        ScheduledFile[(WAL_PATH.scheduled
-scheduled replay queue)]
-        DLQ[(WAL_PATH.dlq
-DeadLetterRecord map)]
-        Audit[(WAL_PATH.audit
-append-only audit chain)]
+        SessionStore[(WAL_PATH.sessions
+resumable session snapshot store)]
+        ScheduledStore[(WAL_PATH.scheduled
+scheduled / retry queue)]
+        DLQStore[(WAL_PATH.dlq
+dead-letter record store)]
+        AuditLog[(WAL_PATH.audit
+append-only audit log)]
+        AuditHead[(WAL_PATH.audit.head
+audit hash head sidecar)]
     end
 
-    Runtime --> RouteIndex
-    Runtime --> SessionTable
-    Runtime --> Inflight
-    Runtime --> Deferred
-    Runtime --> ScheduledMem
+    subgraph RuntimeCaches[Runtime-only derived state / caches]
+        RouteIndex[ART route index cache
+key = tenant_id + topic]
+        SessionCache[Live session cache
+key = tenant_id + consumer_id]
+        InflightCache[Inflight registry cache
+key = message_id]
+        DeferredQueue[Deferred direct queues
+key = tenant_id + topic + destination_id]
+        SchedulerCache[Sorted scheduler cache
+order = deliver_at + sequence]
+    end
 
     Runtime --> RouteCatalog
-    Runtime --> Segments
-    Runtime --> SessionSnap
-    Runtime --> ScheduledFile
-    Runtime --> DLQ
-    Runtime --> Audit
+    Runtime --> WalSegments
+    Runtime --> SessionStore
+    Runtime --> ScheduledStore
+    Runtime --> DLQStore
+    Runtime --> AuditLog
 
     RouteCatalog --> RouteIndex
-    SessionSnap --> SessionTable
-    Segments --> Inflight
-    ScheduledFile --> ScheduledMem
-    DLQ --> Runtime
-    Audit --> AdminExport[Audit / analytics export pipeline]
+    SessionStore --> SessionCache
+    WalSegments --> InflightCache
+    ScheduledStore --> SchedulerCache
+    SessionCache --> DeferredQueue
+    DLQStore --> Runtime
+    AuditHead --> AuditLog
+    AuditLog --> AdminExport[Audit / export queries]
 ```
 
+This diagram follows the broker's current state-store boundaries: persisted files are treated as the source of truth, while ART indexes, live session maps, inflight counters, deferred queues, and sorted scheduler views are runtime-derived structures rebuilt from those persisted records during recovery.
 
 ### Runtime composition
 
@@ -349,7 +349,6 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 - **Priority-aware Delivery Classes:** Introduce weighted priority classes so operator commands, retries, and bulk sync traffic can coexist with predictable fairness.
 - **Tenant-aware Quotas and Isolation:** Extend route namespaces with per-tenant queue budgets, metrics, and admission-control policy.
 - **Geo-redundant Durability:** Replicate WAL, route catalog, and delayed queue state to a standby node or object storage target.
-- **Analytics Export Pipeline:** Stream route, inflight, backlog, and WAL transitions into PostgreSQL, ClickHouse, or warehouse tooling.
 - **SLO-driven Autoscaling Signals:** Emit broker pressure indicators that can feed orchestration or capacity planning automation.
 - **AuthN/AuthZ Control Plane:** Add operator authentication, signed control messages, and role-based access for administrative APIs.
 
@@ -358,7 +357,6 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 - **Priority-aware Delivery Classes:** เพิ่มระดับความสำคัญของการส่งแบบถ่วงน้ำหนัก เพื่อให้คำสั่งของผู้ปฏิบัติงาน งาน retry และทราฟฟิกปริมาณมากอยู่ร่วมกันได้อย่างเป็นธรรม
 - **Tenant-aware Quotas and Isolation:** ขยาย route namespace ให้รองรับ quota, metrics และ admission-control policy แยกตาม tenant
 - **Geo-redundant Durability:** ทำสำเนา WAL, route catalog และสถานะ delayed queue ไปยัง standby node หรือ object storage
-- **Analytics Export Pipeline:** ส่งการเปลี่ยนแปลงของ route, inflight, backlog และ WAL ไปยัง PostgreSQL, ClickHouse หรือ warehouse tooling
 - **SLO-driven Autoscaling Signals:** ปล่อยสัญญาณแรงกดดันของ broker เพื่อนำไปใช้กับระบบ orchestration หรือ automation ด้าน capacity planning
 - **AuthN/AuthZ Control Plane:** เพิ่มการยืนยันตัวตนของผู้ปฏิบัติงาน, signed control messages และสิทธิ์แบบ role-based สำหรับ administrative APIs
 
