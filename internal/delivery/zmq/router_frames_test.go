@@ -931,6 +931,52 @@ func TestPriorityBoostPreventsStarvationAcrossTopics(t *testing.T) {
 	}
 }
 
+func TestAdaptivePriorityWeightsBoostAgedBulkTraffic(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	now := time.Unix(1000, 0).UTC()
+	r.now = func() time.Time { return now }
+	r.SetPriorityPolicy([]string{"high", "normal", "bulk"}, map[string]int{"high": 3, "normal": 2, "bulk": 1}, true, 10, 1)
+	r.SetQueueLimitPolicy(QueueLimitPolicy{
+		Enabled:                 true,
+		EvaluationInterval:      time.Millisecond,
+		AdaptivePriorityWeights: true,
+		AdaptiveStep:            2,
+		AgingBoostAfter:         5 * time.Second,
+	})
+	r.directQueue[tenantTopicKey("", "orders.bulk")] = &priorityQueue{Messages: []queuedDirectMessage{
+		{MessageID: "msg-bulk", Topic: "orders.bulk", Priority: "bulk", EnqueueSequence: 1, EnqueuedAt: now.Add(-12 * time.Second)},
+	}}
+	r.nextQueueSequence = 20
+	r.evaluateQueueLimitPolicy()
+	score := r.priorityScoreLocked(r.directQueue[tenantTopicKey("", "orders.bulk")].Messages[0])
+	if score <= r.priorityWeights["bulk"] {
+		t.Fatalf("expected adaptive weight + aging boost to increase bulk score, got score=%d base=%d", score, r.priorityWeights["bulk"])
+	}
+}
+
+func TestClassCircuitBreakerDropsBulkUnderPressure(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	r.SetPriorityPolicy([]string{"high", "normal", "bulk"}, map[string]int{"high": 3, "normal": 2, "bulk": 1}, true, 8, 1000)
+	r.SetQueueBounds(32, 4)
+	r.SetQueueLimitPolicy(QueueLimitPolicy{
+		Enabled:                   true,
+		ClassCircuitBreaker:       true,
+		ClassBreakerQueueFraction: 0.5,
+	})
+	r.directQueue[tenantTopicKey("", "orders.high")] = &priorityQueue{Messages: []queuedDirectMessage{
+		{MessageID: "h1", Topic: "orders.high", Priority: "high", EnqueueSequence: 1},
+		{MessageID: "h2", Topic: "orders.high", Priority: "high", EnqueueSequence: 2},
+	}}
+	r.enqueueDirectLocked("", "orders.bulk", "", domain.RouteTypeDirect, "msg-bulk", []byte(`{"id":"msg-bulk"}`), "bulk", 0)
+	queue := r.directQueue[tenantTopicKey("", "orders.bulk")]
+	if queue != nil && len(queue.Messages) > 0 {
+		t.Fatalf("expected bulk message dropped by class circuit breaker, got %#v", queue.Messages)
+	}
+	if got := r.metrics.Dropped; got == 0 {
+		t.Fatalf("expected dropped metric incremented when class breaker trips")
+	}
+}
+
 func TestWALReplayPreservesPriorityMetadata(t *testing.T) {
 	w := &stubWAL{replay: []walDispatchedEntry{{
 		MessageID:       "msg-rp1",
