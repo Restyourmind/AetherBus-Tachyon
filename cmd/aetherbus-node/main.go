@@ -82,6 +82,7 @@ func main() {
 		MaxPerTopicQueue:            cfg.QueueLimitPolicy.MaxPerTopicQueue,
 		AdaptivePriorityWeights:     cfg.QueueLimitPolicy.AdaptivePriorityWeights,
 		AdaptiveStep:                cfg.QueueLimitPolicy.AdaptiveStep,
+		AgingEnabled:                cfg.QueueLimitPolicy.AgingEnabled,
 		AgingBoostAfter:             time.Duration(cfg.QueueLimitPolicy.AgingBoostAfterMS) * time.Millisecond,
 		ClassCircuitBreaker:         cfg.QueueLimitPolicy.ClassCircuitBreaker,
 		ClassBreakerQueueFraction:   cfg.QueueLimitPolicy.ClassBreakerQueueFraction,

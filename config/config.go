@@ -25,6 +25,7 @@ type QueueLimitPolicyConfig struct {
 	MaxPerTopicQueue            int
 	AdaptivePriorityWeights     bool
 	AdaptiveStep                int
+	AgingEnabled                bool
 	AgingBoostAfterMS           int
 	ClassCircuitBreaker         bool
 	ClassBreakerQueueFraction   float64
@@ -102,6 +103,7 @@ func Load() (*Config, error) {
 		MaxPerTopicQueue:            getenvIntOrDefault("QUEUE_POLICY_MAX_PER_TOPIC_QUEUE", cfg.MaxPerTopicQueue),
 		AdaptivePriorityWeights:     getenvBoolOrDefault("QUEUE_POLICY_ADAPTIVE_PRIORITY_WEIGHTS", true),
 		AdaptiveStep:                getenvIntOrDefault("QUEUE_POLICY_ADAPTIVE_STEP", 1),
+		AgingEnabled:                getenvBoolOrDefault("QUEUE_POLICY_AGING_ENABLED", true),
 		AgingBoostAfterMS:           getenvIntOrDefault("QUEUE_POLICY_AGING_BOOST_AFTER_MS", 15000),
 		ClassCircuitBreaker:         getenvBoolOrDefault("QUEUE_POLICY_CLASS_CIRCUIT_BREAKER", true),
 		ClassBreakerQueueFraction:   getenvFloatOrDefault("QUEUE_POLICY_CLASS_BREAKER_QUEUE_FRACTION", 0.8),

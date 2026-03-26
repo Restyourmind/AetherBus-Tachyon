@@ -954,6 +954,56 @@ func TestAdaptivePriorityWeightsBoostAgedBulkTraffic(t *testing.T) {
 	}
 }
 
+func TestAgingBoostIsSkippedWhenPolicyDisabled(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	now := time.Unix(1000, 0).UTC()
+	r.now = func() time.Time { return now }
+	r.SetPriorityPolicy([]string{"high", "normal"}, map[string]int{"high": 3, "normal": 1}, false, 0, 0)
+	r.SetQueueLimitPolicy(QueueLimitPolicy{
+		Enabled:         false,
+		AgingEnabled:    true,
+		AgingBoostAfter: 2 * time.Second,
+		AdaptiveStep:    4,
+	})
+	score := r.priorityScoreLocked(queuedDirectMessage{
+		Priority:   "normal",
+		EnqueuedAt: now.Add(-10 * time.Second),
+	})
+	if score != r.priorityWeights["normal"] {
+		t.Fatalf("expected aging boost disabled when policy is disabled, got score=%d base=%d", score, r.priorityWeights["normal"])
+	}
+}
+
+func TestPolicyDisableResetsRuntimeEffectiveWeights(t *testing.T) {
+	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	now := time.Unix(1000, 0).UTC()
+	r.now = func() time.Time { return now }
+	r.SetPriorityPolicy([]string{"high", "bulk"}, map[string]int{"high": 3, "bulk": 1}, true, 10, 1)
+	r.SetQueueLimitPolicy(QueueLimitPolicy{
+		Enabled:                 true,
+		EvaluationInterval:      time.Millisecond,
+		AdaptivePriorityWeights: true,
+		AdaptiveStep:            2,
+		AgingEnabled:            true,
+		AgingBoostAfter:         5 * time.Second,
+	})
+	r.directQueue[tenantTopicKey("", "orders.bulk")] = &priorityQueue{Messages: []queuedDirectMessage{
+		{MessageID: "msg-bulk", Topic: "orders.bulk", Priority: "bulk", EnqueueSequence: 1, EnqueuedAt: now.Add(-12 * time.Second)},
+	}}
+	r.evaluateQueueLimitPolicy()
+	if r.effectivePriorityWeights["bulk"] <= r.priorityWeights["bulk"] {
+		t.Fatalf("expected adaptive policy to mutate effective weights before disable, got effective=%d base=%d", r.effectivePriorityWeights["bulk"], r.priorityWeights["bulk"])
+	}
+
+	r.SetQueueLimitPolicy(QueueLimitPolicy{Enabled: false})
+	if r.policyState.RuntimeMode != queuePolicyRuntimeDisabled {
+		t.Fatalf("expected disabled runtime mode after policy disable, got %q", r.policyState.RuntimeMode)
+	}
+	if got := r.effectivePriorityWeights["bulk"]; got != r.priorityWeights["bulk"] {
+		t.Fatalf("expected effective weights reset on disable, got effective=%d base=%d", got, r.priorityWeights["bulk"])
+	}
+}
+
 func TestClassCircuitBreakerDropsBulkUnderPressure(t *testing.T) {
 	r := NewRouter("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor())
 	r.SetPriorityPolicy([]string{"high", "normal", "bulk"}, map[string]int{"high": 3, "normal": 2, "bulk": 1}, true, 8, 1000)

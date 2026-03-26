@@ -94,6 +94,7 @@ type QueueLimitPolicy struct {
 	MaxPerTopicQueue            int
 	AdaptivePriorityWeights     bool
 	AdaptiveStep                int
+	AgingEnabled                bool
 	AgingBoostAfter             time.Duration
 	ClassCircuitBreaker         bool
 	ClassBreakerQueueFraction   float64
@@ -120,6 +121,7 @@ type QueueLimitPolicyAdjustment struct {
 
 type QueueLimitPolicyState struct {
 	Enabled                  bool                         `json:"enabled"`
+	RuntimeMode              string                       `json:"runtime_mode"`
 	LastEvaluation           time.Time                    `json:"last_evaluation"`
 	LastAppliedAt            time.Time                    `json:"last_applied_at"`
 	CurrentMaxInflight       int                          `json:"current_max_inflight_per_consumer"`
@@ -228,28 +230,35 @@ type scheduledMessage struct {
 
 // DeliveryMetrics captures direct-delivery lifecycle counters.
 type DeliveryMetrics struct {
-	Ingress           uint64
-	Routed            uint64
-	Unroutable        uint64
-	Dispatched        uint64
-	Acked             uint64
-	Nacked            uint64
-	Retried           uint64
-	DeadLettered      uint64
-	DeliveryTimeout   uint64
-	RetryDueToTimeout uint64
-	DispatchPaused    uint64
-	BacklogQueued     uint64
-	WALWritten        uint64
-	WALReplayed       uint64
-	Deferred          uint64
-	Throttled         uint64
-	Dropped           uint64
-	Scheduled         uint64
-	ScheduledPromoted uint64
-	PolicyEvaluations uint64
-	PolicyAdjustments uint64
+	Ingress                 uint64
+	Routed                  uint64
+	Unroutable              uint64
+	Dispatched              uint64
+	Acked                   uint64
+	Nacked                  uint64
+	Retried                 uint64
+	DeadLettered            uint64
+	DeliveryTimeout         uint64
+	RetryDueToTimeout       uint64
+	DispatchPaused          uint64
+	BacklogQueued           uint64
+	WALWritten              uint64
+	WALReplayed             uint64
+	Deferred                uint64
+	Throttled               uint64
+	Dropped                 uint64
+	Scheduled               uint64
+	ScheduledPromoted       uint64
+	PolicyEvaluations       uint64
+	PolicyAdjustments       uint64
+	PolicyRuntimeViolations uint64
 }
+
+const (
+	queuePolicyRuntimeDisabled = "disabled"
+	queuePolicyRuntimeStatic   = "static"
+	queuePolicyRuntimeAdaptive = "adaptive"
+)
 
 type TenantDeliveryMetrics struct {
 	DeliveryMetrics
@@ -436,7 +445,7 @@ func (r *Router) SetQueueLimitPolicy(policy QueueLimitPolicy) {
 			r.policy.ClassBreakerQueueFraction = 0.8
 		}
 	}
-	r.policyState.EffectivePriorityWeights = r.priorityWeightsSnapshotLocked()
+	r.resetPolicyRuntimeStateLocked()
 }
 
 func (r *Router) evaluateQueueLimitPolicy() {
@@ -504,6 +513,11 @@ func (r *Router) evaluateQueueLimitPolicy() {
 }
 
 func (r *Router) adjustPriorityWeightsLocked(inputs QueueLimitPolicyInputs, now time.Time) {
+	if !r.policy.Enabled {
+		r.metrics.PolicyRuntimeViolations++
+		r.resetPolicyRuntimeStateLocked()
+		return
+	}
 	if len(r.priorityWeights) == 0 {
 		return
 	}
@@ -511,8 +525,8 @@ func (r *Router) adjustPriorityWeightsLocked(inputs QueueLimitPolicyInputs, now 
 		r.effectivePriorityWeights = r.priorityWeightsSnapshotLocked()
 	}
 	if !r.policy.AdaptivePriorityWeights {
-		r.effectivePriorityWeights = r.priorityWeightsSnapshotLocked()
-		r.policyState.EffectivePriorityWeights = r.priorityWeightsSnapshotLocked()
+		r.resetToDefaultWeightsLocked()
+		r.policyState.RuntimeMode = queuePolicyRuntimeStatic
 		return
 	}
 	queueByClass, oldestAgeByClass := r.queuedClassStatsLocked(now)
@@ -542,6 +556,31 @@ func (r *Router) adjustPriorityWeightsLocked(inputs QueueLimitPolicyInputs, now 
 	}
 	r.effectivePriorityWeights = updated
 	r.policyState.EffectivePriorityWeights = r.priorityWeightsSnapshotLockedFrom(updated)
+	r.policyState.RuntimeMode = queuePolicyRuntimeAdaptive
+}
+
+func (r *Router) resetToDefaultWeightsLocked() {
+	r.effectivePriorityWeights = r.priorityWeightsSnapshotLocked()
+	r.policyState.EffectivePriorityWeights = r.priorityWeightsSnapshotLocked()
+}
+
+func (r *Router) resetPolicyRuntimeStateLocked() {
+	if !r.policy.Enabled {
+		r.effectivePriorityWeights = make(map[string]int)
+		r.resetToDefaultWeightsLocked()
+		r.policyState.RuntimeMode = queuePolicyRuntimeDisabled
+		r.policyState.HoldUntil = time.Time{}
+		r.policyState.LastReason = "policy_disabled"
+		r.policyState.RecentAdjustments = nil
+		r.policyState.LastInputs = QueueLimitPolicyInputs{}
+		return
+	}
+	r.resetToDefaultWeightsLocked()
+	if r.policy.AdaptivePriorityWeights {
+		r.policyState.RuntimeMode = queuePolicyRuntimeAdaptive
+		return
+	}
+	r.policyState.RuntimeMode = queuePolicyRuntimeStatic
 }
 
 func (r *Router) queuedClassStatsLocked(now time.Time) (map[string]int, map[string]time.Duration) {
@@ -1637,7 +1676,7 @@ func (r *Router) priorityScoreLocked(msg queuedDirectMessage) int {
 }
 
 func (r *Router) applyAgingScoreBoostLocked(score int, msg queuedDirectMessage) int {
-	if r.policy.AgingBoostAfter <= 0 || msg.EnqueuedAt.IsZero() {
+	if !r.policy.Enabled || !r.policy.AgingEnabled || r.policy.AgingBoostAfter <= 0 || msg.EnqueuedAt.IsZero() {
 		return score
 	}
 	age := r.now().Sub(msg.EnqueuedAt)
