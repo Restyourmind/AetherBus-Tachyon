@@ -23,6 +23,11 @@ type QueueLimitPolicyConfig struct {
 	MaxInflightPerConsumer      int
 	MinPerTopicQueue            int
 	MaxPerTopicQueue            int
+	AdaptivePriorityWeights     bool
+	AdaptiveStep                int
+	AgingBoostAfterMS           int
+	ClassCircuitBreaker         bool
+	ClassBreakerQueueFraction   float64
 }
 
 // Config holds the application configuration.
@@ -95,6 +100,11 @@ func Load() (*Config, error) {
 		MaxInflightPerConsumer:      getenvIntOrDefault("QUEUE_POLICY_MAX_INFLIGHT_PER_CONSUMER", cfg.MaxInflightPerConsumer),
 		MinPerTopicQueue:            getenvIntOrDefault("QUEUE_POLICY_MIN_PER_TOPIC_QUEUE", 64),
 		MaxPerTopicQueue:            getenvIntOrDefault("QUEUE_POLICY_MAX_PER_TOPIC_QUEUE", cfg.MaxPerTopicQueue),
+		AdaptivePriorityWeights:     getenvBoolOrDefault("QUEUE_POLICY_ADAPTIVE_PRIORITY_WEIGHTS", true),
+		AdaptiveStep:                getenvIntOrDefault("QUEUE_POLICY_ADAPTIVE_STEP", 1),
+		AgingBoostAfterMS:           getenvIntOrDefault("QUEUE_POLICY_AGING_BOOST_AFTER_MS", 15000),
+		ClassCircuitBreaker:         getenvBoolOrDefault("QUEUE_POLICY_CLASS_CIRCUIT_BREAKER", true),
+		ClassBreakerQueueFraction:   getenvFloatOrDefault("QUEUE_POLICY_CLASS_BREAKER_QUEUE_FRACTION", 0.8),
 	}
 
 	return cfg, nil
