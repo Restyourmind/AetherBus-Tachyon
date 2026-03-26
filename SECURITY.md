@@ -15,7 +15,7 @@ We actively support the latest minor version of AetherBus-Tachyon.
 
 If you discover a security vulnerability, please report it responsibly:
 
-- 📧 Email: security@your-domain.com
+- 📧 Email: lnspirafirma@gmail.com
 - 🔒 Or open a private security advisory on GitHub
 
 Please DO NOT open public issues for security vulnerabilities.
