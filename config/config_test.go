@@ -131,3 +131,19 @@ func TestLoadDirectPriorityFromEnv(t *testing.T) {
 		t.Fatalf("unexpected configured boost policy: threshold=%d offset=%d", cfg.PriorityBoostThreshold, cfg.PriorityBoostOffset)
 	}
 }
+
+func TestLoadDirectPriorityWeightsIgnoresUnknownClasses(t *testing.T) {
+	t.Setenv("DIRECT_PRIORITY_CLASSES", "critical,bulk")
+	t.Setenv("DIRECT_PRIORITY_WEIGHTS", "critical=9,bulk=2,background=100")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected load error: %v", err)
+	}
+	if cfg.PriorityClassWeights["critical"] != 9 || cfg.PriorityClassWeights["bulk"] != 2 {
+		t.Fatalf("unexpected configured weights: %#v", cfg.PriorityClassWeights)
+	}
+	if _, ok := cfg.PriorityClassWeights["background"]; ok {
+		t.Fatalf("expected unknown class to be ignored, got %#v", cfg.PriorityClassWeights)
+	}
+}

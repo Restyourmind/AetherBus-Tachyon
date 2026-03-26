@@ -7,8 +7,7 @@ import (
 	"strings"
 )
 
-// Config holds the application configuration.
-// Values are populated from environment variables.
+// QueueLimitPolicyConfig defines runtime tuning controls for direct queue limits.
 type QueueLimitPolicyConfig struct {
 	Enabled                     bool
 	EvaluationIntervalMS        int
@@ -164,8 +163,10 @@ func getenvCSVOrDefault(key string, defaultValue []string) []string {
 
 func getenvPriorityWeightsOrDefault(key string, classes []string) map[string]int {
 	defaults := make(map[string]int, len(classes))
+	allowed := make(map[string]struct{}, len(classes))
 	for i, class := range classes {
 		defaults[class] = len(classes) - i
+		allowed[class] = struct{}{}
 	}
 	value, ok := os.LookupEnv(key)
 	if !ok || strings.TrimSpace(value) == "" {
@@ -182,6 +183,9 @@ func getenvPriorityWeightsOrDefault(key string, classes []string) map[string]int
 		}
 		class := strings.ToLower(strings.TrimSpace(kv[0]))
 		if class == "" {
+			continue
+		}
+		if _, ok := allowed[class]; !ok {
 			continue
 		}
 		weight, err := strconv.Atoi(strings.TrimSpace(kv[1]))
