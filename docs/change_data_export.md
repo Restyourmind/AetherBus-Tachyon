@@ -50,4 +50,4 @@ Rules for future changes:
 1. Additive fields should go into `labels` first when experimentation is needed.
 2. Stable promoted fields should increment `schema_version` only when a breaking interpretation change is required.
 3. Consumers must ignore unknown fields.
-4. `event_id`, `kind`, `action`, `source`, `occurred_at`, and `cursor` should remain backwards compatible within a major schema version.
+4. `event_id`, `kind`, `action`, `source`, `occurred_at`, and `cursor` should remain backward compatible within a major schema version.
