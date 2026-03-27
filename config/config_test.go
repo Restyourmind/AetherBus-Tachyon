@@ -147,3 +147,30 @@ func TestLoadDirectPriorityWeightsIgnoresUnknownClasses(t *testing.T) {
 		t.Fatalf("expected unknown class to be ignored, got %#v", cfg.PriorityClassWeights)
 	}
 }
+
+func TestLoadTenantQuotasFromEnv(t *testing.T) {
+	t.Setenv("TENANT_QUOTAS_JSON", `{"tenant-a":{"max_inflight":64,"max_queued":512,"max_ingress":1024},"tenant-b":{"max_queued":200}}`)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected load error: %v", err)
+	}
+	if got := cfg.TenantQuotas["tenant-a"]; got.MaxInflight != 64 || got.MaxQueued != 512 || got.MaxIngress != 1024 {
+		t.Fatalf("unexpected tenant-a quota: %#v", got)
+	}
+	if got := cfg.TenantQuotas["tenant-b"]; got.MaxInflight != 0 || got.MaxQueued != 200 || got.MaxIngress != 0 {
+		t.Fatalf("unexpected tenant-b quota: %#v", got)
+	}
+}
+
+func TestLoadTenantQuotasInvalidJSONFallsBackToEmpty(t *testing.T) {
+	t.Setenv("TENANT_QUOTAS_JSON", `{"tenant-a":`)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected load error: %v", err)
+	}
+	if len(cfg.TenantQuotas) != 0 {
+		t.Fatalf("expected empty quotas on invalid json, got %#v", cfg.TenantQuotas)
+	}
+}

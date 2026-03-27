@@ -94,6 +94,18 @@ Direct-delivery admission control defaults are intentionally conservative and ca
 - `MAX_PER_TOPIC_QUEUE` (default `256`)
 - `MAX_QUEUED_DIRECT` (default `4096`)
 - `MAX_GLOBAL_INGRESS` (default `8192`)
+- `TENANT_QUOTAS_JSON` (optional per-tenant quota overrides)
+
+Example `TENANT_QUOTAS_JSON`:
+
+```json
+{
+  "tenant-a": { "max_inflight": 256, "max_queued": 2048, "max_ingress": 4096 },
+  "tenant-b": { "max_queued": 512 }
+}
+```
+
+Each field is optional per tenant. Any configured positive value overrides broker defaults for that tenant only.
 
 When limits are reached, direct messages are deferred or dropped with explicit broker counters (`deferred`, `throttled`, `dropped`).
 
@@ -347,7 +359,7 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 ### English
 
 - **Priority-aware Delivery Classes:** Introduce weighted priority classes so operator commands, retries, and bulk sync traffic can coexist with predictable fairness.
-- **Tenant-aware Quotas and Isolation:** Extend route namespaces with per-tenant queue budgets, metrics, and admission-control policy.
+- **Tenant-aware Quotas and Isolation:** ✅ Route namespaces are tenant-scoped, tenant metrics are emitted, and per-tenant admission quotas can now be set through `TENANT_QUOTAS_JSON`.
 - **Geo-redundant Durability:** Replicate WAL, route catalog, and delayed queue state to a standby node or object storage target.
 - **SLO-driven Autoscaling Signals:** Emit broker pressure indicators that can feed orchestration or capacity planning automation.
 - **AuthN/AuthZ Control Plane:** Add operator authentication, signed control messages, and role-based access for administrative APIs.
@@ -355,7 +367,7 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 ### ภาษาไทย
 
 - **Priority-aware Delivery Classes:** เพิ่มระดับความสำคัญของการส่งแบบถ่วงน้ำหนัก เพื่อให้คำสั่งของผู้ปฏิบัติงาน งาน retry และทราฟฟิกปริมาณมากอยู่ร่วมกันได้อย่างเป็นธรรม
-- **Tenant-aware Quotas and Isolation:** ขยาย route namespace ให้รองรับ quota, metrics และ admission-control policy แยกตาม tenant
+- **Tenant-aware Quotas and Isolation:** ✅ route namespace แยกตาม tenant อยู่แล้ว พร้อม tenant metrics และสามารถกำหนด admission quota แยก tenant ผ่าน `TENANT_QUOTAS_JSON` ได้แล้ว
 - **Geo-redundant Durability:** ทำสำเนา WAL, route catalog และสถานะ delayed queue ไปยัง standby node หรือ object storage
 - **SLO-driven Autoscaling Signals:** ปล่อยสัญญาณแรงกดดันของ broker เพื่อนำไปใช้กับระบบ orchestration หรือ automation ด้าน capacity planning
 - **AuthN/AuthZ Control Plane:** เพิ่มการยืนยันตัวตนของผู้ปฏิบัติงาน, signed control messages และสิทธิ์แบบ role-based สำหรับ administrative APIs
