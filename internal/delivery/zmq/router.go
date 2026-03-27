@@ -701,6 +701,16 @@ func (r *Router) SetTenantQuota(tenantID string, quota TenantQuota) {
 	r.tenantQuotas[tenantID] = quota
 }
 
+func (r *Router) TenantQuotasSnapshot() map[string]TenantQuota {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]TenantQuota, len(r.tenantQuotas))
+	for tenantID, quota := range r.tenantQuotas {
+		out[tenantID] = quota
+	}
+	return out
+}
+
 func (r *Router) SetPriorityPolicy(classes []string, weights map[string]int, preemption bool, boostThreshold, boostOffset int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

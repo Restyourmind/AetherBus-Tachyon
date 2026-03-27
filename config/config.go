@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"sort"
 	"strconv"
@@ -31,6 +32,13 @@ type QueueLimitPolicyConfig struct {
 	ClassBreakerQueueFraction   float64
 }
 
+// TenantQuotaConfig defines per-tenant admission controls.
+type TenantQuotaConfig struct {
+	MaxInflight int `json:"max_inflight"`
+	MaxQueued   int `json:"max_queued"`
+	MaxIngress  int `json:"max_ingress"`
+}
+
 // Config holds the application configuration.
 type Config struct {
 	ZmqBindAddress           string
@@ -57,6 +65,7 @@ type Config struct {
 	PriorityBoostThreshold   int
 	PriorityBoostOffset      int
 	QueueLimitPolicy         QueueLimitPolicyConfig
+	TenantQuotas             map[string]TenantQuotaConfig
 }
 
 // Load reads configuration from environment variables and returns a new Config struct.
@@ -108,6 +117,7 @@ func Load() (*Config, error) {
 		ClassCircuitBreaker:         getenvBoolOrDefault("QUEUE_POLICY_CLASS_CIRCUIT_BREAKER", true),
 		ClassBreakerQueueFraction:   getenvFloatOrDefault("QUEUE_POLICY_CLASS_BREAKER_QUEUE_FRACTION", 0.8),
 	}
+	cfg.TenantQuotas = getenvTenantQuotasOrDefault("TENANT_QUOTAS_JSON")
 
 	return cfg, nil
 }
@@ -240,4 +250,27 @@ func getenvFloatOrDefault(key string, defaultValue float64) float64 {
 		return defaultValue
 	}
 	return parsed
+}
+
+func getenvTenantQuotasOrDefault(key string) map[string]TenantQuotaConfig {
+	value, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(value) == "" {
+		return map[string]TenantQuotaConfig{}
+	}
+	decoded := map[string]TenantQuotaConfig{}
+	if err := json.Unmarshal([]byte(value), &decoded); err != nil {
+		return map[string]TenantQuotaConfig{}
+	}
+	out := map[string]TenantQuotaConfig{}
+	for tenantID, quota := range decoded {
+		tenantID = strings.TrimSpace(tenantID)
+		if tenantID == "" {
+			continue
+		}
+		if quota.MaxInflight <= 0 && quota.MaxQueued <= 0 && quota.MaxIngress <= 0 {
+			continue
+		}
+		out[tenantID] = quota
+	}
+	return out
 }

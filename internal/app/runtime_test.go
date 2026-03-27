@@ -21,6 +21,7 @@ func testRuntimeConfig(path string) *config.Config {
 		MaxQueuedDirect:        10,
 		MaxGlobalIngress:       10,
 		RouteCatalogPath:       path,
+		TenantQuotas:           map[string]config.TenantQuotaConfig{},
 	}
 }
 
@@ -55,5 +56,22 @@ func TestRuntimeFallsBackToBootstrapRoutesOnCorruptedCatalog(t *testing.T) {
 
 	if got := runtime.RouteStore.Match(domain.RouteKey{Topic: "orders.created"}); got != "bootstrap-node" {
 		t.Fatalf("expected bootstrap fallback destination, got %q", got)
+	}
+}
+
+func TestRuntimeAppliesTenantQuotasFromConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.json")
+	cfg := testRuntimeConfig(path)
+	cfg.TenantQuotas = map[string]config.TenantQuotaConfig{
+		"tenant-a": {MaxInflight: 20, MaxQueued: 80, MaxIngress: 120},
+	}
+
+	runtime := NewRuntimeWithCompressor(cfg, map[string]string{"orders.created": "bootstrap-node"}, media.NewNoopCompressor())
+	quotas := runtime.Router.TenantQuotasSnapshot()
+
+	if got, ok := quotas["tenant-a"]; !ok {
+		t.Fatalf("expected tenant-a quota to be applied")
+	} else if got.MaxInflight != 20 || got.MaxQueued != 80 || got.MaxIngress != 120 {
+		t.Fatalf("unexpected tenant-a quota: %#v", got)
 	}
 }
