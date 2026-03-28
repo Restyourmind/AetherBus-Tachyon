@@ -923,7 +923,7 @@ func (r *Router) processInflightTimeouts() {
 			r.tenantMetricLocked(record.TenantID).Retried++
 			r.tenantMetricLocked(record.TenantID).RetryDueToTimeout++
 			r.scheduleDispatchLocked(record.TenantID, record.Topic, record.ConsumerID, domain.RouteTypeDirect, record.MessageID, record.Payload, record.Priority, record.EnqueueSequence, record.DeliveryAttempt, now.Add(r.deliveryTimeout), "timeout_retry")
-			r.emitEventLocked("delivery", "retry", record.TenantID, record.Topic, record.MessageID, record.ConsumerID, record.SessionID, record.DeliveryAttempt, statusRetry, "timeout_retry", record.EnqueueSequence, now.Add(r.deliveryTimeout), len(record.Payload), nil)
+			r.emitEventLocked("delivery", "retry", record.TenantID, record.Topic, record.MessageID, record.ConsumerID, record.SessionID, record.DeliveryAttempt, string(statusRetry), "timeout_retry", record.EnqueueSequence, now.Add(r.deliveryTimeout), len(record.Payload), nil)
 			continue
 		}
 		if s, ok := r.directSessions[sessionMapKey(record.TenantID, record.ConsumerID)]; ok && s.InflightCount > 0 {

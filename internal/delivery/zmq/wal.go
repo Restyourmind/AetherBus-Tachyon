@@ -481,7 +481,7 @@ func (w *fileWAL) PurgeDeadLetters(req DeadLetterPurgeRequest) (DeadLetterPurgeR
 		now := time.Now().UTC()
 		resultStates := make([]audit.MessageState, 0, len(priorStates))
 		for _, state := range priorStates {
-			resultStates = append(resultStates, audit.MessageState{MessageID: statefile.MessageID, Location: "purged"})
+			resultStates = append(resultStates, audit.MessageState{MessageID: state.MessageID, Location: "purged"})
 		}
 		if _, err := w.appendAuditEventLocked(audit.Event{Actor: req.Actor, Timestamp: now, Operation: audit.OperationPurgeDeadLetter, TargetMessageIDs: targetIDs, RequestedReason: req.Reason, PriorState: priorStates, ResultingState: resultStates}); err != nil {
 			return DeadLetterPurgeResult{}, err

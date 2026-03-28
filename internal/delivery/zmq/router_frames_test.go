@@ -649,7 +649,7 @@ func TestReplayFromWALPreservesIdentityAndAttempt(t *testing.T) {
 		Subscriptions:     map[string]struct{}{"orders.created": {}},
 	}
 
-	r.replayFromWAL("worker-1")
+	r.replayFromWAL("", "worker-1")
 	replayed, ok := r.inflight["msg-r2"]
 	if !ok {
 		t.Fatalf("expected replayed inflight")
@@ -687,7 +687,7 @@ func TestRetryExhaustionAppendsDeadLetterToWAL(t *testing.T) {
 	if got := r.metrics.DeadLettered; got != 1 {
 		t.Fatalf("expected deadlettered=1 after retry exhaustion, got %d", got)
 	}
-	if len(w.deadLettered) != 1 || w.deadLettered[0] != "msg-exhaust" {
+	if len(w.deadLettered) != 1 || w.deadLettered[0].MessageID != "msg-exhaust" {
 		t.Fatalf("expected wal dead-letter append for exhausted retry, got %#v", w.deadLettered)
 	}
 }
@@ -698,7 +698,6 @@ func TestLoadSessionSnapshotsMarksResumablePendingUntilRegister(t *testing.T) {
 			SessionID:           "sess_000007",
 			ConsumerID:          "worker-1",
 			Subscriptions:       []string{"orders.created"},
-			ConnectedAt:         time.Unix(100, 0).UTC(),
 			LastHeartbeat:       time.Unix(200, 0).UTC(),
 			MaxInflight:         7,
 			SupportsAck:         true,
@@ -732,7 +731,7 @@ func TestLoadSessionSnapshotsMarksResumablePendingUntilRegister(t *testing.T) {
 	if got := session.Capabilities.SupportsCompression[0]; got != "lz4" {
 		t.Fatalf("expected compression hint restored, got %q", got)
 	}
-	if r.selectSession("orders.created") != nil {
+	if r.selectSession("", "", "orders.created") != nil {
 		t.Fatalf("expected recovered non-live session not selected for dispatch")
 	}
 }
@@ -743,7 +742,6 @@ func TestRegisterConsumerSessionRehydratesRecoveredSessionMetadata(t *testing.T)
 			SessionID:           "sess_000009",
 			ConsumerID:          "worker-1",
 			Subscriptions:       []string{"orders.created"},
-			ConnectedAt:         time.Unix(100, 0).UTC(),
 			LastHeartbeat:       time.Unix(200, 0).UTC(),
 			MaxInflight:         5,
 			SupportsAck:         true,
@@ -945,7 +943,7 @@ func TestWALReplayPreservesPriorityMetadata(t *testing.T) {
 	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 3, time.Second, w)
 	r.directSessions[sessionMapKey("", "worker-1")] = &consumerSession{SessionID: "sess_000001", ConsumerID: "worker-1", TransportIdentity: []byte("cid1"), Capabilities: capabilityHints{SupportsAck: true, Resumable: true}, MaxInflight: 2, Subscriptions: map[string]struct{}{"orders.created": {}}}
 
-	r.replayFromWAL("worker-1")
+	r.replayFromWAL("", "worker-1")
 
 	replayed := r.inflight["msg-rp1"]
 	if replayed == nil || replayed.Priority != "urgent" || replayed.EnqueueSequence != 42 {
