@@ -180,63 +180,103 @@ go run ./cmd/tachyon-bench matrix --duration 10s --connections 2
 
 The harness reports p50/p95/p99 latency, throughput, CPU usage, memory RSS, and allocations/op. See `docs/PERFORMANCE.md` for full interpretation guidance and comparison workflow.
 
-## 🏗️ System Architecture Diagram
+## 🏗️ System Architecture Diagram (Database-Aligned)
 
 ```mermaid
-flowchart TB
-    Producers[Producers / Admin Clients] --> Runtime[Broker Runtime
-internal/app.Runtime + delivery/zmq.Router]
-    Consumers[Consumers / Workers] <--> Runtime
+erDiagram
+    ROUTE_CATALOG_SNAPSHOT {
+        int version PK
+    }
 
-    subgraph Authoritative[Authoritative persisted state]
-        RouteCatalog[(ROUTE_CATALOG_PATH
-route catalog
-version + routes[])]
-        WalSegments[(WAL_PATH segments
-dispatched / committed / dead_lettered)]
-        SessionStore[(WAL_PATH.sessions
-resumable session snapshot store)]
-        ScheduledStore[(WAL_PATH.scheduled
-scheduled / retry queue)]
-        DLQStore[(WAL_PATH.dlq
-dead-letter record store)]
-        AuditLog[(WAL_PATH.audit
-append-only audit log)]
-        AuditHead[(WAL_PATH.audit.head
-audit hash head sidecar)]
-    end
+    ROUTE_ENTRY {
+        string pattern PK
+        string destination_id PK
+        string route_type
+        int priority
+        bool enabled
+        string tenant
+    }
 
-    subgraph RuntimeCaches[Runtime-only derived state / caches]
-        RouteIndex[ART route index cache
-key = tenant_id + topic]
-        SessionCache[Live session cache
-key = tenant_id + consumer_id]
-        InflightCache[Inflight registry cache
-key = message_id]
-        DeferredQueue[Deferred direct queues
-key = tenant_id + topic + destination_id]
-        SchedulerCache[Sorted scheduler cache
-order = deliver_at + sequence]
-    end
+    SESSION_SNAPSHOT {
+        string session_id PK
+        string consumer_id PK
+        string tenant_id
+        string subscriptions_json
+        datetime last_heartbeat
+        int max_inflight
+        bool supports_ack
+        string supports_compression_json
+        string supports_codec_json
+        bool resumable
+    }
 
-    Runtime --> RouteCatalog
-    Runtime --> WalSegments
-    Runtime --> SessionStore
-    Runtime --> ScheduledStore
-    Runtime --> DLQStore
-    Runtime --> AuditLog
+    WAL_RECORD {
+        string message_id PK
+        string type
+        string consumer_id
+        string session_id
+        string tenant_id
+        string topic
+        string payload_base64
+        string priority
+        uint64 enqueue_sequence
+        int attempt
+    }
 
-    RouteCatalog --> RouteIndex
-    SessionStore --> SessionCache
-    WalSegments --> InflightCache
-    ScheduledStore --> SchedulerCache
-    SessionCache --> DeferredQueue
-    DLQStore --> Runtime
-    AuditHead --> AuditLog
-    AuditLog --> AdminExport[Audit / export queries]
+    SCHEDULED_MESSAGE {
+        uint64 sequence PK
+        string message_id
+        string tenant_id
+        string topic
+        string destination_id
+        string route_type
+        bytes payload
+        string priority
+        uint64 enqueue_sequence
+        int delivery_attempt
+        datetime deliver_at
+        string reason
+    }
+
+    DLQ_RECORD {
+        string message_id PK
+        string consumer_id
+        string session_id
+        string tenant_id
+        string topic
+        bytes payload
+        string priority
+        uint64 enqueue_sequence
+        int attempt
+        string reason
+        datetime dead_lettered_at
+        int replay_count
+        datetime last_replay_at
+        string last_replay_target
+    }
+
+    AUDIT_EVENT {
+        string event_id PK
+        string actor
+        datetime timestamp
+        string operation
+        string target_message_ids_json
+        string requested_reason
+        string prior_state_json
+        string resulting_state_json
+        string prev_hash
+        string hash
+    }
+
+    ROUTE_CATALOG_SNAPSHOT ||--o{ ROUTE_ENTRY : contains
+    SESSION_SNAPSHOT }o--o{ WAL_RECORD : "replay join (tenant_id + consumer_id + session_id)"
+    WAL_RECORD ||--o{ SCHEDULED_MESSAGE : "retry / replay scheduling"
+    WAL_RECORD ||--o| DLQ_RECORD : "dead-letter terminal state"
+    DLQ_RECORD ||--o{ AUDIT_EVENT : "manual / replay / purge operations"
+    SCHEDULED_MESSAGE ||--o{ AUDIT_EVENT : "replay mutation trail"
 ```
 
-This diagram follows the broker's current state-store boundaries: persisted files are treated as the source of truth, while ART indexes, live session maps, inflight counters, deferred queues, and sorted scheduler views are runtime-derived structures rebuilt from those persisted records during recovery.
+This view maps directly to persisted Go shapes: `domain.RouteCatalogSnapshot/Route`, `sessionSnapshot`, `walRecord`, `scheduledMessage`, `DeadLetterRecord`, and `audit.Event`. Each persistence file (`ROUTE_CATALOG_PATH`, `WAL_PATH.segments`, `WAL_PATH.sessions`, `WAL_PATH.scheduled`, `WAL_PATH.dlq`, `WAL_PATH.audit`) is represented using those stored fields rather than inferred placeholders.
 
 ### Runtime composition
 
@@ -246,119 +286,49 @@ This diagram follows the broker's current state-store boundaries: persisted file
 - **Transport layer:** `internal/delivery/zmq.Router` owns the ZeroMQ ROUTER/PUB sockets, parses frames, handles consumer registration/heartbeats, and emits direct/fanout deliveries.
 - **Media layer:** `internal/media.JSONCodec` and `internal/media.LZ4Compressor` handle event encoding and payload compression.
 - **Application layer:** `internal/usecase.EventRouter` resolves fanout routes and coordinates routing decisions with broker state.
-- **Logical data layer:** the runtime operates over a hybrid state model — ART route index, consumer session table, inflight registry, deferred/scheduled queues, WAL segments, DLQ store, and append-only audit chain.
+- **Logical data layer:** the runtime operates over a hybrid state model — route catalog, consumer sessions, inflight messages, scheduled retries, WAL segments, DLQ records, and append-only audit events.
 
 ### Message + state flow
 
 1. **Producers** publish multipart frames to the ZeroMQ ROUTER.
 2. **`delivery/zmq.Router`** validates frame shape, decodes/compresses payloads via the media layer, and forwards routing work into the application flow.
-3. **`usecase.EventRouter`** resolves topic matches through the **route store (ART)** for fanout delivery.
-4. **Consumer registration and heartbeat traffic** updates the **consumer session table**, which tracks active direct-delivery capability.
-5. **Direct deliveries** create or update **inflight delivery records** so ACK/NACK, retry, timeout, and dead-letter behavior can be evaluated.
-6. When ACK durability is required, the broker appends dispatch state to **segmented WAL files**, snapshots resumable sessions, and persists scheduled retries for restart recovery.
-7. Terminal failures are materialized into the **DLQ store**, while replay/purge/manual dead-letter mutations are chained into the **admin audit log** for forensic review.
-8. The transport layer emits the final topic payload or direct-delivery frame back to **subscribers / workers**.
+3. **`usecase.EventRouter`** resolves topic matches through the **route catalog** for fanout delivery.
+4. **Consumer registration and heartbeat traffic** upserts **consumer sessions**, tracking active direct-delivery capability.
+5. **Direct deliveries** update runtime inflight state and persist **WAL dispatched records** so ACK/NACK, retry, timeout, and dead-letter rules are deterministic after restart.
+6. When ACK durability is required, state transitions are appended to the **delivery WAL** and replay schedules are persisted in **scheduled deliveries**.
+7. Terminal failures are written into **DLQ records**, while replay/purge/manual dead-letter actions append to **audit events** with hash chaining.
+8. The transport layer emits final topic payloads or direct-delivery frames back to **subscribers / workers**.
 
-This version of the diagram is aligned with the current logical storage model described below, so the architecture view now reflects both the runtime components and the broker-managed data structures.
-
-## 🗃️ Data Storage Structure (Current)
-
-The broker currently uses a **hybrid in-memory + append-only WAL** model instead of a full relational database. The logical data structures are:
-
-### 1) Route store (ART + persisted catalog)
-
-- Purpose: topic-to-destination lookup for routing decisions
-- Shape: adaptive radix tree in memory plus a versioned JSON route catalog on disk
-- Lifecycle: loaded from `ROUTE_CATALOG_PATH` on startup, mutated in memory during runtime, persisted after route changes
-
-| Field | Type | Description |
-|---|---|---|
-| `topic` | string | Topic key used for route lookup |
-| `destination` | string | Target consumer/node identifier |
-
-### 2) Direct consumer session table (in-memory + resumable snapshots)
-
-- Purpose: active consumer capability/session tracking for direct delivery
-- Shape: map keyed by `consumer_id`
-- Lifecycle: active state lives in memory; resumable metadata can be restored from WAL-backed session snapshots
-
-| Field | Type | Description |
-|---|---|---|
-| `consumer_id` | string | Stable consumer identity |
-| `session_id` | string | Active session identifier |
-| `socket_identity` | bytes | ZeroMQ ROUTER identity for direct send |
-| `supports_ack` | bool | Whether consumer participates in ACK flow |
-| `subscriptions` | set[string] | Topics subscribed for direct delivery |
-| `max_inflight` | int | Consumer inflight window cap |
-| `inflight_count` | int | Current number of inflight messages |
-| `last_heartbeat` | timestamp | Last heartbeat seen from consumer |
-
-### 3) Inflight + scheduled delivery tables
-
-- Purpose: ACK/NACK, retry, timeout, dead-letter control, and delayed delivery scheduling for direct mode
-- Shape: maps keyed by `message_id` plus an ordered scheduled queue keyed by `deliver_at`
-- Lifecycle: inflight state lives in memory; retry/delayed queue ordering can be restored from WAL-backed scheduled entries
-
-| Field | Type | Description |
-|---|---|---|
-| `message_id` | string | Message identity used for ACK/NACK correlation |
-| `consumer_id` | string | Target consumer for this attempt |
-| `session_id` | string | Session that received the dispatch |
-| `topic` | string | Routed topic |
-| `payload` | bytes | Original payload bytes |
-| `attempt` | int | Delivery attempt count |
-| `dispatched_at` | timestamp | Dispatch time used for timeout evaluation |
-| `status` | enum | `dispatched` / `acked` / `nacked` / `expired` / `retry_scheduled` / `dead_lettered` |
-
-### 4) Delivery WAL (append-only file)
-
-- Purpose: durability for direct messages requiring ACK
-- Storage: JSON-line append log (default path `./data/direct_delivery.wal`)
-- Recovery: uncommitted dispatch records are replayed when matching consumers re-register
-
-| Field | Type | Description |
-|---|---|---|
-| `type` | enum | `dispatched`, `committed`, or `dead_lettered` |
-| `message_id` | string | Message identity |
-| `consumer` | string | Consumer identity for dispatched records |
-| `session_id` | string | Session ID for dispatched records |
-| `topic` | string | Topic for dispatched records |
-| `payload` | bytes | Payload for dispatched records |
-| `attempt` | int | Attempt number for dispatched records |
-
-> Note: if you need SQL/NoSQL persistence in the future, this model can be mapped directly to tables/collections (`routes`, `consumer_sessions`, `inflight_messages`, `delivery_wal`) while preserving existing runtime semantics.
-
-
-### Durability guarantees and non-goals
-
-**Guarantees (when `WAL_ENABLED=true`):**
-- Direct deliveries that require ACK are written to WAL before broker send.
-- ACK and terminal dead-letter outcomes finalize WAL records, preventing replay.
-- On restart, only unfinalized direct deliveries are replayed, preserving `message_id`, `consumer_id`, topic, payload, and attempt counter.
-
-**Non-goals / current limitations:**
-- WAL is local append-only file storage (single-node durability, no replication or consensus).
-- WAL replay is scoped to consumers that re-register; replay is not global fanout recovery.
-- Dispatch WAL compaction/retention is not implemented in this version.
-- Audit retention is operator-managed and can be longer than WAL retention because the audit chain is stored separately in `WAL_PATH.audit`.
+This database-aligned diagram intentionally focuses on authoritative state and relationships so operators can map broker behavior to backup, retention, and compliance controls more directly.
 
 ## 💡 Function Proposals & Future Extensions
 
 ### English
 
-- **Priority-aware Delivery Classes:** Introduce weighted priority classes so operator commands, retries, and bulk sync traffic can coexist with predictable fairness.
-- **Tenant-aware Quotas and Isolation:** Extend route namespaces with per-tenant queue budgets, metrics, and admission-control policy.
-- **Geo-redundant Durability:** Replicate WAL, route catalog, and delayed queue state to a standby node or object storage target.
-- **SLO-driven Autoscaling Signals:** Emit broker pressure indicators that can feed orchestration or capacity planning automation.
-- **AuthN/AuthZ Control Plane:** Add operator authentication, signed control messages, and role-based access for administrative APIs.
+- **Policy-based Retry Engine:** Attach retry curves (`linear`, `exponential`, `jitter`) by topic or tenant with caps and blackout windows.
+- **Schema Registry + Compatibility Gate:** Validate payload contracts before publish and block incompatible version drift.
+- **Cross-region Read Replica for DLQ/Audit:** Stream DLQ and audit chains to read-only replicas for compliance and incident response.
+- **Adaptive Queue Rebalancer:** Move deferred queues between workers based on heartbeat quality, inflight pressure, and latency trends.
+- **Operator Runbook API:** Publish machine-readable remediation playbooks for common incidents (retry storm, consumer flap, DLQ spike).
+- **Message Trace Correlation:** Add trace/span identifiers from ingress to replay for distributed debugging.
+- **Tenant Billing Metrics Export:** Emit metered usage by tenant/topic for chargeback and quota governance.
+- **Key Rotation Workflow:** Support envelope-key rotation for encrypted payloads without broker downtime.
 
 ### ภาษาไทย
 
-- **Priority-aware Delivery Classes:** เพิ่มระดับความสำคัญของการส่งแบบถ่วงน้ำหนัก เพื่อให้คำสั่งของผู้ปฏิบัติงาน งาน retry และทราฟฟิกปริมาณมากอยู่ร่วมกันได้อย่างเป็นธรรม
-- **Tenant-aware Quotas and Isolation:** ขยาย route namespace ให้รองรับ quota, metrics และ admission-control policy แยกตาม tenant
-- **Geo-redundant Durability:** ทำสำเนา WAL, route catalog และสถานะ delayed queue ไปยัง standby node หรือ object storage
-- **SLO-driven Autoscaling Signals:** ปล่อยสัญญาณแรงกดดันของ broker เพื่อนำไปใช้กับระบบ orchestration หรือ automation ด้าน capacity planning
-- **AuthN/AuthZ Control Plane:** เพิ่มการยืนยันตัวตนของผู้ปฏิบัติงาน, signed control messages และสิทธิ์แบบ role-based สำหรับ administrative APIs
+- **Policy-based Retry Engine:** กำหนดนโยบาย retry (`linear`, `exponential`, `jitter`) แยกตาม topic หรือ tenant พร้อมเพดานและช่วงเวลาหยุดส่ง
+- **Schema Registry + Compatibility Gate:** ตรวจสอบสัญญา payload ก่อน publish และป้องกันการเปลี่ยนเวอร์ชันที่ไม่เข้ากัน
+- **Cross-region Read Replica for DLQ/Audit:** สตรีม DLQ และ audit chain ไปยัง read-only replica ข้ามภูมิภาคเพื่อ compliance และ incident response
+- **Adaptive Queue Rebalancer:** ย้าย deferred queue ระหว่าง worker ตามคุณภาพ heartbeat, แรงกดดัน inflight และแนวโน้ม latency
+- **Operator Runbook API:** เปิด API สำหรับ runbook แบบ machine-readable เพื่อรับมือเหตุขัดข้องที่พบบ่อย (retry storm, consumer flap, DLQ spike)
+- **Message Trace Correlation:** เพิ่ม trace/span identifier ตั้งแต่รับข้อความจน replay เพื่อช่วยวิเคราะห์ปัญหาแบบ distributed
+- **Tenant Billing Metrics Export:** ส่งออกสถิติการใช้งานราย tenant/topic เพื่อทำ chargeback และกำกับ quota
+- **Key Rotation Workflow:** รองรับการหมุนคีย์เข้ารหัส payload แบบไม่ต้องหยุด broker
+
+## 🔐 Project Policies
+
+- [Security Policy](SECURITY.md)
+- [Copyright Notice](COPYRIGHT.md)
 
 ## 📘 Deep Architecture & Protocol Docs
 
