@@ -151,6 +151,46 @@ This runs:
 - `go build ./...`
 - `go test ./...`
 
+### Policy simulation sandbox (non-writing rehearsal)
+
+When you need to rehearse policy/ruleset behavior without mutating module files, use
+`--simulate-policy`:
+
+```bash
+bash scripts/go_mod_recovery.sh --simulate-policy --policy-ruleset pr-healing recover
+```
+
+This prints the planned recovery commands and exits without running write-capable steps.
+
+### Workflow drift dashboard export (JSON + CSV)
+
+To emit trend bundles consumable by dashboard tooling:
+
+```bash
+bash scripts/go_mod_recovery.sh --drift-export-dir artifacts/recovery recover
+```
+
+The command writes:
+
+- `trend_bundle.json`
+- `trend_bundle.csv`
+
+Both include UTC timestamp, mode, status, policy-ruleset label, simulation status, and
+`go.mod`/`go.sum` hashes so nightly and PR healing jobs can track drift over time.
+
+### Controlled auto-rollback hook
+
+If post-fix verification (`go test ./...`) fails, you can opt into a rollback command:
+
+```bash
+bash scripts/go_mod_recovery.sh \
+  --auto-rollback \
+  --auto-rollback-cmd "git checkout -- go.mod go.sum" \
+  recover
+```
+
+Rollback execution is disabled by default and only runs when explicitly enabled.
+
 ### Diagnostics
 
 To inspect the current Go environment:

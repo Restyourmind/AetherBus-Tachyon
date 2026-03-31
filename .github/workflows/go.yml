@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 jobs:
   offline-sanity:
@@ -36,3 +39,39 @@ jobs:
 
       - name: Run full online recovery
         run: bash scripts/go_mod_recovery.sh recover
+
+  pr-healing-drift:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v6.3.0
+        with:
+          go-version: '1.22'
+      - name: Rehearse policy/ruleset healing (non-writing)
+        run: bash scripts/go_mod_recovery.sh --simulate-policy --policy-ruleset pr-healing --drift-export-dir artifacts/pr-healing recover
+      - name: Upload PR healing drift bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-healing-drift
+          path: artifacts/pr-healing/
+
+  nightly-healing-drift:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v6.3.0
+        with:
+          go-version: '1.22'
+      - name: Install ZeroMQ
+        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev
+      - name: Run nightly healing with drift export
+        run: bash scripts/go_mod_recovery.sh --policy-ruleset nightly-healing --drift-export-dir artifacts/nightly-healing --auto-rollback --auto-rollback-cmd "git checkout -- go.mod go.sum" recover
+      - name: Upload nightly healing drift bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-healing-drift
+          path: artifacts/nightly-healing/
