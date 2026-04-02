@@ -180,7 +180,9 @@ go run ./cmd/tachyon-bench matrix --duration 10s --connections 2
 
 The harness reports p50/p95/p99 latency, throughput, CPU usage, memory RSS, and allocations/op. See `docs/PERFORMANCE.md` for full interpretation guidance and comparison workflow.
 
-## 🏗️ System Architecture Diagram (Database-Aligned)
+## 🏗️ System Architecture Diagram (Database + Module Contracts)
+
+> เป้าหมาย: ทำให้ภาพสถาปัตยกรรมอ้างอิง “โครงสร้างข้อมูลที่ persist จริง” และ “เส้นทางควบคุมระหว่างโมดูล” เพื่อไม่ปะปนกับรายการงานที่ปิดแล้ว
 
 ```mermaid
 erDiagram
@@ -205,8 +207,6 @@ erDiagram
         datetime last_heartbeat
         int max_inflight
         bool supports_ack
-        string supports_compression_json
-        string supports_codec_json
         bool resumable
     }
 
@@ -217,8 +217,6 @@ erDiagram
         string session_id
         string tenant_id
         string topic
-        string payload_base64
-        string priority
         uint64 enqueue_sequence
         int attempt
     }
@@ -230,8 +228,6 @@ erDiagram
         string topic
         string destination_id
         string route_type
-        bytes payload
-        string priority
         uint64 enqueue_sequence
         int delivery_attempt
         datetime deliver_at
@@ -244,15 +240,11 @@ erDiagram
         string session_id
         string tenant_id
         string topic
-        bytes payload
-        string priority
         uint64 enqueue_sequence
         int attempt
         string reason
         datetime dead_lettered_at
         int replay_count
-        datetime last_replay_at
-        string last_replay_target
     }
 
     AUDIT_EVENT {
@@ -262,68 +254,123 @@ erDiagram
         string operation
         string target_message_ids_json
         string requested_reason
-        string prior_state_json
-        string resulting_state_json
         string prev_hash
         string hash
     }
 
     ROUTE_CATALOG_SNAPSHOT ||--o{ ROUTE_ENTRY : contains
-    SESSION_SNAPSHOT }o--o{ WAL_RECORD : "replay join (tenant_id + consumer_id + session_id)"
-    WAL_RECORD ||--o{ SCHEDULED_MESSAGE : "retry / replay scheduling"
-    WAL_RECORD ||--o| DLQ_RECORD : "dead-letter terminal state"
-    DLQ_RECORD ||--o{ AUDIT_EVENT : "manual / replay / purge operations"
-    SCHEDULED_MESSAGE ||--o{ AUDIT_EVENT : "replay mutation trail"
+    SESSION_SNAPSHOT }o--o{ WAL_RECORD : replay_join
+    WAL_RECORD ||--o{ SCHEDULED_MESSAGE : retry_schedule
+    WAL_RECORD ||--o| DLQ_RECORD : terminal_failure
+    DLQ_RECORD ||--o{ AUDIT_EVENT : mutation_trail
 ```
 
-This view maps directly to persisted Go shapes: `domain.RouteCatalogSnapshot/Route`, `sessionSnapshot`, `walRecord`, `scheduledMessage`, `DeadLetterRecord`, and `audit.Event`. Each persistence file (`ROUTE_CATALOG_PATH`, `WAL_PATH.segments`, `WAL_PATH.sessions`, `WAL_PATH.scheduled`, `WAL_PATH.dlq`, `WAL_PATH.audit`) is represented using those stored fields rather than inferred placeholders.
+### High-Level Augmented Perception Layer (L9 blueprint)
 
-### Runtime composition
+```mermaid
+flowchart LR
+    U[Voice / Intent / App Request] --> G[Genesis
+Intent -> Visual Plan]
+    G --> M[Manifest
+Intent+Visual+Scene Contract]
+    E[Environment Sensing] --> B[BioVision
+Day/Night/Fog/Rain/Motion]
+    B --> GV[Governor
+Brightness/Curfew/Geo-fence]
+    B --> P[PRGX
+Policy+Safety Gate+Audit]
+    M --> GV
+    M --> P
+    GV --> T[Tachyon Runtime
+Realtime Stream + Time Sync]
+    P --> T
+    T --> X[Edge/WASM Runtime]
+    X --> O1[AR/VR Glasses]
+    X --> O2[Projector / Building Facade]
+    X --> O3[Screen / Legacy OS Surface]
+```
 
-- **Command layer:** `cmd/tachyon` and `cmd/aetherbus-node` load configuration, durability flags, and start the broker runtime.
-- **Configuration layer:** `config.Config` and environment variables define bind addresses, admission limits, timeout behavior, and WAL activation.
-- **Composition layer:** `internal/app.Runtime` wires transport, routing, session tracking, inflight control, and persistence together.
-- **Transport layer:** `internal/delivery/zmq.Router` owns the ZeroMQ ROUTER/PUB sockets, parses frames, handles consumer registration/heartbeats, and emits direct/fanout deliveries.
-- **Media layer:** `internal/media.JSONCodec` and `internal/media.LZ4Compressor` handle event encoding and payload compression.
-- **Application layer:** `internal/usecase.EventRouter` resolves fanout routes and coordinates routing decisions with broker state.
-- **Logical data layer:** the runtime operates over a hybrid state model — route catalog, consumer sessions, inflight messages, scheduled retries, WAL segments, DLQ records, and append-only audit events.
+### C4 (Text)
 
-### Message + state flow
+#### 1) Context
+- **Actors:** End-user, Developer, Enterprise Operator, Regulator/Community authority.
+- **System:** AetherBus-Tachyon as event + light-orchestration backbone.
+- **External systems:** Android/iOS/Windows apps, AR/VR runtime, projector controllers, observability stack, policy registry.
 
-1. **Producers** publish multipart frames to the ZeroMQ ROUTER.
-2. **`delivery/zmq.Router`** validates frame shape, decodes/compresses payloads via the media layer, and forwards routing work into the application flow.
-3. **`usecase.EventRouter`** resolves topic matches through the **route catalog** for fanout delivery.
-4. **Consumer registration and heartbeat traffic** upserts **consumer sessions**, tracking active direct-delivery capability.
-5. **Direct deliveries** update runtime inflight state and persist **WAL dispatched records** so ACK/NACK, retry, timeout, and dead-letter rules are deterministic after restart.
-6. When ACK durability is required, state transitions are appended to the **delivery WAL** and replay schedules are persisted in **scheduled deliveries**.
-7. Terminal failures are written into **DLQ records**, while replay/purge/manual dead-letter actions append to **audit events** with hash chaining.
-8. The transport layer emits final topic payloads or direct-delivery frames back to **subscribers / workers**.
+#### 2) Container
+- **Manifest Service:** contract registry + versioning + compatibility checks.
+- **Genesis Service:** speech/intent normalization + scene graph planning.
+- **BioVision Service:** environment inference and perceptual adaptation.
+- **Governor Service:** legal/safety policy controls (brightness, curfew, geofence).
+- **PRGX Service:** abuse prevention, content safety, policy enforcement, immutable audit.
+- **Tachyon Transport:** low-latency command/data stream, ordering, retry, dedup, time sync.
+- **Edge/WASM Runtime:** local render execution + fallback when network degraded.
+- **State Plane (DB/WAL/DLQ/Audit):** durable state + replay + forensic record.
 
-This database-aligned diagram intentionally focuses on authoritative state and relationships so operators can map broker behavior to backup, retention, and compliance controls more directly.
+#### 3) Component (within Tachyon + State Plane)
+- **Router + EventRouter:** route resolution and fanout/direct path.
+- **Session Store:** consumer capability + heartbeat.
+- **Inflight/WAL Manager:** ack, retry, timeout, dead-letter transitions.
+- **Scheduled Queue:** delayed replay and curfew-window release.
+- **DLQ/Audit Manager:** operator workflows with hash-chain evidence.
 
-## 💡 Function Proposals & Future Extensions
+### Dataflow / Controlflow
 
-### English
+1. **Voice/Intent path:** Input -> Genesis -> Manifest validation -> PRGX/Governor gates -> Tachyon stream -> Edge/WASM -> display endpoint.
+2. **BioVision path:** Sensor/video telemetry -> BioVision adaptive scores -> Governor limit calculation + PRGX safety checks -> Manifest parameter override -> Tachyon emission.
+3. **State path:** Each delivery/ack/retry/dead-letter mutation writes through WAL -> Scheduled/DLQ -> Audit chain, enabling replay + compliance traceability.
 
-- **Policy-based Retry Engine:** Attach retry curves (`linear`, `exponential`, `jitter`) by topic or tenant with caps and blackout windows.
-- **Schema Registry + Compatibility Gate:** Validate payload contracts before publish and block incompatible version drift.
-- **Cross-region Read Replica for DLQ/Audit:** Stream DLQ and audit chains to read-only replicas for compliance and incident response.
-- **Adaptive Queue Rebalancer:** Move deferred queues between workers based on heartbeat quality, inflight pressure, and latency trends.
-- **Operator Runbook API:** Publish machine-readable remediation playbooks for common incidents (retry storm, consumer flap, DLQ spike).
-- **Message Trace Correlation:** Add trace/span identifiers from ingress to replay for distributed debugging.
-- **Tenant Billing Metrics Export:** Emit metered usage by tenant/topic for chargeback and quota governance.
-- **Key Rotation Workflow:** Support envelope-key rotation for encrypted payloads without broker downtime.
+### Inspira-Firma Duality (single intent, two render modes)
 
-### ภาษาไทย
+- **Mode A: Legacy OS mode**
+  - Intent resolves to Android/iOS/Windows app action.
+  - Tachyon emits control events; output remains native OS UI.
+- **Mode B: Light-native mode**
+  - Same intent resolves to visual contract + scene contract.
+  - Edge runtime renders as projected/overlay light interface.
+- **Switch policy:** per-intent metadata (`render_mode=legacy|light|adaptive`) and policy fallback when safety/risk is triggered.
 
-- **Policy-based Retry Engine:** กำหนดนโยบาย retry (`linear`, `exponential`, `jitter`) แยกตาม topic หรือ tenant พร้อมเพดานและช่วงเวลาหยุดส่ง
-- **Schema Registry + Compatibility Gate:** ตรวจสอบสัญญา payload ก่อน publish และป้องกันการเปลี่ยนเวอร์ชันที่ไม่เข้ากัน
-- **Cross-region Read Replica for DLQ/Audit:** สตรีม DLQ และ audit chain ไปยัง read-only replica ข้ามภูมิภาคเพื่อ compliance และ incident response
-- **Adaptive Queue Rebalancer:** ย้าย deferred queue ระหว่าง worker ตามคุณภาพ heartbeat, แรงกดดัน inflight และแนวโน้ม latency
-- **Operator Runbook API:** เปิด API สำหรับ runbook แบบ machine-readable เพื่อรับมือเหตุขัดข้องที่พบบ่อย (retry storm, consumer flap, DLQ spike)
-- **Message Trace Correlation:** เพิ่ม trace/span identifier ตั้งแต่รับข้อความจน replay เพื่อช่วยวิเคราะห์ปัญหาแบบ distributed
-- **Tenant Billing Metrics Export:** ส่งออกสถิติการใช้งานราย tenant/topic เพื่อทำ chargeback และกำกับ quota
-- **Key Rotation Workflow:** รองรับการหมุนคีย์เข้ารหัส payload แบบไม่ต้องหยุด broker
+## 🧭 Known Issues, Gaps, and Corrective Actions
+
+| Area | Problem observed | Impact | Corrective action |
+|---|---|---|---|
+| Contract governance | Intent/Visual schema lifecycle not centralized | version drift, integration breakage | Introduce schema registry + semver policy + compatibility CI gate |
+| Time sync | No explicit predicted-display-time contract at module boundary | jitter and late projection in moving scenes | Add monotonic timestamp + PTP/NTP offset model + predicted display timestamp |
+| Safety gating | Governor/PRGX constraints not yet declared as unified policy bundle | inconsistent enforcement per deployment | Define policy package (`brightness`, `curfew`, `geo`, `content-risk`) signed + versioned |
+| Observability | Cross-module trace correlation still partial | difficult RCA in real-time incidents | Standardize trace/span + delivery IDs from ingress to replay/audit |
+| Edge resilience | reconnect/reconciliation flow not fully formalized | duplicate output or stale state after network flap | Add checkpoint sequence + idempotent reapply + state digest handshake |
+
+## 💡 Proposed Backlog (Pending / Not Yet Implemented)
+
+1. **Intent & Visual Contract Registry** with backward-compatibility matrix and automated migration hints.
+2. **Predictive Render Scheduler** that aligns motion-to-light with scene velocity and device refresh.
+3. **Geo-aware Community Safety Pack** (quiet hours, school-zone limits, emergency override).
+4. **Policy Simulation Sandbox** to dry-run PRGX/Governor rules before production rollout.
+5. **Multi-surface Consistency Engine** to keep projector, glasses, and monitor outputs frame-aligned.
+6. **Tenant-level Cost and Carbon Metering** for enterprise accountability and optimization.
+7. **Replay Forensics Toolkit** for DLQ/audit timeline reconstruction and signed evidence export.
+8. **Edge WASM Capability Discovery** so one contract can compile to multiple device classes safely.
+
+## 🗺️ 4-Phase Production Roadmap
+
+| Phase | Deliverables | Primary risks | Exit criteria | Metrics |
+|---|---|---|---|---|
+| **P0 PoC (0-8 weeks)** | Genesis->Manifest->Tachyon happy path, basic BioVision adaptive brightness, WAL+DLQ minimal loop | latency instability, contract ambiguity | end-to-end demo across 2 device classes | p95 e2e < 220ms, success rate > 98% |
+| **P1 Prototype (2-4 months)** | Governor+PRGX enforceable policy bundle, benchmark harness, reconnect+replay protocol | false-positive safety blocks, replay defects | limited real-site deployment with operator runbook | policy decision < 20ms p95, replay correctness = 100% sampled |
+| **P2 Pilot (4-8 months)** | enterprise multi-tenant controls, audit export, adaptive scene sync in dynamic environments | tenant isolation gaps, operational overhead | first design partners run 24/7 pilot safely | uptime > 99.5%, incident MTTR < 30m |
+| **P3 Production (8-12 months)** | scale hardening, HA state plane, compliance posture, cost/perf optimization | cost blowout, regional policy variance | production SLO/SLA acceptance + security sign-off | uptime > 99.9%, motion-to-light p95 < 120ms (AR) |
+
+## ❓ Open Questions and Assumptions
+
+### Open questions
+- ขอบเขตกฎหมายท้องถิ่นสำหรับการฉายบนอาคาร/พื้นที่สาธารณะในแต่ละเมืองที่ต้องรองรับเป็น baseline คืออะไร?
+- ระดับความแม่นยำ time sync ที่อุปกรณ์ปลายทางรองรับจริง (PTP/NTP/GPS clock) อยู่ที่เท่าใด?
+- ต้องรองรับ content moderation แบบ on-device หรือ cloud-first เป็นหลัก?
+
+### Working assumptions
+- เริ่มจาก deployment แบบเขตจำกัด (controlled zone) เพื่อลด blast radius.
+- ใช้ policy-as-code และ immutable audit เป็นข้อบังคับทุก environment.
+- ระบบต้อง degrade gracefully ไปยัง Legacy OS mode เมื่อ safety gate ไม่ผ่านหรือ latency เกินงบ.
 
 ## 🔐 Project Policies
 
