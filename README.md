@@ -232,75 +232,115 @@ go run ./cmd/tachyon-bench matrix --duration 10s --connections 2
 
 The harness reports p50/p95/p99 latency, throughput, CPU usage, memory RSS, and allocations/op. See `docs/PERFORMANCE.md` for full interpretation guidance and comparison workflow.
 
-## 🏗️ System Architecture Diagram
+## 🏗️ System Architecture Diagram (Database + Module Contracts)
+
+> เป้าหมาย: ทำให้ภาพสถาปัตยกรรมอ้างอิง “โครงสร้างข้อมูลที่ persist จริง” และ “เส้นทางควบคุมระหว่างโมดูล” เพื่อไม่ปะปนกับรายการงานที่ปิดแล้ว
 
 ```mermaid
-flowchart TB
-    Producers[Producers / Admin Clients] --> Runtime[Broker Runtime
-internal/app.Runtime + delivery/zmq.Router]
-    Consumers[Consumers / Workers] <--> Runtime
+erDiagram
+    ROUTE_CATALOG_SNAPSHOT {
+        int version PK
+    }
 
-    subgraph Authoritative[Authoritative persisted state]
-        RouteCatalog[(ROUTE_CATALOG_PATH
-route catalog
-version + routes[])]
-        WalSegments[(WAL_PATH segments
-dispatched / committed / dead_lettered)]
-        SessionStore[(WAL_PATH.sessions
-resumable session snapshot store)]
-        ScheduledStore[(WAL_PATH.scheduled
-scheduled / retry queue)]
-        DLQStore[(WAL_PATH.dlq
-dead-letter record store)]
-        AuditLog[(WAL_PATH.audit
-append-only audit log)]
-        AuditHead[(WAL_PATH.audit.head
-audit hash head sidecar)]
-    end
+    ROUTE_ENTRY {
+        string pattern PK
+        string destination_id PK
+        string route_type
+        int priority
+        bool enabled
+        string tenant
+    }
 
-    subgraph RuntimeCaches[Runtime-only derived state / caches]
-        RouteIndex[ART route index cache
-key = tenant_id + topic]
-        SessionCache[Live session cache
-key = tenant_id + consumer_id]
-        InflightCache[Inflight registry cache
-key = message_id]
-        DeferredQueue[Deferred direct queues
-key = tenant_id + topic + destination_id]
-        SchedulerCache[Sorted scheduler cache
-order = deliver_at + sequence]
-    end
+    SESSION_SNAPSHOT {
+        string session_id PK
+        string consumer_id PK
+        string tenant_id
+        string subscriptions_json
+        datetime last_heartbeat
+        int max_inflight
+        bool supports_ack
+        bool resumable
+    }
 
-    Runtime --> RouteCatalog
-    Runtime --> WalSegments
-    Runtime --> SessionStore
-    Runtime --> ScheduledStore
-    Runtime --> DLQStore
-    Runtime --> AuditLog
+    WAL_RECORD {
+        string message_id PK
+        string type
+        string consumer_id
+        string session_id
+        string tenant_id
+        string topic
+        uint64 enqueue_sequence
+        int attempt
+    }
 
-    RouteCatalog --> RouteIndex
-    SessionStore --> SessionCache
-    WalSegments --> InflightCache
-    ScheduledStore --> SchedulerCache
-    SessionCache --> DeferredQueue
-    DLQStore --> Runtime
-    AuditHead --> AuditLog
-    AuditLog --> AdminExport[Audit / export queries]
+    SCHEDULED_MESSAGE {
+        uint64 sequence PK
+        string message_id
+        string tenant_id
+        string topic
+        string destination_id
+        string route_type
+        uint64 enqueue_sequence
+        int delivery_attempt
+        datetime deliver_at
+        string reason
+    }
+
+    DLQ_RECORD {
+        string message_id PK
+        string consumer_id
+        string session_id
+        string tenant_id
+        string topic
+        uint64 enqueue_sequence
+        int attempt
+        string reason
+        datetime dead_lettered_at
+        int replay_count
+    }
+
+    AUDIT_EVENT {
+        string event_id PK
+        string actor
+        datetime timestamp
+        string operation
+        string target_message_ids_json
+        string requested_reason
+        string prev_hash
+        string hash
+    }
+
+    ROUTE_CATALOG_SNAPSHOT ||--o{ ROUTE_ENTRY : contains
+    SESSION_SNAPSHOT }o--o{ WAL_RECORD : replay_join
+    WAL_RECORD ||--o{ SCHEDULED_MESSAGE : retry_schedule
+    WAL_RECORD ||--o| DLQ_RECORD : terminal_failure
+    DLQ_RECORD ||--o{ AUDIT_EVENT : mutation_trail
 ```
 
-This diagram follows the broker's current state-store boundaries: persisted files are treated as the source of truth, while ART indexes, live session maps, inflight counters, deferred queues, and sorted scheduler views are runtime-derived structures rebuilt from those persisted records during recovery.
+### High-Level Augmented Perception Layer (L9 blueprint)
 
-### Runtime composition
-
-- **Command layer:** `cmd/tachyon` and `cmd/aetherbus-node` load configuration, durability flags, and start the broker runtime.
-- **Configuration layer:** `config.Config` and environment variables define bind addresses, admission limits, timeout behavior, and WAL activation.
-- **Composition layer:** `internal/app.Runtime` wires transport, routing, session tracking, inflight control, and persistence together.
-- **Transport layer:** `internal/delivery/zmq.Router` owns the ZeroMQ ROUTER/PUB sockets, parses frames, handles consumer registration/heartbeats, and emits direct/fanout deliveries.
-- **Media layer:** `internal/media.JSONCodec` and `internal/media.LZ4Compressor` handle event encoding and payload compression.
-- **Application layer:** `internal/usecase.EventRouter` resolves fanout routes and coordinates routing decisions with broker state.
-- **Logical data layer:** the runtime operates over a hybrid state model — ART route index, consumer session table, inflight registry, deferred/scheduled queues, WAL segments, DLQ store, and append-only audit chain.
-
-### Message + state flow
+```mermaid
+flowchart LR
+    U[Voice / Intent / App Request] --> G[Genesis
+Intent -> Visual Plan]
+    G --> M[Manifest
+Intent+Visual+Scene Contract]
+    E[Environment Sensing] --> B[BioVision
+Day/Night/Fog/Rain/Motion]
+    B --> GV[Governor
+Brightness/Curfew/Geo-fence]
+    B --> P[PRGX
+Policy+Safety Gate+Audit]
+    M --> GV
+    M --> P
+    GV --> T[Tachyon Runtime
+Realtime Stream + Time Sync]
+    P --> T
+    T --> X[Edge/WASM Runtime]
+    X --> O1[AR/VR Glasses]
+    X --> O2[Projector / Building Facade]
+    X --> O3[Screen / Legacy OS Surface]
+```
 
 1. **Producers** publish multipart frames to the ZeroMQ ROUTER.
 2. **`delivery/zmq.Router`** validates frame shape, decodes/compresses payloads via the media layer, and forwards routing work into the application flow.
