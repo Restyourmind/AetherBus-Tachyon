@@ -1316,7 +1316,8 @@ func (r *Router) enqueueDirectLocked(tenantID, topic, destinationID, routeType, 
 		queue = &priorityQueue{}
 	}
 	normalizedPriority := r.normalizePriority(priority)
-	if r.shouldTripClassCircuitBreakerLocked(normalizedPriority) {
+	totalQueued := r.totalQueuedLocked()
+	if r.shouldTripClassCircuitBreakerLocked(normalizedPriority, totalQueued) {
 		r.metrics.Dropped++
 		r.tenantMetricLocked(tenantID).Dropped++
 		fmt.Printf("{\"event\":\"direct_drop\",\"topic\":%q,\"message_id\":%q,\"reason\":\"class_circuit_breaker\",\"class\":%q}\n", topic, messageID, normalizedPriority)
