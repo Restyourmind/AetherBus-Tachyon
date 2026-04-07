@@ -1,14 +1,14 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 )
 
-// Config holds the application configuration.
-// Values are populated from environment variables.
+// QueueLimitPolicyConfig defines runtime tuning controls for direct queue limits.
 type QueueLimitPolicyConfig struct {
 	Enabled                     bool
 	EvaluationIntervalMS        int
@@ -24,6 +24,19 @@ type QueueLimitPolicyConfig struct {
 	MaxInflightPerConsumer      int
 	MinPerTopicQueue            int
 	MaxPerTopicQueue            int
+	AdaptivePriorityWeights     bool
+	AdaptiveStep                int
+	AgingEnabled                bool
+	AgingBoostAfterMS           int
+	ClassCircuitBreaker         bool
+	ClassBreakerQueueFraction   float64
+}
+
+// TenantQuotaConfig defines per-tenant admission controls.
+type TenantQuotaConfig struct {
+	MaxInflight int `json:"max_inflight"`
+	MaxQueued   int `json:"max_queued"`
+	MaxIngress  int `json:"max_ingress"`
 }
 
 // Config holds the application configuration.
@@ -52,6 +65,7 @@ type Config struct {
 	PriorityBoostThreshold   int
 	PriorityBoostOffset      int
 	QueueLimitPolicy         QueueLimitPolicyConfig
+	TenantQuotas             map[string]TenantQuotaConfig
 }
 
 // Load reads configuration from environment variables and returns a new Config struct.
@@ -96,7 +110,14 @@ func Load() (*Config, error) {
 		MaxInflightPerConsumer:      getenvIntOrDefault("QUEUE_POLICY_MAX_INFLIGHT_PER_CONSUMER", cfg.MaxInflightPerConsumer),
 		MinPerTopicQueue:            getenvIntOrDefault("QUEUE_POLICY_MIN_PER_TOPIC_QUEUE", 64),
 		MaxPerTopicQueue:            getenvIntOrDefault("QUEUE_POLICY_MAX_PER_TOPIC_QUEUE", cfg.MaxPerTopicQueue),
+		AdaptivePriorityWeights:     getenvBoolOrDefault("QUEUE_POLICY_ADAPTIVE_PRIORITY_WEIGHTS", true),
+		AdaptiveStep:                getenvIntOrDefault("QUEUE_POLICY_ADAPTIVE_STEP", 1),
+		AgingEnabled:                getenvBoolOrDefault("QUEUE_POLICY_AGING_ENABLED", true),
+		AgingBoostAfterMS:           getenvIntOrDefault("QUEUE_POLICY_AGING_BOOST_AFTER_MS", 15000),
+		ClassCircuitBreaker:         getenvBoolOrDefault("QUEUE_POLICY_CLASS_CIRCUIT_BREAKER", true),
+		ClassBreakerQueueFraction:   getenvFloatOrDefault("QUEUE_POLICY_CLASS_BREAKER_QUEUE_FRACTION", 0.8),
 	}
+	cfg.TenantQuotas = getenvTenantQuotasOrDefault("TENANT_QUOTAS_JSON")
 
 	return cfg, nil
 }
@@ -164,8 +185,10 @@ func getenvCSVOrDefault(key string, defaultValue []string) []string {
 
 func getenvPriorityWeightsOrDefault(key string, classes []string) map[string]int {
 	defaults := make(map[string]int, len(classes))
+	allowed := make(map[string]struct{}, len(classes))
 	for i, class := range classes {
 		defaults[class] = len(classes) - i
+		allowed[class] = struct{}{}
 	}
 	value, ok := os.LookupEnv(key)
 	if !ok || strings.TrimSpace(value) == "" {
@@ -182,6 +205,9 @@ func getenvPriorityWeightsOrDefault(key string, classes []string) map[string]int
 		}
 		class := strings.ToLower(strings.TrimSpace(kv[0]))
 		if class == "" {
+			continue
+		}
+		if _, ok := allowed[class]; !ok {
 			continue
 		}
 		weight, err := strconv.Atoi(strings.TrimSpace(kv[1]))
@@ -224,4 +250,27 @@ func getenvFloatOrDefault(key string, defaultValue float64) float64 {
 		return defaultValue
 	}
 	return parsed
+}
+
+func getenvTenantQuotasOrDefault(key string) map[string]TenantQuotaConfig {
+	value, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(value) == "" {
+		return map[string]TenantQuotaConfig{}
+	}
+	decoded := map[string]TenantQuotaConfig{}
+	if err := json.Unmarshal([]byte(value), &decoded); err != nil {
+		return map[string]TenantQuotaConfig{}
+	}
+	out := map[string]TenantQuotaConfig{}
+	for tenantID, quota := range decoded {
+		tenantID = strings.TrimSpace(tenantID)
+		if tenantID == "" {
+			continue
+		}
+		if quota.MaxInflight <= 0 && quota.MaxQueued <= 0 && quota.MaxIngress <= 0 {
+			continue
+		}
+		out[tenantID] = quota
+	}
+	return out
 }

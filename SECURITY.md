@@ -2,42 +2,77 @@
 
 ## Supported Versions
 
-AetherBus-Tachyon is under active development. Security fixes are applied to the latest commit on the `main` branch.
+We actively support the latest minor version of AetherBus-Tachyon.
 
-| Version / Branch | Supported |
-|---|---|
-| `main` (latest) | ✅ |
-| Older commits / forks | ❌ |
+| Version | Supported          |
+| ------- | ------------------ |
+| latest  | ✅ Yes             |
+| older   | ⚠️ Best effort     |
+
+---
 
 ## Reporting a Vulnerability
 
-Please report vulnerabilities privately and avoid opening a public issue for sensitive findings.
+If you discover a security vulnerability, please report it responsibly:
 
-- Email: **security@aetherbus.dev**
-- Subject: `AetherBus-Tachyon Security Report`
-- Recommended details:
-  - Affected component/file
-  - Reproduction steps or proof-of-concept
-  - Impact assessment (confidentiality / integrity / availability)
-  - Suggested mitigation (if available)
+- 📧 Email: lnspirafirma@gmail.com
+- 🔒 Or open a private security advisory on GitHub
 
-## Response Targets
+Please DO NOT open public issues for security vulnerabilities.
 
-- Initial acknowledgement: within **72 hours**
-- Triage and severity classification: within **7 business days**
-- Fix or mitigation plan: as soon as validated, based on severity and operational risk
+---
 
-## Coordinated Disclosure
+## What to Include
 
-- Please allow maintainers reasonable time to validate and patch before public disclosure.
-- After remediation, maintainers may publish a security advisory and credit the reporter (optional).
+Please include as much detail as possible:
 
-## Security Hardening Notes
+- Description of the vulnerability
+- Steps to reproduce
+- Impact assessment (e.g. DoS, data leak, privilege escalation)
+- Suggested fix (if any)
 
-When deploying AetherBus-Tachyon in production:
+---
 
-- Enable operator authentication for admin endpoints (`ADMIN_TOKEN`).
-- Use encrypted transport tunnels or a private network boundary for ZeroMQ traffic.
-- Persist and protect WAL, DLQ, and audit files with least-privilege filesystem permissions.
-- Export append-only audit records to immutable retention storage where required.
-- Monitor retry spikes, dead-letter growth, and consumer heartbeat anomalies.
+## Response Timeline
+
+- Initial response: within 48 hours
+- Triage: within 3–5 days
+- Fix & disclosure: depends on severity
+
+---
+
+## Security Practices
+
+This project follows:
+
+- Defense-in-depth design
+- Backpressure & rate limiting for traffic control
+- Isolation between delivery classes (priority-aware scheduling)
+- Regular dependency updates
+
+---
+
+## Disclosure Policy
+
+- We follow responsible disclosure
+- Credit will be given to reporters (unless anonymity requested)
+- CVE may be assigned for critical issues
+
+---
+
+## Scope
+
+In-scope:
+
+- Core message bus / scheduling logic
+- Delivery guarantees (retry, ordering, fairness)
+- Resource exhaustion / DoS vectors
+
+Out-of-scope:
+
+- Misconfiguration by users
+- Issues in third-party dependencies (report upstream)
+
+---
+
+Thank you for helping keep AetherBus-Tachyon secure 🙏

@@ -85,6 +85,13 @@ func NewRuntimeWithCompressor(cfg *config.Config, bootstrapRoutes map[string]str
 		MinPerTopicQueue:            cfg.QueueLimitPolicy.MinPerTopicQueue,
 		MaxPerTopicQueue:            cfg.QueueLimitPolicy.MaxPerTopicQueue,
 	})
+	for tenantID, quota := range cfg.TenantQuotas {
+		router.SetTenantQuota(tenantID, zmq.TenantQuota{
+			MaxInflight: quota.MaxInflight,
+			MaxQueued:   quota.MaxQueued,
+			MaxIngress:  quota.MaxIngress,
+		})
+	}
 
 	return &Runtime{
 		RouteStore:   routeStore,

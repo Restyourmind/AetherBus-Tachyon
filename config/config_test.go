@@ -131,3 +131,46 @@ func TestLoadDirectPriorityFromEnv(t *testing.T) {
 		t.Fatalf("unexpected configured boost policy: threshold=%d offset=%d", cfg.PriorityBoostThreshold, cfg.PriorityBoostOffset)
 	}
 }
+
+func TestLoadDirectPriorityWeightsIgnoresUnknownClasses(t *testing.T) {
+	t.Setenv("DIRECT_PRIORITY_CLASSES", "critical,bulk")
+	t.Setenv("DIRECT_PRIORITY_WEIGHTS", "critical=9,bulk=2,background=100")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected load error: %v", err)
+	}
+	if cfg.PriorityClassWeights["critical"] != 9 || cfg.PriorityClassWeights["bulk"] != 2 {
+		t.Fatalf("unexpected configured weights: %#v", cfg.PriorityClassWeights)
+	}
+	if _, ok := cfg.PriorityClassWeights["background"]; ok {
+		t.Fatalf("expected unknown class to be ignored, got %#v", cfg.PriorityClassWeights)
+	}
+}
+
+func TestLoadTenantQuotasFromEnv(t *testing.T) {
+	t.Setenv("TENANT_QUOTAS_JSON", `{"tenant-a":{"max_inflight":64,"max_queued":512,"max_ingress":1024},"tenant-b":{"max_queued":200}}`)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected load error: %v", err)
+	}
+	if got := cfg.TenantQuotas["tenant-a"]; got.MaxInflight != 64 || got.MaxQueued != 512 || got.MaxIngress != 1024 {
+		t.Fatalf("unexpected tenant-a quota: %#v", got)
+	}
+	if got := cfg.TenantQuotas["tenant-b"]; got.MaxInflight != 0 || got.MaxQueued != 200 || got.MaxIngress != 0 {
+		t.Fatalf("unexpected tenant-b quota: %#v", got)
+	}
+}
+
+func TestLoadTenantQuotasInvalidJSONFallsBackToEmpty(t *testing.T) {
+	t.Setenv("TENANT_QUOTAS_JSON", `{"tenant-a":`)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected load error: %v", err)
+	}
+	if len(cfg.TenantQuotas) != 0 {
+		t.Fatalf("expected empty quotas on invalid json, got %#v", cfg.TenantQuotas)
+	}
+}

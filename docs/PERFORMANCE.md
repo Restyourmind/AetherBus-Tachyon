@@ -148,6 +148,7 @@ Recommended operating notes:
 - Use `QUEUE_POLICY_CONSUMER_LAG_HIGH_WATERMARK`, `QUEUE_POLICY_RETRY_RATE_HIGH_WATERMARK`, `QUEUE_POLICY_QUEUE_GROWTH_HIGH_WATERMARK`, and `QUEUE_POLICY_MEMORY_PRESSURE_HIGH_WATERMARK` to define pressure signals.
 - Keep `QUEUE_POLICY_INFLIGHT_STEP` and `QUEUE_POLICY_QUEUE_STEP` modest so each recalculation changes capacity gradually.
 - Use `QUEUE_POLICY_MIN_HOLD_MS` to avoid oscillation; the router will not apply another limit change until the hold window expires.
+- Use `QUEUE_POLICY_AGING_ENABLED` (default `true`) to explicitly control time-based aging boosts; setting `QUEUE_POLICY_ENABLED=false` hard-disables all adaptive/aging runtime behavior and resets policy runtime state.
 - The controller only changes capacity ceilings. Queue ordering still follows priority + enqueue sequence, and inflight reductions never evict already-dispatched messages.
 
 ## 7) Initial Target Template

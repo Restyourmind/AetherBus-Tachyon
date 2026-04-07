@@ -94,6 +94,18 @@ Direct-delivery admission control defaults are intentionally conservative and ca
 - `MAX_PER_TOPIC_QUEUE` (default `256`)
 - `MAX_QUEUED_DIRECT` (default `4096`)
 - `MAX_GLOBAL_INGRESS` (default `8192`)
+- `TENANT_QUOTAS_JSON` (optional per-tenant quota overrides)
+
+Example `TENANT_QUOTAS_JSON`:
+
+```json
+{
+  "tenant-a": { "max_inflight": 256, "max_queued": 2048, "max_ingress": 4096 },
+  "tenant-b": { "max_queued": 512 }
+}
+```
+
+Each field is optional per tenant. Any configured positive value overrides broker defaults for that tenant only.
 
 When limits are reached, direct messages are deferred or dropped with explicit broker counters (`deferred`, `throttled`, `dropped`).
 
@@ -138,6 +150,46 @@ This runs:
 - `go mod tidy`
 - `go build ./...`
 - `go test ./...`
+
+### Policy simulation sandbox (non-writing rehearsal)
+
+When you need to rehearse policy/ruleset behavior without mutating module files, use
+`--simulate-policy`:
+
+```bash
+bash scripts/go_mod_recovery.sh --simulate-policy --policy-ruleset pr-healing recover
+```
+
+This prints the planned recovery commands and exits without running write-capable steps.
+
+### Workflow drift dashboard export (JSON + CSV)
+
+To emit trend bundles consumable by dashboard tooling:
+
+```bash
+bash scripts/go_mod_recovery.sh --drift-export-dir artifacts/recovery recover
+```
+
+The command writes:
+
+- `trend_bundle.json`
+- `trend_bundle.csv`
+
+Both include UTC timestamp, mode, status, policy-ruleset label, simulation status, and
+`go.mod`/`go.sum` hashes so nightly and PR healing jobs can track drift over time.
+
+### Controlled auto-rollback hook
+
+If post-fix verification (`go test ./...`) fails, you can opt into a rollback command:
+
+```bash
+bash scripts/go_mod_recovery.sh \
+  --auto-rollback \
+  --auto-rollback-cmd "git checkout -- go.mod go.sum" \
+  recover
+```
+
+Rollback execution is disabled by default and only runs when explicitly enabled.
 
 ### Diagnostics
 
@@ -290,92 +342,115 @@ Realtime Stream + Time Sync]
     X --> O3[Screen / Legacy OS Surface]
 ```
 
-### C4 (Text)
+1. **Producers** publish multipart frames to the ZeroMQ ROUTER.
+2. **`delivery/zmq.Router`** validates frame shape, decodes/compresses payloads via the media layer, and forwards routing work into the application flow.
+3. **`usecase.EventRouter`** resolves topic matches through the **route store (ART)** for fanout delivery.
+4. **Consumer registration and heartbeat traffic** updates the **consumer session table**, which tracks active direct-delivery capability.
+5. **Direct deliveries** create or update **inflight delivery records** so ACK/NACK, retry, timeout, and dead-letter behavior can be evaluated.
+6. When ACK durability is required, the broker appends dispatch state to **segmented WAL files**, snapshots resumable sessions, and persists scheduled retries for restart recovery.
+7. Terminal failures are materialized into the **DLQ store**, while replay/purge/manual dead-letter mutations are chained into the **admin audit log** for forensic review.
+8. The transport layer emits the final topic payload or direct-delivery frame back to **subscribers / workers**.
 
-#### 1) Context
-- **Actors:** End-user, Developer, Enterprise Operator, Regulator/Community authority.
-- **System:** AetherBus-Tachyon as event + light-orchestration backbone.
-- **External systems:** Android/iOS/Windows apps, AR/VR runtime, projector controllers, observability stack, policy registry.
+This version of the diagram is aligned with the current logical storage model described below, so the architecture view now reflects both the runtime components and the broker-managed data structures.
 
-#### 2) Container
-- **Manifest Service:** contract registry + versioning + compatibility checks.
-- **Genesis Service:** speech/intent normalization + scene graph planning.
-- **BioVision Service:** environment inference and perceptual adaptation.
-- **Governor Service:** legal/safety policy controls (brightness, curfew, geofence).
-- **PRGX Service:** abuse prevention, content safety, policy enforcement, immutable audit.
-- **Tachyon Transport:** low-latency command/data stream, ordering, retry, dedup, time sync.
-- **Edge/WASM Runtime:** local render execution + fallback when network degraded.
-- **State Plane (DB/WAL/DLQ/Audit):** durable state + replay + forensic record.
+## 🗃️ Data Storage Structure (Current)
 
-#### 3) Component (within Tachyon + State Plane)
-- **Router + EventRouter:** route resolution and fanout/direct path.
-- **Session Store:** consumer capability + heartbeat.
-- **Inflight/WAL Manager:** ack, retry, timeout, dead-letter transitions.
-- **Scheduled Queue:** delayed replay and curfew-window release.
-- **DLQ/Audit Manager:** operator workflows with hash-chain evidence.
+The broker currently uses a **hybrid in-memory + append-only WAL** model instead of a full relational database. The logical data structures are:
 
-### Dataflow / Controlflow
+### 1) Route store (ART + persisted catalog)
 
-1. **Voice/Intent path:** Input -> Genesis -> Manifest validation -> PRGX/Governor gates -> Tachyon stream -> Edge/WASM -> display endpoint.
-2. **BioVision path:** Sensor/video telemetry -> BioVision adaptive scores -> Governor limit calculation + PRGX safety checks -> Manifest parameter override -> Tachyon emission.
-3. **State path:** Each delivery/ack/retry/dead-letter mutation writes through WAL -> Scheduled/DLQ -> Audit chain, enabling replay + compliance traceability.
+- Purpose: topic-to-destination lookup for routing decisions
+- Shape: adaptive radix tree in memory plus a versioned JSON route catalog on disk
+- Lifecycle: loaded from `ROUTE_CATALOG_PATH` on startup, mutated in memory during runtime, persisted after route changes
 
-### Inspira-Firma Duality (single intent, two render modes)
+| Field | Type | Description |
+|---|---|---|
+| `topic` | string | Topic key used for route lookup |
+| `destination` | string | Target consumer/node identifier |
 
-- **Mode A: Legacy OS mode**
-  - Intent resolves to Android/iOS/Windows app action.
-  - Tachyon emits control events; output remains native OS UI.
-- **Mode B: Light-native mode**
-  - Same intent resolves to visual contract + scene contract.
-  - Edge runtime renders as projected/overlay light interface.
-- **Switch policy:** per-intent metadata (`render_mode=legacy|light|adaptive`) and policy fallback when safety/risk is triggered.
+### 2) Direct consumer session table (in-memory + resumable snapshots)
 
-## 🧭 Known Issues, Gaps, and Corrective Actions
+- Purpose: active consumer capability/session tracking for direct delivery
+- Shape: map keyed by `consumer_id`
+- Lifecycle: active state lives in memory; resumable metadata can be restored from WAL-backed session snapshots
 
-| Area | Problem observed | Impact | Corrective action |
-|---|---|---|---|
-| Contract governance | Intent/Visual schema lifecycle not centralized | version drift, integration breakage | Introduce schema registry + semver policy + compatibility CI gate |
-| Time sync | No explicit predicted-display-time contract at module boundary | jitter and late projection in moving scenes | Add monotonic timestamp + PTP/NTP offset model + predicted display timestamp |
-| Safety gating | Governor/PRGX constraints not yet declared as unified policy bundle | inconsistent enforcement per deployment | Define policy package (`brightness`, `curfew`, `geo`, `content-risk`) signed + versioned |
-| Observability | Cross-module trace correlation still partial | difficult RCA in real-time incidents | Standardize trace/span + delivery IDs from ingress to replay/audit |
-| Edge resilience | reconnect/reconciliation flow not fully formalized | duplicate output or stale state after network flap | Add checkpoint sequence + idempotent reapply + state digest handshake |
+| Field | Type | Description |
+|---|---|---|
+| `consumer_id` | string | Stable consumer identity |
+| `session_id` | string | Active session identifier |
+| `socket_identity` | bytes | ZeroMQ ROUTER identity for direct send |
+| `supports_ack` | bool | Whether consumer participates in ACK flow |
+| `subscriptions` | set[string] | Topics subscribed for direct delivery |
+| `max_inflight` | int | Consumer inflight window cap |
+| `inflight_count` | int | Current number of inflight messages |
+| `last_heartbeat` | timestamp | Last heartbeat seen from consumer |
 
-## 💡 Proposed Backlog (Pending / Not Yet Implemented)
+### 3) Inflight + scheduled delivery tables
 
-1. **Intent & Visual Contract Registry** with backward-compatibility matrix and automated migration hints.
-2. **Predictive Render Scheduler** that aligns motion-to-light with scene velocity and device refresh.
-3. **Geo-aware Community Safety Pack** (quiet hours, school-zone limits, emergency override).
-4. **Policy Simulation Sandbox** to dry-run PRGX/Governor rules before production rollout.
-5. **Multi-surface Consistency Engine** to keep projector, glasses, and monitor outputs frame-aligned.
-6. **Tenant-level Cost and Carbon Metering** for enterprise accountability and optimization.
-7. **Replay Forensics Toolkit** for DLQ/audit timeline reconstruction and signed evidence export.
-8. **Edge WASM Capability Discovery** so one contract can compile to multiple device classes safely.
+- Purpose: ACK/NACK, retry, timeout, dead-letter control, and delayed delivery scheduling for direct mode
+- Shape: maps keyed by `message_id` plus an ordered scheduled queue keyed by `deliver_at`
+- Lifecycle: inflight state lives in memory; retry/delayed queue ordering can be restored from WAL-backed scheduled entries
 
-## 🗺️ 4-Phase Production Roadmap
+| Field | Type | Description |
+|---|---|---|
+| `message_id` | string | Message identity used for ACK/NACK correlation |
+| `consumer_id` | string | Target consumer for this attempt |
+| `session_id` | string | Session that received the dispatch |
+| `topic` | string | Routed topic |
+| `payload` | bytes | Original payload bytes |
+| `attempt` | int | Delivery attempt count |
+| `dispatched_at` | timestamp | Dispatch time used for timeout evaluation |
+| `status` | enum | `dispatched` / `acked` / `nacked` / `expired` / `retry_scheduled` / `dead_lettered` |
 
-| Phase | Deliverables | Primary risks | Exit criteria | Metrics |
-|---|---|---|---|---|
-| **P0 PoC (0-8 weeks)** | Genesis->Manifest->Tachyon happy path, basic BioVision adaptive brightness, WAL+DLQ minimal loop | latency instability, contract ambiguity | end-to-end demo across 2 device classes | p95 e2e < 220ms, success rate > 98% |
-| **P1 Prototype (2-4 months)** | Governor+PRGX enforceable policy bundle, benchmark harness, reconnect+replay protocol | false-positive safety blocks, replay defects | limited real-site deployment with operator runbook | policy decision < 20ms p95, replay correctness = 100% sampled |
-| **P2 Pilot (4-8 months)** | enterprise multi-tenant controls, audit export, adaptive scene sync in dynamic environments | tenant isolation gaps, operational overhead | first design partners run 24/7 pilot safely | uptime > 99.5%, incident MTTR < 30m |
-| **P3 Production (8-12 months)** | scale hardening, HA state plane, compliance posture, cost/perf optimization | cost blowout, regional policy variance | production SLO/SLA acceptance + security sign-off | uptime > 99.9%, motion-to-light p95 < 120ms (AR) |
+### 4) Delivery WAL (append-only file)
 
-## ❓ Open Questions and Assumptions
+- Purpose: durability for direct messages requiring ACK
+- Storage: JSON-line append log (default path `./data/direct_delivery.wal`)
+- Recovery: uncommitted dispatch records are replayed when matching consumers re-register
 
-### Open questions
-- ขอบเขตกฎหมายท้องถิ่นสำหรับการฉายบนอาคาร/พื้นที่สาธารณะในแต่ละเมืองที่ต้องรองรับเป็น baseline คืออะไร?
-- ระดับความแม่นยำ time sync ที่อุปกรณ์ปลายทางรองรับจริง (PTP/NTP/GPS clock) อยู่ที่เท่าใด?
-- ต้องรองรับ content moderation แบบ on-device หรือ cloud-first เป็นหลัก?
+| Field | Type | Description |
+|---|---|---|
+| `type` | enum | `dispatched`, `committed`, or `dead_lettered` |
+| `message_id` | string | Message identity |
+| `consumer` | string | Consumer identity for dispatched records |
+| `session_id` | string | Session ID for dispatched records |
+| `topic` | string | Topic for dispatched records |
+| `payload` | bytes | Payload for dispatched records |
+| `attempt` | int | Attempt number for dispatched records |
 
-### Working assumptions
-- เริ่มจาก deployment แบบเขตจำกัด (controlled zone) เพื่อลด blast radius.
-- ใช้ policy-as-code และ immutable audit เป็นข้อบังคับทุก environment.
-- ระบบต้อง degrade gracefully ไปยัง Legacy OS mode เมื่อ safety gate ไม่ผ่านหรือ latency เกินงบ.
+> Note: if you need SQL/NoSQL persistence in the future, this model can be mapped directly to tables/collections (`routes`, `consumer_sessions`, `inflight_messages`, `delivery_wal`) while preserving existing runtime semantics.
 
-## 🔐 Project Policies
 
-- [Security Policy](SECURITY.md)
-- [Copyright Notice](COPYRIGHT.md)
+### Durability guarantees and non-goals
+
+**Guarantees (when `WAL_ENABLED=true`):**
+- Direct deliveries that require ACK are written to WAL before broker send.
+- ACK and terminal dead-letter outcomes finalize WAL records, preventing replay.
+- On restart, only unfinalized direct deliveries are replayed, preserving `message_id`, `consumer_id`, topic, payload, and attempt counter.
+
+**Non-goals / current limitations:**
+- WAL is local append-only file storage (single-node durability, no replication or consensus).
+- WAL replay is scoped to consumers that re-register; replay is not global fanout recovery.
+- Dispatch WAL compaction/retention is not implemented in this version.
+- Audit retention is operator-managed and can be longer than WAL retention because the audit chain is stored separately in `WAL_PATH.audit`.
+
+## 💡 Function Proposals & Future Extensions
+
+### English
+
+- **Priority-aware Delivery Classes:** Introduce weighted priority classes so operator commands, retries, and bulk sync traffic can coexist with predictable fairness.
+- **Tenant-aware Quotas and Isolation:** ✅ Route namespaces are tenant-scoped, tenant metrics are emitted, and per-tenant admission quotas can now be set through `TENANT_QUOTAS_JSON`.
+- **Geo-redundant Durability:** Replicate WAL, route catalog, and delayed queue state to a standby node or object storage target.
+- **SLO-driven Autoscaling Signals:** Emit broker pressure indicators that can feed orchestration or capacity planning automation.
+- **AuthN/AuthZ Control Plane:** Add operator authentication, signed control messages, and role-based access for administrative APIs.
+
+### ภาษาไทย
+
+- **Priority-aware Delivery Classes:** เพิ่มระดับความสำคัญของการส่งแบบถ่วงน้ำหนัก เพื่อให้คำสั่งของผู้ปฏิบัติงาน งาน retry และทราฟฟิกปริมาณมากอยู่ร่วมกันได้อย่างเป็นธรรม
+- **Tenant-aware Quotas and Isolation:** ✅ route namespace แยกตาม tenant อยู่แล้ว พร้อม tenant metrics และสามารถกำหนด admission quota แยก tenant ผ่าน `TENANT_QUOTAS_JSON` ได้แล้ว
+- **Geo-redundant Durability:** ทำสำเนา WAL, route catalog และสถานะ delayed queue ไปยัง standby node หรือ object storage
+- **SLO-driven Autoscaling Signals:** ปล่อยสัญญาณแรงกดดันของ broker เพื่อนำไปใช้กับระบบ orchestration หรือ automation ด้าน capacity planning
+- **AuthN/AuthZ Control Plane:** เพิ่มการยืนยันตัวตนของผู้ปฏิบัติงาน, signed control messages และสิทธิ์แบบ role-based สำหรับ administrative APIs
 
 ## 📘 Deep Architecture & Protocol Docs
 

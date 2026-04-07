@@ -66,6 +66,7 @@ type Router struct {
 	priorityClasses              []string
 	priorityRank                 map[string]int
 	priorityWeights              map[string]int
+	effectivePriorityWeights     map[string]int
 	priorityBoostThreshold       int
 	priorityBoostOffset          int
 	priorityPreemption           bool
@@ -91,6 +92,12 @@ type QueueLimitPolicy struct {
 	MaxInflightPerConsumer      int
 	MinPerTopicQueue            int
 	MaxPerTopicQueue            int
+	AdaptivePriorityWeights     bool
+	AdaptiveStep                int
+	AgingEnabled                bool
+	AgingBoostAfter             time.Duration
+	ClassCircuitBreaker         bool
+	ClassBreakerQueueFraction   float64
 }
 
 type QueueLimitPolicyInputs struct {
@@ -113,17 +120,19 @@ type QueueLimitPolicyAdjustment struct {
 }
 
 type QueueLimitPolicyState struct {
-	Enabled            bool                         `json:"enabled"`
-	LastEvaluation     time.Time                    `json:"last_evaluation"`
-	LastAppliedAt      time.Time                    `json:"last_applied_at"`
-	CurrentMaxInflight int                          `json:"current_max_inflight_per_consumer"`
-	CurrentMaxDeferred int                          `json:"current_max_per_topic_queue"`
-	DesiredMaxInflight int                          `json:"desired_max_inflight_per_consumer"`
-	DesiredMaxDeferred int                          `json:"desired_max_per_topic_queue"`
-	HoldUntil          time.Time                    `json:"hold_until"`
-	LastReason         string                       `json:"last_reason"`
-	LastInputs         QueueLimitPolicyInputs       `json:"last_inputs"`
-	RecentAdjustments  []QueueLimitPolicyAdjustment `json:"recent_adjustments"`
+	Enabled                  bool                         `json:"enabled"`
+	RuntimeMode              string                       `json:"runtime_mode"`
+	LastEvaluation           time.Time                    `json:"last_evaluation"`
+	LastAppliedAt            time.Time                    `json:"last_applied_at"`
+	CurrentMaxInflight       int                          `json:"current_max_inflight_per_consumer"`
+	CurrentMaxDeferred       int                          `json:"current_max_per_topic_queue"`
+	DesiredMaxInflight       int                          `json:"desired_max_inflight_per_consumer"`
+	DesiredMaxDeferred       int                          `json:"desired_max_per_topic_queue"`
+	HoldUntil                time.Time                    `json:"hold_until"`
+	LastReason               string                       `json:"last_reason"`
+	LastInputs               QueueLimitPolicyInputs       `json:"last_inputs"`
+	RecentAdjustments        []QueueLimitPolicyAdjustment `json:"recent_adjustments"`
+	EffectivePriorityWeights map[string]int               `json:"effective_priority_weights,omitempty"`
 }
 
 type deliveryStatus string
@@ -189,14 +198,15 @@ type inflightMessage struct {
 }
 
 type queuedDirectMessage struct {
-	MessageID       string `json:"message_id"`
-	TenantID        string `json:"tenant_id,omitempty"`
-	Topic           string `json:"topic"`
-	DestinationID   string `json:"destination_id,omitempty"`
-	RouteType       string `json:"route_type,omitempty"`
-	Payload         []byte `json:"payload"`
-	Priority        string `json:"priority,omitempty"`
-	EnqueueSequence uint64 `json:"enqueue_sequence"`
+	MessageID       string    `json:"message_id"`
+	TenantID        string    `json:"tenant_id,omitempty"`
+	Topic           string    `json:"topic"`
+	DestinationID   string    `json:"destination_id,omitempty"`
+	RouteType       string    `json:"route_type,omitempty"`
+	Payload         []byte    `json:"payload"`
+	Priority        string    `json:"priority,omitempty"`
+	EnqueueSequence uint64    `json:"enqueue_sequence"`
+	EnqueuedAt      time.Time `json:"enqueued_at,omitempty"`
 }
 
 type priorityQueue struct {
@@ -220,28 +230,35 @@ type scheduledMessage struct {
 
 // DeliveryMetrics captures direct-delivery lifecycle counters.
 type DeliveryMetrics struct {
-	Ingress           uint64
-	Routed            uint64
-	Unroutable        uint64
-	Dispatched        uint64
-	Acked             uint64
-	Nacked            uint64
-	Retried           uint64
-	DeadLettered      uint64
-	DeliveryTimeout   uint64
-	RetryDueToTimeout uint64
-	DispatchPaused    uint64
-	BacklogQueued     uint64
-	WALWritten        uint64
-	WALReplayed       uint64
-	Deferred          uint64
-	Throttled         uint64
-	Dropped           uint64
-	Scheduled         uint64
-	ScheduledPromoted uint64
-	PolicyEvaluations uint64
-	PolicyAdjustments uint64
+	Ingress                 uint64
+	Routed                  uint64
+	Unroutable              uint64
+	Dispatched              uint64
+	Acked                   uint64
+	Nacked                  uint64
+	Retried                 uint64
+	DeadLettered            uint64
+	DeliveryTimeout         uint64
+	RetryDueToTimeout       uint64
+	DispatchPaused          uint64
+	BacklogQueued           uint64
+	WALWritten              uint64
+	WALReplayed             uint64
+	Deferred                uint64
+	Throttled               uint64
+	Dropped                 uint64
+	Scheduled               uint64
+	ScheduledPromoted       uint64
+	PolicyEvaluations       uint64
+	PolicyAdjustments       uint64
+	PolicyRuntimeViolations uint64
 }
+
+const (
+	queuePolicyRuntimeDisabled = "disabled"
+	queuePolicyRuntimeStatic   = "static"
+	queuePolicyRuntimeAdaptive = "adaptive"
+)
 
 type TenantDeliveryMetrics struct {
 	DeliveryMetrics
@@ -418,7 +435,17 @@ func (r *Router) SetQueueLimitPolicy(policy QueueLimitPolicy) {
 		if policy.QueueStep <= 0 {
 			r.policy.QueueStep = 32
 		}
+		if policy.AdaptiveStep <= 0 {
+			r.policy.AdaptiveStep = 1
+		}
+		if policy.AgingBoostAfter <= 0 {
+			r.policy.AgingBoostAfter = 15 * time.Second
+		}
+		if policy.ClassBreakerQueueFraction <= 0 || policy.ClassBreakerQueueFraction > 1 {
+			r.policy.ClassBreakerQueueFraction = 0.8
+		}
 	}
+	r.resetPolicyRuntimeStateLocked()
 }
 
 func (r *Router) evaluateQueueLimitPolicy() {
@@ -448,6 +475,7 @@ func (r *Router) evaluateQueueLimitPolicy() {
 	r.policyLastDeferred = uint64(deferred)
 	r.policyState.LastEvaluation = now
 	r.policyState.LastInputs = inputs
+	r.adjustPriorityWeightsLocked(inputs, now)
 	desiredInflight := r.targetMaxInflightPerConsumer
 	desiredQueue := r.targetMaxPerTopicQueue
 	reason := "steady"
@@ -482,6 +510,114 @@ func (r *Router) evaluateQueueLimitPolicy() {
 	if len(r.policyState.RecentAdjustments) > 8 {
 		r.policyState.RecentAdjustments = r.policyState.RecentAdjustments[:8]
 	}
+}
+
+func (r *Router) adjustPriorityWeightsLocked(inputs QueueLimitPolicyInputs, now time.Time) {
+	if !r.policy.Enabled {
+		r.metrics.PolicyRuntimeViolations++
+		r.resetPolicyRuntimeStateLocked()
+		return
+	}
+	if len(r.priorityWeights) == 0 {
+		return
+	}
+	if r.effectivePriorityWeights == nil {
+		r.effectivePriorityWeights = r.priorityWeightsSnapshotLocked()
+	}
+	if !r.policy.AdaptivePriorityWeights {
+		r.resetToDefaultWeightsLocked()
+		r.policyState.RuntimeMode = queuePolicyRuntimeStatic
+		return
+	}
+	queueByClass, oldestAgeByClass := r.queuedClassStatsLocked(now)
+	totalQueued := 0
+	for _, count := range queueByClass {
+		totalQueued += count
+	}
+	updated := r.priorityWeightsSnapshotLocked()
+	for class, base := range updated {
+		next := base
+		if totalQueued > 0 {
+			share := float64(queueByClass[class]) / float64(totalQueued)
+			if share >= 0.5 {
+				next = maxInt(1, next-r.policy.AdaptiveStep)
+			}
+		}
+		if r.policy.AgingBoostAfter > 0 && oldestAgeByClass[class] >= r.policy.AgingBoostAfter {
+			next += r.policy.AdaptiveStep
+		}
+		if r.policy.RetryRateHighWatermark > 0 && inputs.RetryRate >= r.policy.RetryRateHighWatermark {
+			name := strings.ToLower(class)
+			if strings.Contains(name, "retry") || strings.Contains(name, "urgent") || strings.Contains(name, "high") {
+				next += r.policy.AdaptiveStep
+			}
+		}
+		updated[class] = maxInt(1, next)
+	}
+	r.effectivePriorityWeights = updated
+	r.policyState.EffectivePriorityWeights = r.priorityWeightsSnapshotLockedFrom(updated)
+	r.policyState.RuntimeMode = queuePolicyRuntimeAdaptive
+}
+
+func (r *Router) resetToDefaultWeightsLocked() {
+	r.effectivePriorityWeights = r.priorityWeightsSnapshotLocked()
+	r.policyState.EffectivePriorityWeights = r.priorityWeightsSnapshotLocked()
+}
+
+func (r *Router) resetPolicyRuntimeStateLocked() {
+	if !r.policy.Enabled {
+		r.effectivePriorityWeights = make(map[string]int)
+		r.resetToDefaultWeightsLocked()
+		r.policyState.RuntimeMode = queuePolicyRuntimeDisabled
+		r.policyState.HoldUntil = time.Time{}
+		r.policyState.LastReason = "policy_disabled"
+		r.policyState.RecentAdjustments = nil
+		r.policyState.LastInputs = QueueLimitPolicyInputs{}
+		return
+	}
+	r.resetToDefaultWeightsLocked()
+	if r.policy.AdaptivePriorityWeights {
+		r.policyState.RuntimeMode = queuePolicyRuntimeAdaptive
+		return
+	}
+	r.policyState.RuntimeMode = queuePolicyRuntimeStatic
+}
+
+func (r *Router) queuedClassStatsLocked(now time.Time) (map[string]int, map[string]time.Duration) {
+	queueByClass := make(map[string]int, len(r.priorityClasses))
+	oldestAgeByClass := make(map[string]time.Duration, len(r.priorityClasses))
+	for _, class := range r.priorityClasses {
+		queueByClass[class] = 0
+		oldestAgeByClass[class] = 0
+	}
+	for _, queue := range r.directQueue {
+		if queue == nil {
+			continue
+		}
+		for _, msg := range queue.Messages {
+			class := r.normalizePriorityLocked(msg.Priority)
+			queueByClass[class]++
+			if !msg.EnqueuedAt.IsZero() {
+				age := now.Sub(msg.EnqueuedAt)
+				if age > oldestAgeByClass[class] {
+					oldestAgeByClass[class] = age
+				}
+			}
+		}
+	}
+	return queueByClass, oldestAgeByClass
+}
+
+func (r *Router) priorityWeightsSnapshotLocked() map[string]int {
+	return r.priorityWeightsSnapshotLockedFrom(r.priorityWeights)
+}
+
+func (r *Router) priorityWeightsSnapshotLockedFrom(source map[string]int) map[string]int {
+	snapshot := make(map[string]int, len(source))
+	for class, weight := range source {
+		snapshot[class] = weight
+	}
+	return snapshot
 }
 
 func (r *Router) applyPolicyLimitsLocked(inflightLimit, perTopicQueueLimit int) {
@@ -545,6 +681,7 @@ func (r *Router) QueueLimitPolicySnapshot() QueueLimitPolicyState {
 	defer r.mu.Unlock()
 	state := r.policyState
 	state.RecentAdjustments = append([]QueueLimitPolicyAdjustment(nil), r.policyState.RecentAdjustments...)
+	state.EffectivePriorityWeights = r.priorityWeightsSnapshotLockedFrom(r.policyState.EffectivePriorityWeights)
 	return state
 }
 
@@ -562,6 +699,16 @@ func (r *Router) SetTenantQuota(tenantID string, quota TenantQuota) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.tenantQuotas[tenantID] = quota
+}
+
+func (r *Router) TenantQuotasSnapshot() map[string]TenantQuota {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]TenantQuota, len(r.tenantQuotas))
+	for tenantID, quota := range r.tenantQuotas {
+		out[tenantID] = quota
+	}
+	return out
 }
 
 func (r *Router) SetPriorityPolicy(classes []string, weights map[string]int, preemption bool, boostThreshold, boostOffset int) {
@@ -589,6 +736,7 @@ func (r *Router) SetPriorityPolicy(classes []string, weights map[string]int, pre
 	r.priorityClasses = normalizedClasses
 	r.priorityRank = make(map[string]int, len(normalizedClasses))
 	r.priorityWeights = make(map[string]int, len(normalizedClasses))
+	r.effectivePriorityWeights = make(map[string]int, len(normalizedClasses))
 	for i, class := range normalizedClasses {
 		r.priorityRank[class] = i
 		weight := len(normalizedClasses) - i
@@ -598,7 +746,9 @@ func (r *Router) SetPriorityPolicy(classes []string, weights map[string]int, pre
 			}
 		}
 		r.priorityWeights[class] = weight
+		r.effectivePriorityWeights[class] = weight
 	}
+	r.policyState.EffectivePriorityWeights = r.priorityWeightsSnapshotLocked()
 	r.priorityPreemption = preemption
 	if boostThreshold > 0 {
 		r.priorityBoostThreshold = boostThreshold
@@ -1165,6 +1315,14 @@ func (r *Router) enqueueDirectLocked(tenantID, topic, destinationID, routeType, 
 	if queue == nil {
 		queue = &priorityQueue{}
 	}
+	normalizedPriority := r.normalizePriority(priority)
+	totalQueued := r.totalQueuedLocked()
+	if r.shouldTripClassCircuitBreakerLocked(normalizedPriority, totalQueued) {
+		r.metrics.Dropped++
+		r.tenantMetricLocked(tenantID).Dropped++
+		fmt.Printf("{\"event\":\"direct_drop\",\"topic\":%q,\"message_id\":%q,\"reason\":\"class_circuit_breaker\",\"class\":%q}\n", topic, messageID, normalizedPriority)
+		return
+	}
 	if r.maxPerTopicQueue > 0 && len(queue.Messages) >= r.maxPerTopicQueue {
 		r.metrics.Dropped++
 		fmt.Printf("{\"event\":\"direct_drop\",\"topic\":%q,\"message_id\":%q,\"reason\":\"topic_queue_full\",\"limit\":%d}\n", topic, messageID, r.maxPerTopicQueue)
@@ -1183,7 +1341,7 @@ func (r *Router) enqueueDirectLocked(tenantID, topic, destinationID, routeType, 
 	}
 	r.metrics.Deferred++
 	r.metrics.Throttled++
-	r.emitEventLocked("delivery", "defer", tenantID, topic, messageID, "", "", 0, "queued", "backpressure", enqueueSequence, time.Time{}, len(payload), map[string]string{"priority": r.normalizePriority(priority)})
+	r.emitEventLocked("delivery", "defer", tenantID, topic, messageID, "", "", 0, "queued", "backpressure", enqueueSequence, time.Time{}, len(payload), map[string]string{"priority": normalizedPriority})
 	r.metrics.BacklogQueued++
 	tenantMetric := r.tenantMetricLocked(tenantID)
 	tenantMetric.Deferred++
@@ -1192,7 +1350,7 @@ func (r *Router) enqueueDirectLocked(tenantID, topic, destinationID, routeType, 
 	if enqueueSequence == 0 {
 		enqueueSequence = r.nextEnqueueSequenceLocked()
 	}
-	queue.Messages = append(queue.Messages, queuedDirectMessage{MessageID: messageID, TenantID: tenantID, Topic: topic, DestinationID: destinationID, RouteType: routeType, Payload: append([]byte(nil), payload...), Priority: r.normalizePriority(priority), EnqueueSequence: enqueueSequence})
+	queue.Messages = append(queue.Messages, queuedDirectMessage{MessageID: messageID, TenantID: tenantID, Topic: topic, DestinationID: destinationID, RouteType: routeType, Payload: append([]byte(nil), payload...), Priority: normalizedPriority, EnqueueSequence: enqueueSequence, EnqueuedAt: r.now()})
 	r.sortPriorityQueueLocked(queue)
 	r.directQueue[queueKey] = queue
 	tenantMetric.Deferred = r.tenantQueuedLocked(tenantID)
@@ -1217,6 +1375,29 @@ func (r *Router) totalQueuedLocked() int {
 		}
 	}
 	return total
+}
+
+func (r *Router) shouldTripClassCircuitBreakerLocked(priority string, totalQueued int) bool {
+	if !r.policy.Enabled || !r.policy.ClassCircuitBreaker {
+		return false
+	}
+	if totalQueued == 0 {
+		return false
+	}
+	if r.maxQueuedDirect <= 0 {
+		return false
+	}
+	if float64(totalQueued)/float64(r.maxQueuedDirect) < r.policy.ClassBreakerQueueFraction {
+		return false
+	}
+	class := strings.ToLower(strings.TrimSpace(priority))
+	if strings.Contains(class, "bulk") || strings.Contains(class, "low") {
+		return true
+	}
+	if rank, ok := r.priorityRank[class]; ok {
+		return rank >= len(r.priorityClasses)-1
+	}
+	return false
 }
 func (r *Router) totalDirectLoadLocked() int { return len(r.inflight) + r.totalQueuedLocked() }
 func (r *Router) tenantQueuedLocked(tenantID string) int {
@@ -1489,14 +1670,31 @@ func (r *Router) normalizePriorityLocked(priority string) string {
 func (r *Router) priorityScoreLocked(msg queuedDirectMessage) int {
 	priority := r.normalizePriorityLocked(msg.Priority)
 	score := r.priorityWeights[priority]
+	if r.effectivePriorityWeights != nil {
+		if dynamic, ok := r.effectivePriorityWeights[priority]; ok && dynamic > 0 {
+			score = dynamic
+		}
+	}
 	if !r.priorityPreemption || r.priorityBoostThreshold <= 0 || r.priorityBoostOffset <= 0 {
-		return score
+		return r.applyAgingScoreBoostLocked(score, msg)
 	}
 	if msg.EnqueueSequence == 0 || r.nextQueueSequence <= msg.EnqueueSequence {
-		return score
+		return r.applyAgingScoreBoostLocked(score, msg)
 	}
 	age := int((r.nextQueueSequence - msg.EnqueueSequence) / uint64(r.priorityBoostThreshold))
-	return score + (age * r.priorityBoostOffset)
+	return r.applyAgingScoreBoostLocked(score+(age*r.priorityBoostOffset), msg)
+}
+
+func (r *Router) applyAgingScoreBoostLocked(score int, msg queuedDirectMessage) int {
+	if !r.policy.Enabled || !r.policy.AgingEnabled || r.policy.AgingBoostAfter <= 0 || msg.EnqueuedAt.IsZero() {
+		return score
+	}
+	age := r.now().Sub(msg.EnqueuedAt)
+	if age < r.policy.AgingBoostAfter {
+		return score
+	}
+	steps := int(age / r.policy.AgingBoostAfter)
+	return score + (steps * maxInt(1, r.policy.AdaptiveStep))
 }
 
 func (r *Router) sortPriorityQueueLocked(queue *priorityQueue) {
