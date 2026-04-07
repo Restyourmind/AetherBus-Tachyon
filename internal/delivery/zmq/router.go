@@ -1376,11 +1376,10 @@ func (r *Router) totalQueuedLocked() int {
 	return total
 }
 
-func (r *Router) shouldTripClassCircuitBreakerLocked(priority string) bool {
+func (r *Router) shouldTripClassCircuitBreakerLocked(priority string, totalQueued int) bool {
 	if !r.policy.Enabled || !r.policy.ClassCircuitBreaker {
 		return false
 	}
-	totalQueued := r.totalQueuedLocked()
 	if totalQueued == 0 {
 		return false
 	}
