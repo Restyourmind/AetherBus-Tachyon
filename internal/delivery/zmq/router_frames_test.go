@@ -1,13 +1,16 @@
 package zmq
 
 import (
+	"context"
 	"encoding/json"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/aetherbus/aetherbus-tachyon/internal/admin/audit"
 	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
 	"github.com/aetherbus/aetherbus-tachyon/internal/media"
+	"github.com/pebbe/zmq4"
 )
 
 type stubWAL struct {
@@ -181,6 +184,80 @@ func TestValidateTopic(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIsSupportedSpecVersion(t *testing.T) {
+	tests := []struct {
+		name        string
+		specVersion string
+		want        bool
+	}{
+		{name: "empty defaults to supported", specVersion: "", want: true},
+		{name: "supported", specVersion: "abtp/1", want: true},
+		{name: "supported with spaces", specVersion: "  abtp/1  ", want: true},
+		{name: "unsupported", specVersion: "abtp/2", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSupportedSpecVersion(tc.specVersion); got != tc.want {
+				t.Fatalf("expected %v, got %v", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestStart_CleansUpSocketsOnPubBindFailure(t *testing.T) {
+	routerAddr := "tcp://127.0.0.1:" + allocateTCPPort(t)
+	pubAddr := "tcp://127.0.0.1:" + allocateTCPPort(t)
+
+	ctx, err := zmq4.NewContext()
+	if err != nil {
+		t.Fatalf("failed to create zmq context: %v", err)
+	}
+	defer ctx.Term()
+
+	occupiedPub, err := ctx.NewSocket(zmq4.PUB)
+	if err != nil {
+		t.Fatalf("failed to create occupied pub socket: %v", err)
+	}
+	defer occupiedPub.Close()
+	if err := occupiedPub.Bind(pubAddr); err != nil {
+		t.Fatalf("failed to occupy pub address: %v", err)
+	}
+
+	r := NewRouter(routerAddr, pubAddr, nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	startCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := r.Start(startCtx); err == nil {
+		t.Fatalf("expected start to fail due to occupied pub bind address")
+	}
+	if r.routerSocket != nil || r.pubSocket != nil {
+		t.Fatalf("expected sockets to remain nil on start failure")
+	}
+
+	rebind, err := ctx.NewSocket(zmq4.ROUTER)
+	if err != nil {
+		t.Fatalf("failed to create rebind router socket: %v", err)
+	}
+	defer rebind.Close()
+	if err := rebind.Bind(routerAddr); err != nil {
+		t.Fatalf("expected router address to be reusable, bind failed: %v", err)
+	}
+}
+
+func allocateTCPPort(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate port: %v", err)
+	}
+	defer ln.Close()
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to parse allocated port: %v", err)
+	}
+	return port
 }
 
 func TestHandleAckDuplicateAndStale(t *testing.T) {

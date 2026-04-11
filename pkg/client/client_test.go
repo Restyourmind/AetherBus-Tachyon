@@ -3,6 +3,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -160,5 +161,67 @@ func TestPublishAndSubscribe_HappyPath(t *testing.T) {
 		// Test passed!
 	case <-ctx.Done():
 		t.Fatal("Test timed out waiting for message")
+	}
+}
+
+func TestPublish_RespectsContextDeadline(t *testing.T) {
+	dealerAddr := "inproc://test-dealer-context"
+	subAddr := "inproc://test-sub-context"
+	server, err := newMockServer(dealerAddr, subAddr)
+	if err != nil {
+		t.Fatalf("Failed to start mock server: %v", err)
+	}
+	defer server.Close()
+
+	client, err := New(WithAddr(dealerAddr), WithSubAddr(subAddr), WithTimeout(time.Second))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = client.Publish(ctx, "orders.created", []byte(`{}`))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled error, got: %v", err)
+	}
+}
+
+func TestPublish_AppliesSocketTimeoutFromOptions(t *testing.T) {
+	dealerAddr := "inproc://test-dealer-timeout"
+	subAddr := "inproc://test-sub-timeout"
+	server, err := newMockServer(dealerAddr, subAddr)
+	if err != nil {
+		t.Fatalf("Failed to start mock server: %v", err)
+	}
+	defer server.Close()
+
+	configuredTimeout := 250 * time.Millisecond
+	client, err := New(WithAddr(dealerAddr), WithSubAddr(subAddr), WithTimeout(configuredTimeout))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	internalClient, ok := client.(*tachyonClient)
+	if !ok {
+		t.Fatalf("expected *tachyonClient, got %T", client)
+	}
+
+	sendTimeout, err := internalClient.dealer.GetSndtimeo()
+	if err != nil {
+		t.Fatalf("failed to get send timeout: %v", err)
+	}
+	if sendTimeout != configuredTimeout {
+		t.Fatalf("expected send timeout %s, got %s", configuredTimeout, sendTimeout)
+	}
+
+	recvTimeout, err := internalClient.dealer.GetRcvtimeo()
+	if err != nil {
+		t.Fatalf("failed to get receive timeout: %v", err)
+	}
+	if recvTimeout != configuredTimeout {
+		t.Fatalf("expected receive timeout %s, got %s", configuredTimeout, recvTimeout)
 	}
 }

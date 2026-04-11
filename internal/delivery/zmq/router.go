@@ -21,6 +21,7 @@ const maxScheduledDeliveryHorizon = 365 * 24 * time.Hour
 const (
 	defaultPriorityBoostThreshold = 8
 	defaultPriorityBoostOffset    = 1000
+	supportedSpecVersion          = "abtp/1"
 )
 
 // Router manages the ZMQ ROUTER socket for incoming events.
@@ -360,18 +361,34 @@ func (r *Router) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create router socket: %w", err)
 	}
-	r.routerSocket = routerSocket
+	cleanupRouter := true
+	defer func() {
+		if cleanupRouter {
+			_ = routerSocket.Close()
+		}
+	}()
+
 	pubSocket, err := zmq4.NewSocket(zmq4.PUB)
 	if err != nil {
 		return fmt.Errorf("failed to create pub socket: %w", err)
 	}
-	r.pubSocket = pubSocket
-	if err := r.routerSocket.Bind(r.bindAddress); err != nil {
+	cleanupPub := true
+	defer func() {
+		if cleanupPub {
+			_ = pubSocket.Close()
+		}
+	}()
+
+	if err := routerSocket.Bind(r.bindAddress); err != nil {
 		return fmt.Errorf("failed to bind router socket: %w", err)
 	}
-	if err := r.pubSocket.Bind(r.pubAddress); err != nil {
+	if err := pubSocket.Bind(r.pubAddress); err != nil {
 		return fmt.Errorf("failed to bind pub socket: %w", err)
 	}
+	r.routerSocket = routerSocket
+	r.pubSocket = pubSocket
+	cleanupRouter = false
+	cleanupPub = false
 	fmt.Println("ZMQ Router started")
 	r.directSender = func(identity []byte, topic string, payload []byte) error {
 		_, err := r.routerSocket.SendMessage(identity, "", topic, payload)
@@ -799,6 +816,16 @@ func (r *Router) loop(ctx context.Context) {
 			if err := r.codec.Decode(decompressedEvent, &event); err != nil {
 				fmt.Printf("failed to decode event: %v\n", err)
 				continue
+			}
+			if !isSupportedSpecVersion(event.SpecVersion) {
+				fmt.Printf("unsupported spec_version %q for message %q\n", event.SpecVersion, event.ID)
+				r.mu.Lock()
+				r.metrics.Dropped++
+				r.mu.Unlock()
+				continue
+			}
+			if strings.TrimSpace(event.SpecVersion) == "" {
+				event.SpecVersion = supportedSpecVersion
 			}
 			event.Topic = topic
 			tenantID := strings.TrimSpace(event.TenantID)
@@ -1924,6 +1951,12 @@ func parseFrames(msg [][]byte) ([]byte, string, []byte, error) {
 		return nil, "", nil, fmt.Errorf("malformed message: expected 3 frames or 4 frames with delimiter, got %d", len(msg))
 	}
 }
+
+func isSupportedSpecVersion(specVersion string) bool {
+	normalized := strings.TrimSpace(specVersion)
+	return normalized == "" || normalized == supportedSpecVersion
+}
+
 func validateTopic(topic string) error {
 	if topic == "" {
 		return fmt.Errorf("topic must not be empty")
