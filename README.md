@@ -434,21 +434,19 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 - Dispatch WAL compaction/retention is not implemented in this version.
 - Audit retention is operator-managed and can be longer than WAL retention because the audit chain is stored separately in `WAL_PATH.audit`.
 
-## 💡 Function Proposals & Future Extensions
+## 💡 Feature Proposals & Future Extensions
 
 ### English
 
-- **Priority-aware Delivery Classes:** เพิ่มระดับความสำคัญของการส่งแบบถ่วงน้ำหนัก เพื่อให้คำสั่งของผู้ปฏิบัติงาน งาน retry และทราฟฟิกปริมาณมากอยู่ร่วมกันได้อย่างเป็นธรรมและคาดการณ์ได้
+- **Priority-aware Delivery Classes:** Add weighted delivery priorities so operator commands, retries, and high-volume traffic can coexist fairly and predictably.
 - **Geo-redundant Durability:** Replicate WAL, route catalog, and delayed queue state to a standby node or object storage target.
 - **SLO-driven Autoscaling Signals:** Emit broker pressure indicators that can feed orchestration or capacity planning automation.
-- **AuthN/AuthZ Control Plane:** Add operator authentication, signed control messages, and role-based access for administrative APIs.
 
 ### ภาษาไทย
 
 - **Priority-aware Delivery Classes:** เพิ่มระดับความสำคัญของการส่งแบบถ่วงน้ำหนัก เพื่อให้คำสั่งของผู้ปฏิบัติงาน งาน retry และทราฟฟิกปริมาณมากอยู่ร่วมกันได้อย่างเป็นธรรม
 - **Geo-redundant Durability:** ทำสำเนา WAL, route catalog และสถานะ delayed queue ไปยัง standby node หรือ object storage
 - **SLO-driven Autoscaling Signals:** ปล่อยสัญญาณแรงกดดันของ broker เพื่อนำไปใช้กับระบบ orchestration หรือ automation ด้าน capacity planning
-- **AuthN/AuthZ Control Plane:** เพิ่มการยืนยันตัวตนของผู้ปฏิบัติงาน, signed control messages และสิทธิ์แบบ role-based สำหรับ administrative APIs
 
 ## 📘 Deep Architecture & Protocol Docs
 

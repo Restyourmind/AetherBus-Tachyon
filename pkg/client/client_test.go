@@ -83,10 +83,14 @@ func (s *mockTachyonServer) run() {
 				continue
 			}
 
-			// Expected format: [identity, topic, payload]
-			if len(msgs) == 3 {
-				topic := msgs[1]
-				payload := msgs[2]
+			// Expected format:
+			// - [identity, topic, payload]
+			// - [identity, empty-delimiter, topic, payload]
+			if len(msgs) >= 3 {
+				topicIndex := len(msgs) - 2
+				payloadIndex := len(msgs) - 1
+				topic := msgs[topicIndex]
+				payload := msgs[payloadIndex]
 				// Forward the message to subscribers via the PUB socket
 				s.pub.SendMessage(topic, payload)
 			}
@@ -223,5 +227,51 @@ func TestPublish_AppliesSocketTimeoutFromOptions(t *testing.T) {
 	}
 	if recvTimeout != configuredTimeout {
 		t.Fatalf("expected receive timeout %s, got %s", configuredTimeout, recvTimeout)
+	}
+}
+
+func TestSubscribe_HandlerReceivesActualPublishedTopic(t *testing.T) {
+	dealerAddr := "inproc://test-dealer-topic"
+	subAddr := "inproc://test-sub-topic"
+
+	server, err := newMockServer(dealerAddr, subAddr)
+	if err != nil {
+		t.Fatalf("Failed to start mock server: %v", err)
+	}
+	defer server.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	client, err := New(WithAddr(dealerAddr), WithSubAddr(subAddr))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	receivedTopic := make(chan string, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Subscribe(ctx, "orders.", func(ctx context.Context, topic string, payload []byte) error {
+		receivedTopic <- topic
+		return nil
+	}); err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	expectedTopic := "orders.created"
+	if err := client.Publish(ctx, expectedTopic, []byte("payload")); err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+
+	select {
+	case topic := <-receivedTopic:
+		if topic != expectedTopic {
+			t.Fatalf("handler received topic %q, expected %q", topic, expectedTopic)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for topic")
 	}
 }
