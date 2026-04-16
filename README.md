@@ -343,7 +343,7 @@ Realtime Stream + Time Sync]
 ```
 
 1. **Producers** publish multipart frames to the ZeroMQ ROUTER.
-2. **`delivery/zmq.Router`** validates frame shape, decodes/compresses payloads via the media layer, and forwards routing work into the application flow.
+2. **`delivery/zmq.Router`** validates frame shape, decompresses/decodes payloads via the media layer, and forwards routing work into the application flow.
 3. **`usecase.EventRouter`** resolves topic matches through the **route store (ART)** for fanout delivery.
 4. **Consumer registration and heartbeat traffic** updates the **consumer session table**, which tracks active direct-delivery capability.
 5. **Direct deliveries** create or update **inflight delivery records** so ACK/NACK, retry, timeout, and dead-letter behavior can be evaluated.
@@ -438,13 +438,11 @@ The broker currently uses a **hybrid in-memory + append-only WAL** model instead
 
 ### English
 
-- **Priority-aware Delivery Classes:** Add weighted delivery priorities so operator commands, retries, and high-volume traffic can coexist fairly and predictably.
 - **Geo-redundant Durability:** Replicate WAL, route catalog, and delayed queue state to a standby node or object storage target.
 - **SLO-driven Autoscaling Signals:** Emit broker pressure indicators that can feed orchestration or capacity planning automation.
 
 ### ภาษาไทย
 
-- **Priority-aware Delivery Classes:** เพิ่มระดับความสำคัญของการส่งแบบถ่วงน้ำหนัก เพื่อให้คำสั่งของผู้ปฏิบัติงาน งาน retry และทราฟฟิกปริมาณมากอยู่ร่วมกันได้อย่างเป็นธรรมและคาดการณ์ได้
 - **Geo-redundant Durability:** ทำสำเนา WAL, route catalog และสถานะ delayed queue ไปยัง standby node หรือ object storage
 - **SLO-driven Autoscaling Signals:** ปล่อยสัญญาณแรงกดดันของ broker เพื่อนำไปใช้กับระบบ orchestration หรือ automation ด้าน capacity planning
 

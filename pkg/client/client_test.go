@@ -230,6 +230,53 @@ func TestPublish_AppliesSocketTimeoutFromOptions(t *testing.T) {
 	}
 }
 
+func TestPublish_ClearsTemporaryDeadlineTimeoutWhenNoDefaultTimeout(t *testing.T) {
+	dealerAddr := "inproc://test-dealer-timeout-clear"
+	subAddr := "inproc://test-sub-timeout-clear"
+	server, err := newMockServer(dealerAddr, subAddr)
+	if err != nil {
+		t.Fatalf("Failed to start mock server: %v", err)
+	}
+	defer server.Close()
+
+	client, err := New(WithAddr(dealerAddr), WithSubAddr(subAddr), WithTimeout(0))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	ctxWithDeadline, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if err := client.Publish(ctxWithDeadline, "orders.created", []byte("payload")); err != nil {
+		t.Fatalf("Publish with deadline failed: %v", err)
+	}
+
+	internalClient, ok := client.(*tachyonClient)
+	if !ok {
+		t.Fatalf("expected *tachyonClient, got %T", client)
+	}
+
+	timeoutAfterDeadline, err := internalClient.dealer.GetSndtimeo()
+	if err != nil {
+		t.Fatalf("failed to get send timeout after deadline publish: %v", err)
+	}
+	if timeoutAfterDeadline <= 0 {
+		t.Fatalf("expected temporary positive timeout after deadline publish, got %s", timeoutAfterDeadline)
+	}
+
+	if err := client.Publish(context.Background(), "orders.created", []byte("payload")); err != nil {
+		t.Fatalf("Publish without deadline failed: %v", err)
+	}
+
+	timeoutAfterNoDeadline, err := internalClient.dealer.GetSndtimeo()
+	if err != nil {
+		t.Fatalf("failed to get send timeout after no-deadline publish: %v", err)
+	}
+	if timeoutAfterNoDeadline >= 0 {
+		t.Fatalf("expected cleared send timeout (<0) after no-deadline publish, got %s", timeoutAfterNoDeadline)
+	}
+}
+
 func TestSubscribe_HandlerReceivesActualPublishedTopic(t *testing.T) {
 	dealerAddr := "inproc://test-dealer-topic"
 	subAddr := "inproc://test-sub-topic"
