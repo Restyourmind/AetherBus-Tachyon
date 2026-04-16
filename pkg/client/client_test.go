@@ -239,7 +239,7 @@ func TestPublish_ClearsTemporaryDeadlineTimeoutWhenNoDefaultTimeout(t *testing.T
 	}
 	defer server.Close()
 
-	client, err := New(WithAddr(dealerAddr), WithSubAddr(subAddr), WithTimeout(0))
+	client, err := New(WithAddr(dealerAddr), WithSubAddr(subAddr))
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}

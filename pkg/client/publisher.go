@@ -48,16 +48,10 @@ func (c *tachyonClient) applyPublishTimeoutLocked(ctx context.Context) error {
 		}
 	}
 	if timeout <= 0 {
-		if err := ctx.Err(); err != nil {
-			return err
+		if err := c.dealer.SetSndtimeo(-1 * time.Millisecond); err != nil {
+			return fmt.Errorf("failed to clear publish send timeout: %w", err)
 		}
-		ถ้า err  :=  ctx.Err ( ); err !  =  nil {
-			ส่งคืน ข้อผิดพลาด
-		}
-		ถ้า err  : =  c.dealer.SetSndtimeo ( -1 ) ; err ! = nil {​​  
-			ส่งคืน ค่า fmt.Errorf ( " ไม่สามารถล้างการหมดเวลาในการส่งเผยแพร่ได้: %w" , err )
-		}
-		ส่งคืน ค่าว่าง
+		return nil
 	}
 	if err := c.dealer.SetSndtimeo(timeout); err != nil {
 		return fmt.Errorf("failed to apply publish send timeout: %w", err)
