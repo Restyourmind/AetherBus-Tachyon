@@ -12,7 +12,38 @@ This project is currently under active development and aims to be a foundational
   - **Compressor:** Defaulting to `LZ4` for high-speed compression and decompression.
 - **ZeroMQ Integration:** Built on top of ZeroMQ (using `pebbe/zmq4`), leveraging its powerful and battle-tested messaging patterns (ROUTER-DEALER, PUB-SUB).
 - **Clean Architecture:** Organized with a clear separation of concerns (domain, use case, delivery, repository, media, app runtime) for maintainability and testability.
-- **Continuous Integration:** Includes a **GitHub Actions workflow** that automatically builds the application and runs tests (including race detection) on every push and pull request to the `main` branch.
+- **Polyglot Runtime Components:** Includes a Go broker core, a FastAPI operational/control surface, and a Rust fast-path sidecar scaffold.
+- **Continuous Integration:** Uses GitHub Actions jobs for Go module recovery validation, API gateway tests, Rust crate tests, and drift export workflows.
+
+## 🗂️ Repository Structure
+
+This repository is organized into runtime components plus shared domain/transport modules:
+
+```text
+.
+├── cmd/                     # Go executables (tachyon broker, benchmark harness, adapters)
+├── internal/                # Broker application, domain, delivery, persistence, media internals
+├── pkg/                     # Reusable public Go packages (client, transport, encoding, errors)
+├── config/                  # Go configuration loading and tests
+├── api/                     # protobuf contracts
+├── api_gateway/             # FastAPI admin/control-surface service + pytest suite
+├── rust/tachyon-fastpath/   # Rust sidecar scaffold for fast-path operations
+├── tools/contracts/         # Contract validation utilities
+├── scripts/                 # Recovery and benchmark helper scripts
+├── docs/                    # Architecture, protocol, performance, and roadmap documentation
+└── .github/workflows/       # CI workflows
+```
+
+## 🔄 CI Workflows
+
+GitHub Actions (`.github/workflows/go.yml`) executes:
+
+- `go-offline-sanity`: offline-safe Go repository and package checks (`scripts/go_mod_recovery.sh check`)
+- `go-full-recovery`: online module recovery + full Go build/test (`scripts/go_mod_recovery.sh recover`)
+- `api-gateway-tests`: FastAPI gateway tests with `pytest -q api_gateway/tests`
+- `rust-fastpath-tests`: Rust sidecar tests with `cargo test --locked`
+- `pr-healing-drift`: pull-request simulation drift artifact export
+- `nightly-healing-drift`: scheduled/workflow-dispatch healing drift execution with artifact export
 
 ## 🚀 Getting Started
 

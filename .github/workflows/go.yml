@@ -1,16 +1,21 @@
-name: Go CI
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  offline-sanity:
+  go-offline-sanity:
+    name: Go / offline sanity
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -26,9 +31,10 @@ jobs:
       - name: Run offline-safe checks
         run: bash scripts/go_mod_recovery.sh check
 
-  full-recovery:
+  go-full-recovery:
+    name: Go / full recovery
     runs-on: ubuntu-latest
-    needs: offline-sanity
+    needs: go-offline-sanity
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -48,17 +54,58 @@ jobs:
       - name: Run full online recovery
         run: bash scripts/go_mod_recovery.sh recover
 
+  api-gateway-tests:
+    name: API Gateway / pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install API Gateway test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi uvicorn pydantic jsonschema pytest httpx
+
+      - name: Run API Gateway tests
+        run: pytest -q api_gateway/tests
+
+  rust-fastpath-tests:
+    name: Rust fastpath / test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Rust tests
+        working-directory: rust/tachyon-fastpath
+        run: cargo test --locked
+
   pr-healing-drift:
+    name: PR healing drift
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Go
-        uses: actions/setup-go@v6.3.0
+        uses: actions/setup-go@v6
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
+          cache: true
+
       - name: Rehearse policy/ruleset healing (non-writing)
         run: bash scripts/go_mod_recovery.sh --simulate-policy --policy-ruleset pr-healing --drift-export-dir artifacts/pr-healing recover
+
       - name: Upload PR healing drift bundle
         uses: actions/upload-artifact@v4
         with:
@@ -66,18 +113,26 @@ jobs:
           path: artifacts/pr-healing/
 
   nightly-healing-drift:
+    name: Nightly healing drift
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Go
-        uses: actions/setup-go@v6.3.0
+        uses: actions/setup-go@v6
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
+          cache: true
+
       - name: Install ZeroMQ
-        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libzmq3-dev
+
       - name: Run nightly healing with drift export
         run: bash scripts/go_mod_recovery.sh --policy-ruleset nightly-healing --drift-export-dir artifacts/nightly-healing --auto-rollback --auto-rollback-cmd "git checkout -- go.mod go.sum" recover
+
       - name: Upload nightly healing drift bundle
         uses: actions/upload-artifact@v4
         with:
