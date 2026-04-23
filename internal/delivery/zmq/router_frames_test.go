@@ -1,13 +1,16 @@
 package zmq
 
 import (
+	"context"
 	"encoding/json"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/aetherbus/aetherbus-tachyon/internal/admin/audit"
 	"github.com/aetherbus/aetherbus-tachyon/internal/domain"
 	"github.com/aetherbus/aetherbus-tachyon/internal/media"
+	"github.com/pebbe/zmq4"
 )
 
 type stubWAL struct {
@@ -181,6 +184,80 @@ func TestValidateTopic(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIsSupportedSpecVersion(t *testing.T) {
+	tests := []struct {
+		name        string
+		specVersion string
+		want        bool
+	}{
+		{name: "empty defaults to supported", specVersion: "", want: true},
+		{name: "supported", specVersion: "abtp/1", want: true},
+		{name: "supported with spaces", specVersion: "  abtp/1  ", want: true},
+		{name: "unsupported", specVersion: "abtp/2", want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSupportedSpecVersion(tc.specVersion); got != tc.want {
+				t.Fatalf("expected %v, got %v", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestStart_CleansUpSocketsOnPubBindFailure(t *testing.T) {
+	routerAddr := "tcp://127.0.0.1:" + allocateTCPPort(t)
+	pubAddr := "tcp://127.0.0.1:" + allocateTCPPort(t)
+
+	ctx, err := zmq4.NewContext()
+	if err != nil {
+		t.Fatalf("failed to create zmq context: %v", err)
+	}
+	defer ctx.Term()
+
+	occupiedPub, err := ctx.NewSocket(zmq4.PUB)
+	if err != nil {
+		t.Fatalf("failed to create occupied pub socket: %v", err)
+	}
+	defer occupiedPub.Close()
+	if err := occupiedPub.Bind(pubAddr); err != nil {
+		t.Fatalf("failed to occupy pub address: %v", err)
+	}
+
+	r := NewRouter(routerAddr, pubAddr, nil, media.NewJSONCodec(), media.NewNoopCompressor())
+	startCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := r.Start(startCtx); err == nil {
+		t.Fatalf("expected start to fail due to occupied pub bind address")
+	}
+	if r.routerSocket != nil || r.pubSocket != nil {
+		t.Fatalf("expected sockets to remain nil on start failure")
+	}
+
+	rebind, err := ctx.NewSocket(zmq4.ROUTER)
+	if err != nil {
+		t.Fatalf("failed to create rebind router socket: %v", err)
+	}
+	defer rebind.Close()
+	if err := rebind.Bind(routerAddr); err != nil {
+		t.Fatalf("expected router address to be reusable, bind failed: %v", err)
+	}
+}
+
+func allocateTCPPort(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate port: %v", err)
+	}
+	defer ln.Close()
+	_, port, err := net.SplitHostPort(ln.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to parse allocated port: %v", err)
+	}
+	return port
 }
 
 func TestHandleAckDuplicateAndStale(t *testing.T) {
@@ -649,7 +726,7 @@ func TestReplayFromWALPreservesIdentityAndAttempt(t *testing.T) {
 		Subscriptions:     map[string]struct{}{"orders.created": {}},
 	}
 
-	r.replayFromWAL("worker-1")
+	r.replayFromWAL("", "worker-1")
 	replayed, ok := r.inflight["msg-r2"]
 	if !ok {
 		t.Fatalf("expected replayed inflight")
@@ -687,7 +764,7 @@ func TestRetryExhaustionAppendsDeadLetterToWAL(t *testing.T) {
 	if got := r.metrics.DeadLettered; got != 1 {
 		t.Fatalf("expected deadlettered=1 after retry exhaustion, got %d", got)
 	}
-	if len(w.deadLettered) != 1 || w.deadLettered[0] != "msg-exhaust" {
+	if len(w.deadLettered) != 1 || w.deadLettered[0].MessageID != "msg-exhaust" {
 		t.Fatalf("expected wal dead-letter append for exhausted retry, got %#v", w.deadLettered)
 	}
 }
@@ -698,7 +775,6 @@ func TestLoadSessionSnapshotsMarksResumablePendingUntilRegister(t *testing.T) {
 			SessionID:           "sess_000007",
 			ConsumerID:          "worker-1",
 			Subscriptions:       []string{"orders.created"},
-			ConnectedAt:         time.Unix(100, 0).UTC(),
 			LastHeartbeat:       time.Unix(200, 0).UTC(),
 			MaxInflight:         7,
 			SupportsAck:         true,
@@ -732,7 +808,7 @@ func TestLoadSessionSnapshotsMarksResumablePendingUntilRegister(t *testing.T) {
 	if got := session.Capabilities.SupportsCompression[0]; got != "lz4" {
 		t.Fatalf("expected compression hint restored, got %q", got)
 	}
-	if r.selectSession("orders.created") != nil {
+	if r.selectSession("", "", "orders.created") != nil {
 		t.Fatalf("expected recovered non-live session not selected for dispatch")
 	}
 }
@@ -743,7 +819,6 @@ func TestRegisterConsumerSessionRehydratesRecoveredSessionMetadata(t *testing.T)
 			SessionID:           "sess_000009",
 			ConsumerID:          "worker-1",
 			Subscriptions:       []string{"orders.created"},
-			ConnectedAt:         time.Unix(100, 0).UTC(),
 			LastHeartbeat:       time.Unix(200, 0).UTC(),
 			MaxInflight:         5,
 			SupportsAck:         true,
@@ -1041,7 +1116,7 @@ func TestWALReplayPreservesPriorityMetadata(t *testing.T) {
 	r := NewRouterWithDurability("", "", nil, media.NewJSONCodec(), media.NewNoopCompressor(), 3, time.Second, w)
 	r.directSessions[sessionMapKey("", "worker-1")] = &consumerSession{SessionID: "sess_000001", ConsumerID: "worker-1", TransportIdentity: []byte("cid1"), Capabilities: capabilityHints{SupportsAck: true, Resumable: true}, MaxInflight: 2, Subscriptions: map[string]struct{}{"orders.created": {}}}
 
-	r.replayFromWAL("worker-1")
+	r.replayFromWAL("", "worker-1")
 
 	replayed := r.inflight["msg-rp1"]
 	if replayed == nil || replayed.Priority != "urgent" || replayed.EnqueueSequence != 42 {

@@ -31,12 +31,7 @@ This roadmap is grounded in the current repository shape and documented protocol
   - Invalid header variants are rejected with deterministic parser errors.
   - Tests cover valid/invalid frame parsing and route lookup behavior for both paths.
 
-### 2) Route decision outcomes + explicit unroutable handling contract ✅
-- **Status:** Implemented in current baseline.
-- `EventRouter` now exposes structured routing outcomes (`routed`, `unroutable`) while preserving the legacy publisher contract.
-- No-route decisions now deterministically skip delivery dispatch and are counted separately in broker metrics.
-
-### 3) Add repeatable benchmark matrix for baseline vs fast path
+### 2) Add repeatable benchmark matrix for baseline vs fast path
 - **Goal:** Make performance claims measurable and regression-detectable.
 - **Impacted files/packages:**
   - `cmd/tachyon-bench/main.go`
@@ -48,7 +43,7 @@ This roadmap is grounded in the current repository shape and documented protocol
   - Results report throughput, p50/p95/p99, alloc/op, bytes/op.
   - A standard invocation and output format is documented for CI/perf runs.
 
-### 4) Harden transport/media error taxonomy
+### 3) Harden transport/media error taxonomy
 - **Goal:** Distinguish malformed frame, unsupported codec/compression, decode failure, and route miss.
 - **Impacted files/packages:**
   - `internal/delivery/zmq/router.go`
@@ -59,7 +54,7 @@ This roadmap is grounded in the current repository shape and documented protocol
   - Error classes are typed/sentinel and observable in logs/metrics.
   - Parser and media failures do not crash the loop and are counted separately.
 
-### 5) Lightweight metrics scaffolding in hot path
+### 4) Lightweight metrics scaffolding in hot path
 - **Goal:** Add counters/timers aligned with existing performance doc metric names.
 - **Impacted files/packages:**
   - `internal/delivery/zmq/router.go`
@@ -75,25 +70,25 @@ This roadmap is grounded in the current repository shape and documented protocol
 
 ## Do next (close protocol + delivery semantics gaps)
 
-### 6) Session registry + consumer capability registration
+### 5) Session registry + consumer capability registration
 - **Protocol/delivery gap addressed:** Session model and registration semantics are documented but not implemented.
 - **Impacted files/packages:** `internal/domain`, `internal/usecase`, `internal/delivery/zmq`, `docs/DELIVERY.md`.
 - **Risk:** **Medium**.
 - **Acceptance criteria:** In-memory session table with heartbeat expiry + capability map (`supports_ack`, codec/compression support).
 
-### 7) Direct delivery ACK/NACK inflight state machine (in-memory first)
+### 6) Direct delivery ACK/NACK inflight state machine (in-memory first)
 - **Gap addressed:** Documented ACK/NACK and inflight lifecycle not present in runtime.
 - **Impacted files/packages:** `internal/domain`, `internal/usecase`, `internal/delivery/zmq`, `docs/DELIVERY.md`.
 - **Risk:** **Medium/High**.
 - **Acceptance criteria:** Dispatch->acked/nacked/expired transitions with idempotent ACK handling and tests.
 
-### 8) Route matching upgrade path (exact + wildcard policy)
+### 7) Route matching upgrade path (exact + wildcard policy)
 - **Gap addressed:** docs describe richer routing semantics than exact-only matching.
 - **Impacted files/packages:** `internal/repository/art_route_store.go`, tests, `docs/PROTOCOL.md`.
 - **Risk:** **Medium** (determinism + precedence rules).
 - **Acceptance criteria:** deterministic precedence and benchmarked lookup impact.
 
-### 9) Dead-letter + retry queue scaffolding
+### 8) Dead-letter + retry queue scaffolding
 - **Durability/semantics gap addressed:** NACK retry and DLQ are documented as SHOULD/MAY behavior.
 - **Impacted files/packages:** `internal/usecase`, `internal/domain`, potentially `internal/repository` for queue backing.
 - **Risk:** **Medium**.
@@ -103,19 +98,19 @@ This roadmap is grounded in the current repository shape and documented protocol
 
 ## Later (durability, scale, federation, intent-aware runway)
 
-### 10) Pluggable durability layer (WAL first, queue snapshots second)
+### 9) Pluggable durability layer (WAL first, queue snapshots second)
 - **Durability gap addressed:** Current runtime is in-memory only. Session snapshot persistence for resumable consumers is now implemented in the ZMQ router/WAL path; queue snapshots and broader runtime integration remain open.
 - **Impacted files/packages:** new `internal/durability/*`, integration in `internal/app/runtime.go`.
 - **Risk:** **High** (ordering, fsync tradeoffs, recovery logic).
 - **Acceptance criteria:** crash recovery for inflight/retry metadata and at-least-once replay boundary documented. Resumable consumer snapshots must restore capability hints without reusing stale transport identities.
 
-### 11) Federation/bridge control plane minimum
+### 10) Federation/bridge control plane minimum
 - **Scalability/federation gap addressed:** Bridge mode exists in docs, no practical multi-broker control plane yet.
 - **Impacted files/packages:** `internal/usecase`, `internal/delivery`, new federation package, `docs/PROTOCOL.md`.
 - **Risk:** **High**.
 - **Acceptance criteria:** broker-to-broker forwarding with loop prevention metadata and route namespace boundaries.
 
-### 12) Intent-aware coordination scaffolding (minimum viable)
+### 11) Intent-aware coordination scaffolding (minimum viable)
 - **Future runway goal:** prepare policy hooks without rewriting broker core.
 - **Impacted files/packages:**
   - `internal/domain` (policy/intents structs)

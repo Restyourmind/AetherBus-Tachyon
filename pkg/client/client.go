@@ -2,7 +2,6 @@
 package client
 
 import (
-	"context"
 	"fmt"
 	"sync"
 
@@ -56,6 +55,14 @@ func New(opts ...Option) (Client, error) {
 }
 
 func (c *tachyonClient) connect() error {
+	if c.opts.Timeout > 0 {
+		if err := c.dealer.SetSndtimeo(c.opts.Timeout); err != nil {
+			return fmt.Errorf("failed to configure dealer send timeout: %w", err)
+		}
+		if err := c.dealer.SetRcvtimeo(c.opts.Timeout); err != nil {
+			return fmt.Errorf("failed to configure dealer receive timeout: %w", err)
+		}
+	}
 	return c.dealer.Connect(c.opts.Addr)
 }
 

@@ -3,6 +3,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -82,10 +83,14 @@ func (s *mockTachyonServer) run() {
 				continue
 			}
 
-			// Expected format: [identity, topic, payload]
-			if len(msgs) == 3 {
-				topic := msgs[1]
-				payload := msgs[2]
+			// Expected format:
+			// - [identity, topic, payload]
+			// - [identity, empty-delimiter, topic, payload]
+			if len(msgs) >= 3 {
+				topicIndex := len(msgs) - 2
+				payloadIndex := len(msgs) - 1
+				topic := msgs[topicIndex]
+				payload := msgs[payloadIndex]
 				// Forward the message to subscribers via the PUB socket
 				s.pub.SendMessage(topic, payload)
 			}
@@ -160,5 +165,160 @@ func TestPublishAndSubscribe_HappyPath(t *testing.T) {
 		// Test passed!
 	case <-ctx.Done():
 		t.Fatal("Test timed out waiting for message")
+	}
+}
+
+func TestPublish_RespectsContextDeadline(t *testing.T) {
+	dealerAddr := "inproc://test-dealer-context"
+	subAddr := "inproc://test-sub-context"
+	server, err := newMockServer(dealerAddr, subAddr)
+	if err != nil {
+		t.Fatalf("Failed to start mock server: %v", err)
+	}
+	defer server.Close()
+
+	client, err := New(WithAddr(dealerAddr), WithSubAddr(subAddr), WithTimeout(time.Second))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = client.Publish(ctx, "orders.created", []byte(`{}`))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled error, got: %v", err)
+	}
+}
+
+func TestPublish_AppliesSocketTimeoutFromOptions(t *testing.T) {
+	dealerAddr := "inproc://test-dealer-timeout"
+	subAddr := "inproc://test-sub-timeout"
+	server, err := newMockServer(dealerAddr, subAddr)
+	if err != nil {
+		t.Fatalf("Failed to start mock server: %v", err)
+	}
+	defer server.Close()
+
+	configuredTimeout := 250 * time.Millisecond
+	client, err := New(WithAddr(dealerAddr), WithSubAddr(subAddr), WithTimeout(configuredTimeout))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	internalClient, ok := client.(*tachyonClient)
+	if !ok {
+		t.Fatalf("expected *tachyonClient, got %T", client)
+	}
+
+	sendTimeout, err := internalClient.dealer.GetSndtimeo()
+	if err != nil {
+		t.Fatalf("failed to get send timeout: %v", err)
+	}
+	if sendTimeout != configuredTimeout {
+		t.Fatalf("expected send timeout %s, got %s", configuredTimeout, sendTimeout)
+	}
+
+	recvTimeout, err := internalClient.dealer.GetRcvtimeo()
+	if err != nil {
+		t.Fatalf("failed to get receive timeout: %v", err)
+	}
+	if recvTimeout != configuredTimeout {
+		t.Fatalf("expected receive timeout %s, got %s", configuredTimeout, recvTimeout)
+	}
+}
+
+func TestPublish_ClearsTemporaryDeadlineTimeoutWhenNoDefaultTimeout(t *testing.T) {
+	dealerAddr := "inproc://test-dealer-timeout-clear"
+	subAddr := "inproc://test-sub-timeout-clear"
+	server, err := newMockServer(dealerAddr, subAddr)
+	if err != nil {
+		t.Fatalf("Failed to start mock server: %v", err)
+	}
+	defer server.Close()
+
+	client, err := New(WithAddr(dealerAddr), WithSubAddr(subAddr))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	ctxWithDeadline, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	if err := client.Publish(ctxWithDeadline, "orders.created", []byte("payload")); err != nil {
+		t.Fatalf("Publish with deadline failed: %v", err)
+	}
+
+	internalClient, ok := client.(*tachyonClient)
+	if !ok {
+		t.Fatalf("expected *tachyonClient, got %T", client)
+	}
+
+	timeoutAfterDeadline, err := internalClient.dealer.GetSndtimeo()
+	if err != nil {
+		t.Fatalf("failed to get send timeout after deadline publish: %v", err)
+	}
+	if timeoutAfterDeadline <= 0 {
+		t.Fatalf("expected temporary positive timeout after deadline publish, got %s", timeoutAfterDeadline)
+	}
+
+	if err := client.Publish(context.Background(), "orders.created", []byte("payload")); err != nil {
+		t.Fatalf("Publish without deadline failed: %v", err)
+	}
+
+	timeoutAfterNoDeadline, err := internalClient.dealer.GetSndtimeo()
+	if err != nil {
+		t.Fatalf("failed to get send timeout after no-deadline publish: %v", err)
+	}
+	if timeoutAfterNoDeadline >= 0 {
+		t.Fatalf("expected cleared send timeout (<0) after no-deadline publish, got %s", timeoutAfterNoDeadline)
+	}
+}
+
+func TestSubscribe_HandlerReceivesActualPublishedTopic(t *testing.T) {
+	dealerAddr := "inproc://test-dealer-topic"
+	subAddr := "inproc://test-sub-topic"
+
+	server, err := newMockServer(dealerAddr, subAddr)
+	if err != nil {
+		t.Fatalf("Failed to start mock server: %v", err)
+	}
+	defer server.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	client, err := New(WithAddr(dealerAddr), WithSubAddr(subAddr))
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	receivedTopic := make(chan string, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := client.Subscribe(ctx, "orders.", func(ctx context.Context, topic string, payload []byte) error {
+		receivedTopic <- topic
+		return nil
+	}); err != nil {
+		t.Fatalf("Subscribe failed: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	expectedTopic := "orders.created"
+	if err := client.Publish(ctx, expectedTopic, []byte("payload")); err != nil {
+		t.Fatalf("Publish failed: %v", err)
+	}
+
+	select {
+	case topic := <-receivedTopic:
+		if topic != expectedTopic {
+			t.Fatalf("handler received topic %q, expected %q", topic, expectedTopic)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for topic")
 	}
 }

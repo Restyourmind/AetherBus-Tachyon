@@ -52,7 +52,7 @@ func (c *tachyonClient) Subscribe(ctx context.Context, topic string, handler Han
 
 				msgs, err := sub.RecvMessageBytes(0) // No DONTWAIT needed with Poller
 				if err == nil && len(msgs) == 2 { // Expect [Topic, Payload]
-					_ = handler(ctx, topic, msgs[1])
+					_ = handler(ctx, string(msgs[0]), msgs[1])
 				}
 			}
 		}
