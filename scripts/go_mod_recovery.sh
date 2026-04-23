@@ -140,8 +140,8 @@ emit_drift_bundle() {
   json_file="${DRIFT_EXPORT_DIR}/trend_bundle.json"
   csv_file="${DRIFT_EXPORT_DIR}/trend_bundle.csv"
   local mod_sha="missing" sum_sha="missing"
-  [[ -f go.mod ]] && mod_sha="$(sha256sum go.mod | awk '{print $1}')"
-  [[ -f go.sum ]] && sum_sha="$(sha256sum go.sum | awk '{print $1}')"
+  [[ -f go.mod ]] && mod_sha="$( (sha256sum go.mod || shasum -a 256 go.mod) | awk '{print $1}')"
+  [[ -f go.sum ]] && sum_sha="$( (sha256sum go.sum || shasum -a 256 go.sum) | awk '{print $1}')"
 
   cat >"$json_file" <<JSON
 {
